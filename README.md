@@ -27,7 +27,7 @@ Uses **WebSocket persistent connection** mode, so no public HTTPS endpoint is re
 2. Create a **Custom App** (enterprise internal app)
 3. Note the **App ID** (`cli_...`) and **App Secret**
 4. Under **Event Subscriptions**:
-   - Enable **Using persistent connection** (WebSocket mode)
+   - Switch to **Using persistent connection** (WebSocket mode) — this is found at the top of the Event Subscriptions page as a connection method toggle
    - Add event: `im.message.receive_v1`
 5. Under **Permissions & Scopes**, add:
 
@@ -55,7 +55,17 @@ git clone git@github.com:phxwang/feishuclaudecode.git
 claude plugin add ./feishuclaudecode
 ```
 
-### 3. Configure Credentials
+### 3. Start Claude Code with the Feishu Channel
+
+The Feishu channel is a development channel plugin. Launch Claude Code with:
+
+```bash
+claude --dangerously-load-development-channels server:feishu
+```
+
+> **Note:** The `--dangerously-load-development-channels` flag is required because this is a local development channel. The flag tells Claude Code to load the channel server.
+
+### 4. Configure Credentials
 
 In your Claude Code terminal:
 
@@ -65,7 +75,7 @@ In your Claude Code terminal:
 
 Credentials are stored in `~/.claude/channels/feishu/.env` (mode 600).
 
-### 4. Pair Your Account
+### 5. Pair Your Account
 
 1. Open Feishu and search for your bot by app name
 2. Send any message to the bot
