@@ -34,7 +34,7 @@ Uses **WebSocket persistent connection** mode, so no public HTTPS endpoint is re
 
    **Callback Configuration** tab:
    - Also switch to **Using persistent connection** (WebSocket mode)
-   - Add callback: **Card interaction callback** (卡片回传交互) — required for confirm card buttons to work
+   - Add callback: `card.action.trigger` (Card interaction callback) — required for confirm card buttons to work
 
 5. Under **Permissions & Scopes**, add:
 
