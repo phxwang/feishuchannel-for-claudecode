@@ -220,11 +220,16 @@ async function downloadResource(messageId: string, fileKey: string, type: 'file'
   mkdirSync(INBOX_DIR, { recursive: true })
   const raw = await (apiClient as any).im.messageResource.get({ path: { message_id: messageId, file_key: fileKey }, params: { type } })
   let buf: Buffer
-  if (Buffer.isBuffer(raw)) buf = raw
-  else if (raw instanceof ArrayBuffer) buf = Buffer.from(raw)
-  else if (raw && typeof raw.arrayBuffer === 'function') buf = Buffer.from(await raw.arrayBuffer())
-  else if (raw && typeof raw.pipe === 'function') buf = await new Promise<Buffer>((res, rej) => { const c: Buffer[] = []; raw.on('data', (d: Buffer) => c.push(d)); raw.on('end', () => res(Buffer.concat(c))); raw.on('error', rej) })
-  else throw new Error(`unexpected download response type: ${typeof raw}`)
+  const data = raw?.data ?? raw
+  if (Buffer.isBuffer(data)) buf = data
+  else if (data instanceof ArrayBuffer) buf = Buffer.from(data)
+  else if (data && typeof data.arrayBuffer === 'function') buf = Buffer.from(await data.arrayBuffer())
+  else if (data && typeof data.pipe === 'function') buf = await new Promise<Buffer>((res, rej) => { const c: Buffer[] = []; data.on('data', (d: Buffer) => c.push(d)); data.on('end', () => res(Buffer.concat(c))); data.on('error', rej) })
+  else if (data && typeof data.getReadableStream === 'function') {
+    const stream = await data.getReadableStream()
+    buf = await new Promise<Buffer>((res, rej) => { const c: Buffer[] = []; stream.on('data', (d: Buffer) => c.push(d)); stream.on('end', () => res(Buffer.concat(c))); stream.on('error', rej) })
+  }
+  else throw new Error(`unexpected download response type: ${typeof raw}, keys: ${raw ? Object.keys(raw).join(',') : 'null'}`)
   writeFileSync(outPath, buf)
   return outPath
 }
