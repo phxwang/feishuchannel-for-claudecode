@@ -26,9 +26,16 @@ Uses **WebSocket persistent connection** mode, so no public HTTPS endpoint is re
 1. Go to [Feishu Open Platform](https://open.feishu.cn) (or [Lark Open Platform](https://open.larksuite.com) for international)
 2. Create a **Custom App** (enterprise internal app)
 3. Note the **App ID** (`cli_...`) and **App Secret**
-4. Under **Event Subscriptions**:
-   - Switch to **Using persistent connection** (WebSocket mode) — this is found at the top of the Event Subscriptions page as a connection method toggle
+4. Under **Events & Callbacks**, configure two separate tabs:
+
+   **Event Configuration** tab:
+   - Switch connection method to **Using persistent connection** (WebSocket mode) at the top of the page
    - Add event: `im.message.receive_v1`
+
+   **Callback Configuration** tab:
+   - Also switch to **Using persistent connection** (WebSocket mode)
+   - Add callback: **Card interaction callback** (卡片回传交互) — required for confirm card buttons to work
+
 5. Under **Permissions & Scopes**, add:
 
    | Permission | Purpose |
