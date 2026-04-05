@@ -288,6 +288,16 @@ function buildPermCard(tool_name: string, description: string, request_id: strin
               width: 'auto',
               elements: [{
                 tag: 'button',
+                text: { content: '🔓 始终允许', tag: 'plain_text' },
+                type: 'primary',
+                behaviors: [{ type: 'callback', value: { action: 'perm_always_allow', code: request_id } }],
+              }],
+            },
+            {
+              tag: 'column',
+              width: 'auto',
+              elements: [{
+                tag: 'button',
                 text: { content: '❌ 拒绝', tag: 'plain_text' },
                 type: 'danger',
                 behaviors: [{ type: 'callback', value: { action: 'perm_deny', code: request_id } }],
@@ -504,14 +514,14 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   if (!code || !action) return {}
 
   // Handle permission card buttons
-  if (action === 'perm_allow' || action === 'perm_deny') {
-    const behavior = action === 'perm_allow' ? 'allow' : 'deny'
+  if (action === 'perm_allow' || action === 'perm_always_allow' || action === 'perm_deny') {
+    const behavior = action === 'perm_deny' ? 'deny' : action === 'perm_always_allow' ? 'always_allow' : 'allow'
     void mcp.notification({ method: 'notifications/claude/channel/permission', params: { request_id: code, behavior } })
     const perm = pendingPerms.get(code)
     pendingPerms.delete(code)
-    const statusText = behavior === 'allow' ? '✅ 已允许' : '❌ 已拒绝'
+    const statusText = behavior === 'always_allow' ? '🔓 始终允许' : behavior === 'allow' ? '✅ 已允许' : '❌ 已拒绝'
     return {
-      toast: { type: behavior === 'allow' ? 'success' : 'info', content: statusText },
+      toast: { type: behavior === 'deny' ? 'info' : 'success', content: statusText },
       card: {
         type: 'raw',
         data: {
@@ -519,7 +529,7 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
           config: { wide_screen_mode: true },
           header: {
             title: { tag: 'plain_text', content: `🔐 Permission Request — ${statusText}` },
-            template: behavior === 'allow' ? 'green' : 'grey',
+            template: behavior === 'deny' ? 'grey' : 'green',
           },
           body: {
             elements: [
