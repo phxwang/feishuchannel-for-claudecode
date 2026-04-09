@@ -34,7 +34,7 @@ function ancestorHasChannelArg(): boolean {
     for (let depth = 0; depth < 5; depth++) {
       const p = byPid.get(pid)
       if (!p) break
-      if (/\bchannels?\b/.test(p.args)) return true
+      if (/\bchannels?\b/.test(p.args) && /\bfeishu\b/.test(p.args)) return true
       pid = p.ppid
       if (pid <= 1) break
     }
