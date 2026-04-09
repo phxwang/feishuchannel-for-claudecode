@@ -95,34 +95,27 @@ Map Feishu groups to project directories in `~/.claude/channels/feishu/access.js
 
 ### 2. Install the Plugin
 
-Clone the repository:
-
 ```bash
 git clone https://github.com/phxwang/feishuchannel-for-claudecode.git
-```
-
-Register the local directory as a plugin marketplace, then install the plugin:
-
-```bash
-claude plugin marketplace add ./feishuclaudecode
+cd feishuchannel-for-claudecode
+bun install                                    # installs deps + creates claude-feishu shortcut
+claude plugin marketplace add .
 claude plugin install feishu@feishu-local
 ```
 
-### 3. Start Claude Code with the Feishu Channel
+The `claude-feishu` shortcut is now available (symlinked to `~/.local/bin/claude-feishu`).
 
-After installation, a `claude-feishu` shortcut is available (symlinked to `~/.local/bin` on first run). Use either:
+### 3. Start Claude Code with the Feishu Channel
 
 ```bash
 claude-feishu
 ```
 
-or the full command:
+Or use the full command:
 
 ```bash
 claude --dangerously-load-development-channels plugin:feishu@feishu-local
 ```
-
-> **Note:** The `--dangerously-load-development-channels` flag is required because this is a local development channel plugin.
 
 ### 4. Configure Credentials
 
