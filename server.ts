@@ -432,6 +432,66 @@ function buildConfirmCard(title: string, content: string, code: string): string 
   })
 }
 
+// ── Unanswered message reminders ────────────────────────────────────────────
+
+const REMINDER_DELAYS_MS = [30 * 60_000, 60 * 60_000, 120 * 60_000]  // 30m, 1h, 2h
+
+type PendingReply = {
+  chatId: string
+  userId: string
+  chatType: string
+  content: string
+  receivedAt: number
+  reminderCount: number
+  timer: ReturnType<typeof setTimeout> | null
+}
+
+const pendingReplies = new Map<string, PendingReply>()
+
+function scheduleReminder(pr: PendingReply) {
+  if (pr.reminderCount >= REMINDER_DELAYS_MS.length) return
+  const delay = REMINDER_DELAYS_MS[pr.reminderCount]
+  pr.timer = setTimeout(() => {
+    const elapsed = Math.round((Date.now() - pr.receivedAt) / 60_000)
+    const attempt = pr.reminderCount + 1
+    dbg(`reminder #${attempt} for chat ${pr.chatId} (${elapsed}m elapsed)`)
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `[提醒 ${attempt}/3] 用户在 ${elapsed} 分钟前发了消息，还没有回复，请尽快处理。\n原始消息: "${pr.content.slice(0, 200)}"`,
+        meta: {
+          chat_id: pr.chatId,
+          message_id: `reminder-${Date.now()}`,
+          user: 'system',
+          user_id: 'system',
+          ts: new Date().toISOString(),
+          chat_type: pr.chatType,
+        },
+      },
+    }).catch(e => dbg(`reminder notification failed: ${e}`))
+    pr.reminderCount++
+    scheduleReminder(pr)
+  }, delay)
+}
+
+function trackUnanswered(chatId: string, userId: string, chatType: string, content: string) {
+  clearReminder(chatId)
+  const pr: PendingReply = {
+    chatId, userId, chatType, content,
+    receivedAt: Date.now(),
+    reminderCount: 0,
+    timer: null,
+  }
+  pendingReplies.set(chatId, pr)
+  scheduleReminder(pr)
+}
+
+function clearReminder(chatId: string) {
+  const pr = pendingReplies.get(chatId)
+  if (pr?.timer) clearTimeout(pr.timer)
+  pendingReplies.delete(chatId)
+}
+
 mcp.setNotificationHandler(
   z.object({
     method: z.literal('notifications/claude/channel/permission_request'),
@@ -504,6 +564,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const r3 = await apiClient.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: msgType, content: JSON.stringify(content) } })
           const id = r3?.message_id ?? (r3 as any)?.data?.message_id ?? ''; if (id) ids.push(id)
         }
+        clearReminder(chatId)
         return { content: [{ type: 'text', text: ids.length === 1 ? `sent (id: ${ids[0]})` : `sent ${ids.length} messages (ids: ${ids.join(', ')})` }] }
       }
       case 'react': {
@@ -723,6 +784,7 @@ async function handleInbound(data: any) {
     method: 'notifications/claude/channel',
     params: { content, meta: { chat_id: chatId, message_id: messageId, user: senderId, user_id: senderId, ts, chat_type: chatType, ...(atts.length ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}) } },
   }).then(() => dbg('notification sent ok')).catch(e => dbg(`deliver failed: ${e}`))
+  trackUnanswered(chatId, senderId, chatType, content)
 }
 
 // Startup — auto-launch router if needed
@@ -757,6 +819,7 @@ function connectWorker() {
         if (data.type === 'channel_message') {
           dbg(`worker: message from ${data.meta?.user}`)
           mcp.notification({ method: 'notifications/claude/channel', params: { content: data.content, meta: data.meta } }).catch(e => dbg(`deliver failed: ${e}`))
+          if (data.meta?.chat_id) trackUnanswered(data.meta.chat_id, data.meta.user ?? '', data.meta.chat_type ?? 'p2p', data.content ?? '')
         } else if (data.type === 'permission_response') {
           dbg(`worker: permission ${data.behavior} for ${data.request_id}`)
           mcp.notification({ method: 'notifications/claude/channel/permission', params: { request_id: data.request_id, behavior: data.behavior } }).catch(e => dbg(`deliver failed: ${e}`))
