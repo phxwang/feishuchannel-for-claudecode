@@ -8,14 +8,18 @@ DIR_NAME=$(basename "$(pwd)")
 PROJECT_KEY=$(pwd | sed 's|/|-|g')
 PROJECT_DIR="$HOME/.claude/projects/$PROJECT_KEY"
 
-# Search for a session with a customTitle ending in the directory name
-MATCH=""
+# Prefer session named "cc_<dir>", fall back to any session ending with dir name
+SEARCH=""
 if [ -d "$PROJECT_DIR" ]; then
-  MATCH=$(grep -rl "\"customTitle\":\".*${DIR_NAME}\"" "$PROJECT_DIR"/*.jsonl 2>/dev/null | tail -1)
+  if grep -rl "\"customTitle\":\"cc_${DIR_NAME}\"" "$PROJECT_DIR"/*.jsonl >/dev/null 2>&1; then
+    SEARCH="cc_${DIR_NAME}"
+  elif grep -rl "\"customTitle\":\".*${DIR_NAME}\"" "$PROJECT_DIR"/*.jsonl >/dev/null 2>&1; then
+    SEARCH="$DIR_NAME"
+  fi
 fi
 
-if [ -n "$MATCH" ]; then
-  exec claude --resume "$DIR_NAME" $CHANNEL_FLAG "$@"
+if [ -n "$SEARCH" ]; then
+  exec claude --resume "$SEARCH" $CHANNEL_FLAG "$@"
 else
   exec claude --resume $CHANNEL_FLAG "$@"
 fi
