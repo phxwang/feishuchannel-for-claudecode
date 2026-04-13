@@ -10,7 +10,9 @@ PROJECT_DIR="$HOME/.claude/projects/$PROJECT_KEY"
 
 # Prefer session named "cc_<dir>", fall back to any session ending with dir name
 SEARCH=""
-if [ -d "$PROJECT_DIR" ]; then
+HAS_SESSIONS=0
+if [ -d "$PROJECT_DIR" ] && compgen -G "$PROJECT_DIR/*.jsonl" > /dev/null; then
+  HAS_SESSIONS=1
   if grep -rl "\"customTitle\":\"cc_${DIR_NAME}\"" "$PROJECT_DIR"/*.jsonl >/dev/null 2>&1; then
     SEARCH="cc_${DIR_NAME}"
   elif grep -rl "\"customTitle\":\".*${DIR_NAME}\"" "$PROJECT_DIR"/*.jsonl >/dev/null 2>&1; then
@@ -20,6 +22,8 @@ fi
 
 if [ -n "$SEARCH" ]; then
   exec claude --resume "$SEARCH" $CHANNEL_FLAG "$@"
-else
+elif [ "$HAS_SESSIONS" = "1" ]; then
   exec claude --resume $CHANNEL_FLAG "$@"
+else
+  exec claude $CHANNEL_FLAG "$@"
 fi
