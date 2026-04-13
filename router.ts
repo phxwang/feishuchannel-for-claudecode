@@ -245,7 +245,7 @@ async function handleInbound(data: any) {
   if (!workdir) { dbg(`no workdir for ${chatId}, dropping`); return }
 
   dbg(`routing ${chatId} (${chatType}) → ${workdir}`)
-  routeToWorkdir(workdir, {
+  const delivered = routeToWorkdir(workdir, {
     type: 'channel_message',
     content,
     meta: {
@@ -258,6 +258,13 @@ async function handleInbound(data: any) {
       ...(atts.length ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
     },
   })
+  if (!delivered) {
+    const hint = `⚠️ 该群绑定的项目 \`${workdir}\` 还没有启动 Claude Code 会话。请在该目录下运行 \`claude-feishu\` 后再发消息。`
+    void (apiClient as any).im.message.reply({
+      path: { message_id: messageId },
+      data: { msg_type: 'text', content: JSON.stringify({ text: hint }), reply_in_thread: false },
+    }).catch((e: unknown) => dbg(`no-worker hint reply failed: ${e}`))
+  }
 }
 
 async function handleCardAction(data: any): Promise<Record<string, unknown>> {
