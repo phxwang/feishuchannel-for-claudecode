@@ -1040,4 +1040,13 @@ setInterval(() => {
   }
 }, 2000).unref()
 
+// In-process detection above can fail if the event loop gets blocked (websocket
+// reconnect spin, broken stdio pipes, etc.). Spawn an independent watchdog that
+// SIGKILLs us via the OS when the parent dies — no event-loop dependency.
+if (initialPpid > 1) {
+  spawn('bash', ['-c',
+    `while kill -0 ${initialPpid} 2>/dev/null && kill -0 ${process.pid} 2>/dev/null; do sleep 5; done; kill -9 ${process.pid} 2>/dev/null`,
+  ], { detached: true, stdio: 'ignore' }).unref()
+}
+
 await mcpPromise
