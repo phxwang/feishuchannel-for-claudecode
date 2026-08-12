@@ -1,4 +1,35 @@
 import { describe, test, expect } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { acquireRouterLock, releaseRouterLock } from './router-lock'
+
+describe('router singleton lock', () => {
+  test('only one live owner can acquire the lock', () => {
+    const root = mkdtempSync(join(tmpdir(), 'feishu-router-lock-'))
+    const lock = join(root, 'router.lock')
+    try {
+      expect(acquireRouterLock(lock, 111, pid => pid === 111)).toBe(true)
+      expect(acquireRouterLock(lock, 222, pid => pid === 111)).toBe(false)
+    } finally {
+      releaseRouterLock(lock)
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('reclaims a stale owner', () => {
+    const root = mkdtempSync(join(tmpdir(), 'feishu-router-lock-'))
+    const lock = join(root, 'router.lock')
+    try {
+      mkdirSync(lock)
+      writeFileSync(join(lock, 'pid'), '111\n')
+      expect(acquireRouterLock(lock, 222, () => false)).toBe(true)
+    } finally {
+      releaseRouterLock(lock)
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
 
 // ── Pure function extractions for testing ──────────────────────────────────
 // These mirror logic in server.ts / router.ts without importing the full
