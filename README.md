@@ -3,30 +3,32 @@
 [![npm version](https://img.shields.io/npm/v/feishuchannel-for-claudecode)](https://www.npmjs.com/package/feishuchannel-for-claudecode)
 [![license](https://img.shields.io/npm/l/feishuchannel-for-claudecode)](LICENSE)
 
-A [Feishu (Lark)](https://www.feishu.cn/) channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), built on Claude Code's **native [Channel interface](https://docs.anthropic.com/en/docs/claude-code/channels)**. Send messages to a Feishu bot and interact with Claude — right in your chat.
+A [Feishu (Lark)](https://www.feishu.cn/) channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), built on Claude Code's **native [Channel interface](https://docs.anthropic.com/en/docs/claude-code/channels)**. Send messages to a Feishu bot and interact with Claude — right in your chat, with **WebSocket persistent connection** mode requiring no public HTTPS endpoint.
 
-Uses the MCP Channel protocol to integrate Feishu as a first-class messaging channel for Claude Code, with **WebSocket persistent connection** mode requiring no public HTTPS endpoint.
+Claude Code is the primary way in — you install the plugin, run `claude-feishu`, and every message from Feishu reaches a live Claude Code instance. But the router behind it isn't limited to Claude: each Feishu group can instead be pointed at an [OpenCode](https://opencode.ai) session, and a group can even **fall back to OpenCode automatically** when its Claude Code worker isn't connected. Same bot, same chat, your choice of backend per group.
 
 ```bash
 npx feishuchannel-for-claudecode   # one-command install
 ```
 
-## Multi-Group Router — One Bot, Many Projects
+## Multi-Group Router — One Bot, Many Projects (and Backends)
 
-The killer feature: **route different Feishu groups to different Claude Code instances**, each working in its own project directory. A single Feishu bot serves your entire team — each group gets its own isolated Claude with full project context.
+The killer feature: **route different Feishu groups to different Claude Code instances — or to OpenCode** — each working in its own project directory. A single Feishu bot serves your entire team — each group gets its own isolated agent with full project context, and the backend is a per-group config choice, not a code change.
 
 ```
                              ┌─ Claude Code (project-a)
 Feishu Bot ──→ Router ───────┤─ Claude Code (project-b)
-           (single WebSocket)└─ Claude Code (project-c)
-                                  ▲ auto-connect via Unix socket
+           (single WebSocket)├─ OpenCode      (project-c)
+                             └─ Claude Code (project-d), fallback → OpenCode
+                                 ▲ Claude Code workers auto-connect via Unix socket
 ```
 
 **How it works:**
-- The **router** holds the single Feishu WebSocket connection and routes messages by `chat_id → workdir → worker`
-- Each **worker** (server.ts) runs inside a Claude Code instance, registered by its working directory
+- The **router** holds the single Feishu WebSocket connection and routes messages by `chat_id → project → backend (claude | opencode)`
+- For **Claude Code**, each **worker** (server.ts) runs inside a Claude Code instance, registered by its working directory, and connects to the router over a Unix socket
+- For **OpenCode**, the router talks directly to an `opencode serve` HTTP/SSE API — no worker process, no manual per-project startup
 - The first `claude-feishu` launch **auto-spawns the router** — no manual setup needed
-- When all workers disconnect, the router **auto-shuts down** after a grace period
+- When all Claude Code workers disconnect, the router **auto-shuts down** after a grace period — this check only counts Claude Code workers, so if you run OpenCode-only groups with no Claude Code project ever connected, run the router as a persistent service instead (see [Running the Router as a Service](#3-running-the-router-as-a-service-recommended-for-anything-long-running))
 
 **Zero-config startup** — just run `claude-feishu` in each project directory:
 
