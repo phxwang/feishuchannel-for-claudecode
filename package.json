@@ -1,6 +1,6 @@
 {
   "name": "feishuchannel-for-claudecode",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Feishu (Lark) channel plugin for Claude Code — route multiple groups to isolated Claude instances via a single bot",
   "license": "MIT",
   "type": "module",
