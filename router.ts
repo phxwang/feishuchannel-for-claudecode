@@ -17,13 +17,15 @@ import {
 import { homedir } from 'os'
 import { join, resolve } from 'path'
 import { acquireRouterLock, releaseRouterLock } from './router-lock'
-import { markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, wasEventProcessed } from './routing/storage'
+import { markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, SqliteBindingStore, wasEventProcessed } from './routing/storage'
 import { loadRouterConfig, RouterConfigError } from './routing/config'
 import { resolveRoute } from './routing/resolver'
 import { conversationKey } from './routing/bindings'
 import type { AgentPolicy, RouterConfig } from './routing/types'
 import { OpenCodeAdapter } from './adapters/opencode/opencode-adapter'
 import type { AgentEvent } from './adapters/agent-adapter'
+import { createBinding } from './routing/bindings'
+import { chunkText, MAX_CHUNK } from './chunk-text'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -161,6 +163,7 @@ function checkMention(mentions: any[], text: string, patterns?: string[]): boole
 mkdirSync(STATE_DIR, { recursive: true })
 const db = openDb(DB_PATH)
 const permissionRegistry = new PermissionRegistry(db)
+const openCodeBindings = new SqliteBindingStore(db)
 
 type Worker = {
   socket: Socket
@@ -224,13 +227,13 @@ const sockServer = createServer((socket) => {
       if (!line.trim()) continue
       try {
         const msg = JSON.parse(line)
-        if (msg.type === 'register' && msg.workdir) {
+        if (msg.type === 'register' && typeof msg.workdir === 'string') {
           w.workdir = resolve(msg.workdir)
           w.workerId = typeof msg.workerId === 'string' ? msg.workerId : undefined
           w.capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : undefined
           w.protocolVersion = typeof msg.protocolVersion === 'number' ? msg.protocolVersion : undefined
           dbg(`worker registered: ${w.workdir}${w.workerId ? ` (id=${w.workerId}, v${w.protocolVersion ?? '?'})` : ''}`)
-        } else if (msg.type === 'callback_registered' && msg.code && msg.workdir) {
+        } else if (msg.type === 'callback_registered' && typeof msg.code === 'string' && typeof msg.workdir === 'string') {
           permissionRegistry.register(msg.code, resolve(msg.workdir), typeof msg.taskId === 'string' ? msg.taskId : null, new Date().toISOString())
         }
       } catch (e) { dbg(`bad message from worker: ${e}`) }
@@ -274,10 +277,36 @@ async function replyText(chatId: string, messageId: string, text: string) {
 // Design doc step 5: route-level primary:opencode, fallback intentionally NOT
 // wired here yet (agents.yaml has fallback.enabled: false for now).
 
-/** conversationKey -> OpenCode sessionId, sticky for the router process lifetime. */
-const openCodeSessions = new Map<string, string>()
+// conversationKey -> OpenCode sessionId is persisted in SQLite (openCodeBindings,
+// routing/storage.ts SqliteBindingStore) so a session survives a router restart
+// instead of living in a bare in-memory Map. `inFlightSessionCreations` is a
+// separate, process-local lock: two messages for the same conversation arriving
+// close together would otherwise both see no binding yet and both create a
+// session, orphaning one — this makes the second one await the first's result.
+const inFlightSessionCreations = new Map<string, Promise<string>>()
 /** Permission request ids currently awaiting a card response, issued by OpenCode (not a Claude worker). */
 const openCodePermissionCodes = new Set<string>()
+
+async function getOrCreateOpenCodeSession(key: string, route: NonNullable<ReturnType<typeof resolveRoute>>): Promise<string> {
+  const existing = openCodeBindings.get(key)
+  if (existing) return existing.agentSessionId
+
+  const inFlight = inFlightSessionCreations.get(key)
+  if (inFlight) return inFlight
+
+  const creation = (async () => {
+    const session = await openCodeAdapter!.createSession({ conversationKey: key, projectId: route.project, workdir: route.workdir })
+    openCodeBindings.put(createBinding(key, route.project, 'opencode', null, session.sessionId, '1', new Date().toISOString()))
+    dbg(`opencode: created session ${session.sessionId} for ${key}`)
+    return session.sessionId
+  })()
+  inFlightSessionCreations.set(key, creation)
+  try {
+    return await creation
+  } finally {
+    inFlightSessionCreations.delete(key)
+  }
+}
 
 function buildOpenCodePermCard(toolName: string, description: string, code: string): string {
   return JSON.stringify({
@@ -320,18 +349,13 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
   const key = conversationKey(
     chatType === 'group' ? { kind: 'group', chatId, projectId: route.project } : { kind: 'p2p', userOpenId: chatId, projectId: route.project },
   )
-  let sessionId = openCodeSessions.get(key)
-  if (!sessionId) {
-    try {
-      const session = await openCodeAdapter.createSession({ conversationKey: key, projectId: route.project, workdir: route.workdir })
-      sessionId = session.sessionId
-      openCodeSessions.set(key, sessionId)
-      dbg(`opencode: created session ${sessionId} for ${key}`)
-    } catch (e) {
-      dbg(`opencode: createSession failed: ${e}`)
-      void replyText(chatId, messageId, `⚠️ OpenCode 会话创建失败：${e}`)
-      return
-    }
+  let sessionId: string
+  try {
+    sessionId = await getOrCreateOpenCodeSession(key, route)
+  } catch (e) {
+    dbg(`opencode: createSession failed: ${e}`)
+    void replyText(chatId, messageId, `⚠️ OpenCode 会话创建失败：${e}`)
+    return
   }
 
   const taskId = `oc-${messageId}`
@@ -345,6 +369,10 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
         finalText = event.text
       } else if (event.type === 'task.failed') {
         dbg(`opencode: task ${taskId} failed: ${event.reason}`)
+        // The cached session may no longer be valid (e.g. opencode serve
+        // restarted and forgot it) — evict so the next message gets a fresh
+        // one instead of repeating the same failure forever.
+        openCodeBindings.delete(key)
         void replyText(chatId, messageId, `⚠️ OpenCode 执行失败：${event.reason}`)
         return
       } else if (event.type === 'task.aborted') {
@@ -354,13 +382,16 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
     }
   } catch (e) {
     dbg(`opencode: send() threw: ${e}`)
+    openCodeBindings.delete(key)
     void replyText(chatId, messageId, `⚠️ OpenCode 执行出错：${e}`)
     return
   }
 
-  markEventProcessed(db, messageId, new Date().toISOString())
-  if (finalText) void replyText(chatId, messageId, finalText)
-  else dbg(`opencode: task ${taskId} completed with no text output`)
+  if (finalText) {
+    for (const chunk of chunkText(finalText, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
+  } else {
+    dbg(`opencode: task ${taskId} completed with no text output`)
+  }
 }
 
 async function handleInbound(data: any) {
@@ -419,6 +450,7 @@ async function handleInbound(data: any) {
 
   const route = resolveRoute({ chatType: chatKind, chatId }, infraConfig, access)
   if (!route) { dbg(`no route for ${chatId}, dropping`); return }
+  if (route.agentSanitized) dbg(`${chatId}: requested agent was not whitelisted for ${route.workdir}, downgraded to Claude-only`)
 
   if (chatKind === 'group') {
     const mentioned = checkMention(mentions, text, access.mentionPatterns)
@@ -454,6 +486,11 @@ async function handleInbound(data: any) {
   if (route.agent.primary === 'opencode') {
     dbg(`routing ${chatId} (${chatType}) → ${workdir} via OpenCode`)
     const ocContent = atts.length ? `${content}\n\n(注意: OpenCode 当前不支持附件，已忽略)` : content
+    // Mark processed now, at dispatch — not after the task finishes (which can
+    // take up to taskTimeoutSeconds). Marking late left a redelivery window
+    // where the same Feishu message_id could dispatch a second concurrent
+    // OpenCode task before the first one completed.
+    markEventProcessed(db, messageId, new Date().toISOString())
     void handleOpenCodeTask(route, chatId, messageId, chatKind, ocContent)
     return
   }
@@ -507,10 +544,15 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
     // OpenCode permission requests are tracked separately (routed directly to the
     // OpenCode Adapter, not to a Claude worker) — see handleOpenCodePermission.
     if (openCodePermissionCodes.has(code)) {
-      openCodePermissionCodes.delete(code)
+      // Only remove the code once delivery is confirmed — deleting it first
+      // (as the old code did) meant a failed respondPermission call stranded
+      // the request: the code was gone from this set, but never registered
+      // in permissionRegistry either, so a retry click fell through to the
+      // Claude-worker branch below and matched nothing.
       let delivered = true
       try {
         await openCodeAdapter!.respondPermission(code, { requestId: code, behavior })
+        openCodePermissionCodes.delete(code)
       } catch (e) {
         delivered = false
         dbg(`opencode respondPermission(${code}) failed: ${e}`)

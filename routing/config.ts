@@ -97,6 +97,12 @@ export function validateRouterConfig(raw: unknown, allowedRoots: string[]): Rout
     if (!withinAllowedRoot) {
       throw new RouterConfigError(`project "${projectId}": workdir "${real}" is outside allowed roots [${allowedRoots.join(', ')}]`)
     }
+    // Store the canonicalized path back, not the raw YAML string — resolver.ts
+    // compares this against access.json's workdir by exact string equality, and
+    // a trailing slash or un-resolved symlink would otherwise silently fail
+    // that match (falling back to Claude-only with no error, since access.json
+    // can be edited live and isn't itself validated against agents.yaml).
+    proj.workdir = real
   }
 
   return cfg

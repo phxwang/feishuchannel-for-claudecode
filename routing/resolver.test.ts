@@ -63,6 +63,34 @@ describe('resolveRoute — project always comes from access.json', () => {
   })
 })
 
+describe('resolveRoute — agentSanitized flags a silent downgrade for callers to log', () => {
+  test('true when the requested agent was downgraded', () => {
+    const r = resolveRoute({ chatType: 'group', chatId: 'oc_untrusted_group' }, infra, access)
+    expect(r?.agentSanitized).toBe(true)
+  })
+
+  test('false when the request was granted as-is', () => {
+    const r = resolveRoute({ chatType: 'group', chatId: 'oc_opencode_group' }, infra, access)
+    expect(r?.agentSanitized).toBe(false)
+  })
+
+  test('false when there was no explicit request to begin with (falls to infra default without downgrade)', () => {
+    const r = resolveRoute({ chatType: 'group', chatId: 'oc_claude_only_group' }, infra, access)
+    expect(r?.agentSanitized).toBe(false)
+  })
+})
+
+describe('resolveRoute — workdir comparison is normalized, not raw string equality', () => {
+  test('a trailing slash in access.json still matches the infra project', () => {
+    const withSlash: LegacyAccess = {
+      groups: { oc_g: { workdir: '/Users/openclaw/Projects/feishuchannel/', agent: { primary: 'opencode', fallback: null } } },
+    }
+    const r = resolveRoute({ chatType: 'group', chatId: 'oc_g' }, infra, withSlash)
+    expect(r?.agent.primary).toBe('opencode')
+    expect(r?.agentSanitized).toBe(false)
+  })
+})
+
 describe('resolveRoute — sanitizes an access.json agent request against infra whitelist (fail closed, not startup-time)', () => {
   test('requested agent not in that project.allowedAgents -> falls back to Claude-only', () => {
     const r = resolveRoute({ chatType: 'group', chatId: 'oc_untrusted_group' }, infra, access)

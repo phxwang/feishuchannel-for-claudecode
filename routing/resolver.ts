@@ -17,6 +17,7 @@
  * an unrecognized or disallowed choice is not an error, it just falls
  * closed to Claude-only for that resolution.
  */
+import { resolve } from 'path'
 import type { AgentPolicy, RouterConfig } from './types'
 
 export interface ResolvedRoute {
@@ -25,6 +26,8 @@ export interface ResolvedRoute {
   agent: AgentPolicy
   requireMention: boolean
   source: 'thread_override' | 'access_json'
+  /** True when access.json requested an agent that sanitizeAgentPolicy downgraded (unwhitelisted or undeclared project) — callers should log this, since it's a silent fail-closed with no other signal. */
+  agentSanitized: boolean
 }
 
 /** Shape of this repo's access.json, extended with an optional per-chat agent override. */
@@ -58,6 +61,7 @@ export function resolveRoute(input: ResolveInput, infra: RouterConfig | null, ac
         agent: input.threadOverride.agent,
         requireMention: groupRequireMention(input, access),
         source: 'thread_override',
+        agentSanitized: false,
       }
     }
   }
@@ -75,6 +79,7 @@ export function resolveRoute(input: ResolveInput, infra: RouterConfig | null, ac
     agent,
     requireMention: groupRequireMention(input, access),
     source: 'access_json',
+    agentSanitized: agent.primary !== requested.primary || agent.fallback !== requested.fallback,
   }
 }
 
@@ -90,7 +95,12 @@ function groupRequireMention(input: ResolveInput, access: LegacyAccess): boolean
  */
 function sanitizeAgentPolicy(requested: AgentPolicy, infra: RouterConfig | null, workdir: string): AgentPolicy {
   if (!infra) return CLAUDE_ONLY
-  const project = Object.values(infra.projects).find(p => p.workdir === workdir)
+  // resolve() normalizes trailing slashes etc — agents.yaml's workdir is
+  // canonicalized via realpathSync at load time (routing/config.ts), but
+  // access.json's workdir is operator-typed and not canonicalized, so compare
+  // both through the same normalization rather than raw string equality.
+  const target = resolve(workdir)
+  const project = Object.values(infra.projects).find(p => resolve(p.workdir) === target)
   if (!project) return CLAUDE_ONLY
   if (!project.allowedAgents.includes(requested.primary)) return CLAUDE_ONLY
   const fallbackOk = requested.fallback === null || project.allowedAgents.includes(requested.fallback)
