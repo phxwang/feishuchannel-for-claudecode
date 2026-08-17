@@ -64,7 +64,10 @@ export interface RouterConfig {
     routingKey: 'thread' | 'chat'
     stickyBackend: boolean
   }
-  agents: Partial<Record<AgentKind, AgentBackendConfig>>
+  // Keyed per-agent-kind (not Partial<Record<AgentKind, AgentBackendConfig>>) so
+  // `agents.opencode` narrows to OpenCodeAgentConfig instead of the union —
+  // matches routing/config.ts's zod schema shape field-for-field.
+  agents: { claude?: ClaudeAgentConfig; opencode?: OpenCodeAgentConfig }
   projects: Record<string, ProjectConfig>
   fallback: FallbackConfig
 }

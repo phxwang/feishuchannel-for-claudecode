@@ -18,6 +18,8 @@ let sendStatus = 200
 let sendBody: any = { info: {}, parts: [{ type: 'text', text: 'hi there' }] }
 /** When set, /session/{id}/message doesn't resolve until this promise does — lets tests simulate a mid-task permission block. */
 let sendGate: Promise<void> | null = null
+/** When true, /event never closes and never sends anything after the initial `events` — matches the real OpenCode global stream, which stays open indefinitely and can go quiet for a while. */
+let eventStreamNeverCloses = false
 
 function encoder() { return new TextEncoder() }
 
@@ -28,6 +30,7 @@ function startMockServer() {
   sendStatus = 200
   sendBody = { info: {}, parts: [{ type: 'text', text: 'hi there' }] }
   sendGate = null
+  eventStreamNeverCloses = false
   server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -60,7 +63,9 @@ function startMockServer() {
         const stream = new ReadableStream({
           start(controller) {
             for (const e of events) controller.enqueue(encoder().encode(`data: ${e}\n\n`))
-            controller.close()
+            if (!eventStreamNeverCloses) controller.close()
+            // else: leave it open with nothing further enqueued, like the real
+            // global /event stream during a quiet period.
           },
         })
         return new Response(stream, { headers: { 'content-type': 'text/event-stream' } })
@@ -169,6 +174,30 @@ describe('send — SSE watched concurrently for mid-task events', () => {
     expect(third.value).toEqual({ type: 'text.completed', taskId: 't1', text: 'hi there' })
     const fourth = await iter.next()
     expect(fourth.value).toEqual({ type: 'session.idle', taskId: 't1' })
+  })
+
+  test('regression: completes even when the SSE stream stays open indefinitely with no further events (real OpenCode /event never closes)', async () => {
+    eventStreamNeverCloses = true
+    let releaseSend: () => void = () => {}
+    sendGate = new Promise<void>((resolve) => { releaseSend = resolve })
+    sendBody = { info: {}, parts: [{ type: 'text', text: 'hi there' }] }
+
+    const out: any[] = []
+    const donePromise = (async () => {
+      for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e)
+    })()
+
+    // Give the SSE connection time to actually establish and start its pending
+    // read before the POST resolves, so this reproduces the real ordering.
+    await new Promise(r => setTimeout(r, 20))
+    releaseSend()
+
+    // Bounded wait: before the fix, this hung forever because events.return()
+    // doesn't interrupt a pending reader.read() on a stream with no more data.
+    const timedOut = Symbol('timeout')
+    const result = await Promise.race([donePromise.then(() => 'done'), new Promise(r => setTimeout(() => r(timedOut), 2000))])
+    expect(result).toBe('done')
+    expect(out.map(e => e.type)).toEqual(['task.started', 'text.completed', 'session.idle'])
   })
 
   test('filters out events for other sessions', async () => {

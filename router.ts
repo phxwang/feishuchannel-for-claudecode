@@ -18,6 +18,12 @@ import { homedir } from 'os'
 import { join, resolve } from 'path'
 import { acquireRouterLock, releaseRouterLock } from './router-lock'
 import { markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, wasEventProcessed } from './routing/storage'
+import { loadRouterConfig, RouterConfigError } from './routing/config'
+import { resolveRoute } from './routing/resolver'
+import { conversationKey } from './routing/bindings'
+import type { AgentPolicy, RouterConfig } from './routing/types'
+import { OpenCodeAdapter } from './adapters/opencode/opencode-adapter'
+import type { AgentEvent } from './adapters/agent-adapter'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -28,6 +34,8 @@ const DEBUG_LOG = join(STATE_DIR, 'router-debug.log')
 const SOCK_PATH = join(STATE_DIR, 'router.sock')
 const LOCK_DIR = join(STATE_DIR, 'router.lock')
 const DB_PATH = join(STATE_DIR, 'router.db')
+const AGENTS_YAML_PATH = join(STATE_DIR, 'agents.yaml')
+const AGENTS_ALLOWED_ROOTS = [process.env.FEISHU_PROJECTS_ROOT ?? join(homedir(), 'Projects')]
 
 function dbg(msg: string) {
   const line = `${new Date().toISOString()} [router] ${msg}\n`
@@ -53,9 +61,32 @@ if (!APP_ID || !APP_SECRET) {
   process.exit(1)
 }
 
+// agents.yaml is the backend/infra config (routing/config.ts RouterConfig) — see
+// docs/multi-agent-router-design.md §5. Missing file = legacy Claude-only mode
+// (infraConfig stays null, zero behavior change). A *present but invalid* file
+// must fail closed: refuse to start rather than run with a partially-valid config.
+let infraConfig: RouterConfig | null = null
+try {
+  infraConfig = loadRouterConfig(AGENTS_YAML_PATH, AGENTS_ALLOWED_ROOTS)
+} catch (e) {
+  const msg = e instanceof RouterConfigError ? e.message : String(e)
+  process.stderr.write(`feishu router: agents.yaml is invalid, refusing to start:\n  ${msg}\n`)
+  process.exit(1)
+}
+
+const openCodeCfg = infraConfig?.agents.opencode
+const openCodeAdapter = openCodeCfg
+  ? new OpenCodeAdapter({
+      baseUrl: openCodeCfg.baseUrl,
+      requestTimeoutSeconds: openCodeCfg.requestTimeoutSeconds,
+      taskTimeoutSeconds: openCodeCfg.taskTimeoutSeconds,
+      passwordEnv: openCodeCfg.passwordEnv,
+    })
+  : null
+
 // ── Access control ──────────────────────────────────────────────────────────
 
-type GroupPolicy = { requireMention: boolean; allowFrom: string[]; workdir?: string }
+type GroupPolicy = { requireMention: boolean; allowFrom: string[]; workdir?: string; agent?: AgentPolicy }
 type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
@@ -65,6 +96,7 @@ type Access = {
   mentionPatterns?: string[]
   ackReaction?: string
   defaultWorkdir?: string
+  defaultAgent?: AgentPolicy
 }
 
 function readAccess(): Access {
@@ -79,6 +111,7 @@ function readAccess(): Access {
       mentionPatterns: p.mentionPatterns,
       ackReaction: p.ackReaction ?? 'Get',
       defaultWorkdir: p.defaultWorkdir,
+      defaultAgent: p.defaultAgent,
     }
   } catch {
     return { dmPolicy: 'pairing', allowFrom: [], p2pChats: {}, groups: {}, pending: {}, ackReaction: 'Get' }
@@ -228,6 +261,108 @@ function resolveWorkdir(chatId: string, chatType: string): string | undefined {
   return access.defaultWorkdir
 }
 
+async function replyText(chatId: string, messageId: string, text: string) {
+  try {
+    await (apiClient as any).im.message.reply({
+      path: { message_id: messageId },
+      data: { msg_type: 'text', content: JSON.stringify({ text }), reply_in_thread: false },
+    })
+  } catch (e) { dbg(`reply failed: ${e}`) }
+}
+
+// ── OpenCode task execution ─────────────────────────────────────────────────
+// Design doc step 5: route-level primary:opencode, fallback intentionally NOT
+// wired here yet (agents.yaml has fallback.enabled: false for now).
+
+/** conversationKey -> OpenCode sessionId, sticky for the router process lifetime. */
+const openCodeSessions = new Map<string, string>()
+/** Permission request ids currently awaiting a card response, issued by OpenCode (not a Claude worker). */
+const openCodePermissionCodes = new Set<string>()
+
+function buildOpenCodePermCard(toolName: string, description: string, code: string): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: '🔐 OpenCode Permission Request' }, template: 'orange' },
+    body: {
+      elements: [
+        { tag: 'markdown', content: `**Tool:** ${toolName}\n${description}` },
+        { tag: 'hr' },
+        {
+          tag: 'action',
+          actions: [
+            { tag: 'button', text: { tag: 'plain_text', content: '✅ Allow' }, type: 'primary', value: { code, action: 'perm_allow' } },
+            { tag: 'button', text: { tag: 'plain_text', content: '❌ Deny' }, type: 'danger', value: { code, action: 'perm_deny' } },
+          ],
+        },
+      ],
+    },
+  })
+}
+
+async function handleOpenCodePermission(event: Extract<AgentEvent, { type: 'permission.requested' }>, chatId: string) {
+  openCodePermissionCodes.add(event.requestId)
+  try {
+    await (apiClient as any).im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'interactive', content: buildOpenCodePermCard(event.toolName, event.description, event.requestId) },
+    })
+  } catch (e) { dbg(`opencode: permission card send failed: ${e}`) }
+}
+
+async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRoute>>, chatId: string, messageId: string, chatType: 'p2p' | 'group', content: string) {
+  if (!openCodeAdapter) {
+    dbg(`route wants opencode but agents.opencode is not configured, dropping`)
+    void replyText(chatId, messageId, '⚠️ OpenCode 未配置，无法处理该消息。')
+    return
+  }
+
+  const key = conversationKey(
+    chatType === 'group' ? { kind: 'group', chatId, projectId: route.project } : { kind: 'p2p', userOpenId: chatId, projectId: route.project },
+  )
+  let sessionId = openCodeSessions.get(key)
+  if (!sessionId) {
+    try {
+      const session = await openCodeAdapter.createSession({ conversationKey: key, projectId: route.project, workdir: route.workdir })
+      sessionId = session.sessionId
+      openCodeSessions.set(key, sessionId)
+      dbg(`opencode: created session ${sessionId} for ${key}`)
+    } catch (e) {
+      dbg(`opencode: createSession failed: ${e}`)
+      void replyText(chatId, messageId, `⚠️ OpenCode 会话创建失败：${e}`)
+      return
+    }
+  }
+
+  const taskId = `oc-${messageId}`
+  const controller = new AbortController()
+  let finalText = ''
+  try {
+    for await (const event of openCodeAdapter.send({ taskId, sessionId, prompt: content }, controller.signal)) {
+      if (event.type === 'permission.requested') {
+        void handleOpenCodePermission(event, chatId)
+      } else if (event.type === 'text.completed') {
+        finalText = event.text
+      } else if (event.type === 'task.failed') {
+        dbg(`opencode: task ${taskId} failed: ${event.reason}`)
+        void replyText(chatId, messageId, `⚠️ OpenCode 执行失败：${event.reason}`)
+        return
+      } else if (event.type === 'task.aborted') {
+        void replyText(chatId, messageId, `⚠️ OpenCode 任务被中断`)
+        return
+      }
+    }
+  } catch (e) {
+    dbg(`opencode: send() threw: ${e}`)
+    void replyText(chatId, messageId, `⚠️ OpenCode 执行出错：${e}`)
+    return
+  }
+
+  markEventProcessed(db, messageId, new Date().toISOString())
+  if (finalText) void replyText(chatId, messageId, finalText)
+  else dbg(`opencode: task ${taskId} completed with no text output`)
+}
+
 async function handleInbound(data: any) {
   const ev = data.event ?? data
   const sender = ev.sender, message = ev.message
@@ -271,16 +406,23 @@ async function handleInbound(data: any) {
   } catch { text = contentStr }
 
   const access = readAccess()
+  const chatKind: 'p2p' | 'group' = chatType === 'group' ? 'group' : 'p2p'
 
   // Access check
-  if (chatType === 'p2p') {
+  if (chatKind === 'p2p') {
     if (!access.allowFrom.includes(senderId)) { dbg(`dm from unknown ${senderId}, dropping`); return }
   } else {
     const policy = access.groups[chatId]
     if (!policy) { dbg(`group ${chatId} not configured, dropping`); return }
     if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(senderId)) return
+  }
+
+  const route = resolveRoute({ chatType: chatKind, chatId }, infraConfig, access)
+  if (!route) { dbg(`no route for ${chatId}, dropping`); return }
+
+  if (chatKind === 'group') {
     const mentioned = checkMention(mentions, text, access.mentionPatterns)
-    if ((policy.requireMention ?? true) && !mentioned) return
+    if (route.requireMention && !mentioned) return
   }
 
   // Ack reaction
@@ -307,8 +449,14 @@ async function handleInbound(data: any) {
   const content = quotePrefix + body
   if (!content) return
 
-  const workdir = resolveWorkdir(chatId, chatType)
-  if (!workdir) { dbg(`no workdir for ${chatId}, dropping`); return }
+  const workdir = route.workdir
+
+  if (route.agent.primary === 'opencode') {
+    dbg(`routing ${chatId} (${chatType}) → ${workdir} via OpenCode`)
+    const ocContent = atts.length ? `${content}\n\n(注意: OpenCode 当前不支持附件，已忽略)` : content
+    void handleOpenCodeTask(route, chatId, messageId, chatKind, ocContent)
+    return
+  }
 
   dbg(`routing ${chatId} (${chatType}) → ${workdir}${parentId ? ' (reply)' : ''}`)
   const delivered = routeToWorkdir(workdir, {
@@ -355,6 +503,32 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
 
   if (action === 'perm_allow' || action === 'perm_deny') {
     const behavior = action === 'perm_deny' ? 'deny' : 'allow'
+
+    // OpenCode permission requests are tracked separately (routed directly to the
+    // OpenCode Adapter, not to a Claude worker) — see handleOpenCodePermission.
+    if (openCodePermissionCodes.has(code)) {
+      openCodePermissionCodes.delete(code)
+      let delivered = true
+      try {
+        await openCodeAdapter!.respondPermission(code, { requestId: code, behavior })
+      } catch (e) {
+        delivered = false
+        dbg(`opencode respondPermission(${code}) failed: ${e}`)
+      }
+      const statusText = !delivered ? '⚠️ 发送失败，请重试' : (behavior === 'allow' ? '✅ 已允许' : '❌ 已拒绝')
+      return {
+        toast: { type: !delivered ? 'warning' : (behavior === 'deny' ? 'info' : 'success'), content: statusText },
+        card: {
+          type: 'raw',
+          data: {
+            schema: '2.0', config: { wide_screen_mode: true },
+            header: { title: { tag: 'plain_text', content: `🔐 OpenCode Permission — ${statusText}` }, template: !delivered ? 'red' : (behavior === 'deny' ? 'grey' : 'green') },
+            body: { elements: [{ tag: 'hr' }, { tag: 'markdown', content: `**${statusText}**` }] },
+          },
+        },
+      }
+    }
+
     const payload = { type: 'permission_response', request_id: code, behavior }
     const delivered = workdir ? routeToWorkdir(workdir, payload) : false
     consumeIfDelivered(delivered)

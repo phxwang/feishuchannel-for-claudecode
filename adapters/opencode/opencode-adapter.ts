@@ -177,6 +177,16 @@ export class OpenCodeAdapter implements AgentAdapter {
           continue
         }
 
+        // The POST won the race. `events.return()` alone does NOT interrupt a
+        // pending `reader.read()` — per the async-generator protocol, a
+        // queued .return() only takes effect once that read next resolves on
+        // its own, which for the real (long-lived, low-traffic) OpenCode
+        // /event stream could be a long time or never within this task's
+        // lifetime, hanging send() forever even though the real work is done.
+        // Aborting the shared signal actually rejects the in-flight read (the
+        // POST has already resolved by this point, so aborting its signal now
+        // is a no-op for it) so openEventStream's catch/finally can unwind.
+        promptController.abort()
         await events.return?.(undefined).catch(() => {})
         if (!raced.r.ok) {
           yield signal.aborted
