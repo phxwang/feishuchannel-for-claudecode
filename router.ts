@@ -17,6 +17,7 @@ import {
 import { homedir } from 'os'
 import { join, resolve } from 'path'
 import { acquireRouterLock, releaseRouterLock } from './router-lock'
+import { markEventProcessed, openDb, PermissionRegistry } from './routing/storage'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -26,6 +27,7 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const DEBUG_LOG = join(STATE_DIR, 'router-debug.log')
 const SOCK_PATH = join(STATE_DIR, 'router.sock')
 const LOCK_DIR = join(STATE_DIR, 'router.lock')
+const DB_PATH = join(STATE_DIR, 'router.db')
 
 function dbg(msg: string) {
   const line = `${new Date().toISOString()} [router] ${msg}\n`
@@ -123,7 +125,18 @@ function checkMention(mentions: any[], text: string, patterns?: string[]): boole
 
 // ── Worker registry (Unix socket) ───────────────────────────────────────────
 
-type Worker = { socket: Socket; workdir: string; buf: string }
+mkdirSync(STATE_DIR, { recursive: true })
+const db = openDb(DB_PATH)
+const permissionRegistry = new PermissionRegistry(db)
+
+type Worker = {
+  socket: Socket
+  workdir: string
+  buf: string
+  workerId?: string
+  capabilities?: string[]
+  protocolVersion?: number
+}
 
 const workers = new Map<Socket, Worker>()
 
@@ -180,7 +193,12 @@ const sockServer = createServer((socket) => {
         const msg = JSON.parse(line)
         if (msg.type === 'register' && msg.workdir) {
           w.workdir = resolve(msg.workdir)
-          dbg(`worker registered: ${w.workdir}`)
+          w.workerId = typeof msg.workerId === 'string' ? msg.workerId : undefined
+          w.capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : undefined
+          w.protocolVersion = typeof msg.protocolVersion === 'number' ? msg.protocolVersion : undefined
+          dbg(`worker registered: ${w.workdir}${w.workerId ? ` (id=${w.workerId}, v${w.protocolVersion ?? '?'})` : ''}`)
+        } else if (msg.type === 'callback_registered' && msg.code && msg.workdir) {
+          permissionRegistry.register(msg.code, resolve(msg.workdir), typeof msg.taskId === 'string' ? msg.taskId : null, new Date().toISOString())
         }
       } catch (e) { dbg(`bad message from worker: ${e}`) }
     }
@@ -224,6 +242,7 @@ async function handleInbound(data: any) {
   const mentions: any[] = message.mentions ?? []
   const createTime: string = message.create_time ?? ''
   if (!senderId || !chatId || !messageId) return
+  if (!markEventProcessed(db, messageId, new Date().toISOString())) { dbg(`duplicate event ${messageId}, dropping`); return }
 
   let text = ''
   const postImageKeys: string[] = []
@@ -318,15 +337,20 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   const action = value.action as string | undefined
   if (!code || !action) return {}
 
-  // Find the worker that sent this card — route by chat_id or broadcast
+  // Route precisely by the code the issuing worker registered (routing/storage.ts
+  // PermissionRegistry). chat_id lookup is a defensive fallback only for the rare
+  // case the registration message was lost in flight — we never broadcast to every
+  // connected worker, since that could leak an unrelated project's approval prompt.
   const chatId = data?.open_chat_id ?? ''
-  const workdir = chatId ? resolveWorkdir(chatId, 'group') ?? resolveWorkdir(chatId, 'p2p') : undefined
+  const registered = permissionRegistry.resolve(code)
+  const workdir = registered?.workdir ?? (chatId ? resolveWorkdir(chatId, 'group') ?? resolveWorkdir(chatId, 'p2p') : undefined)
+  if (registered) permissionRegistry.consume(code)
 
   if (action === 'perm_allow' || action === 'perm_deny') {
     const behavior = action === 'perm_deny' ? 'deny' : 'allow'
     const payload = { type: 'permission_response', request_id: code, behavior }
     if (workdir) routeToWorkdir(workdir, payload)
-    else for (const w of workers.values()) sendToWorker(w, payload) // broadcast if unknown
+    else dbg(`callback code ${code} has no known workdir, dropping (not broadcasting)`)
 
     const statusText = behavior === 'allow' ? '✅ 已允许' : '❌ 已拒绝'
     return {
@@ -357,7 +381,7 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
       },
     }
     if (workdir) routeToWorkdir(workdir, payload)
-    else for (const w of workers.values()) sendToWorker(w, payload)
+    else dbg(`callback code ${code} has no known workdir, dropping (not broadcasting)`)
 
     const statusText = isConfirm ? '✅ 已确认' : '❌ 已取消'
     return {
