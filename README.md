@@ -206,14 +206,19 @@ The **first** instance auto-spawns the router. Subsequent instances connect as w
 
 The auto-spawn behavior above is convenient for quick starts, but for a machine that stays up (a dev box, a server), run the router as a supervised background service instead — it survives crashes and reboots without depending on any particular `claude-feishu` instance staying alive to relaunch it. Ad-hoc `bun router.ts` or a tmux pane both work for testing, but **once a service is installed, don't also start the router manually** — `router-lock.ts` prevents two routers from serving traffic at once, so a manually-started process will just exit immediately (or fight with the service over the singleton lock).
 
-**macOS (launchd):** create `~/Library/LaunchAgents/com.yourname.feishuchannel-router.plist`:
+**macOS (launchd):**
 
-```xml
+**1. Install** — pick a label (`com.<you>.feishuchannel-router`), then write the plist. Fill in the absolute paths for your setup: `which bun` for the bun binary, the repo's absolute path, and wherever you want logs written.
+
+```bash
+mkdir -p ~/Library/LaunchAgents ~/logs   # or wherever you want StandardOut/ErrorPath to live
+
+cat > ~/Library/LaunchAgents/com.you.feishuchannel-router.plist <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.yourname.feishuchannel-router</string>
+  <key>Label</key><string>com.you.feishuchannel-router</string>
   <key>ProgramArguments</key>
   <array>
     <string>/path/to/bun</string>
@@ -227,17 +232,31 @@ The auto-spawn behavior above is convenient for quick starts, but for a machine 
   <key>StandardErrorPath</key><string>/path/to/logs/router.stderr.log</string>
 </dict>
 </plist>
+PLIST
+
+launchctl load -w ~/Library/LaunchAgents/com.you.feishuchannel-router.plist
 ```
 
+`load -w` starts it immediately and registers it to start on every future login/reboot too — no separate "enable" step needed.
+
+**2. Verify it's actually running:**
+
 ```bash
-# Load it (starts the router, and on every future login/reboot)
-launchctl load -w ~/Library/LaunchAgents/com.yourname.feishuchannel-router.plist
+launchctl print gui/$(id -u)/com.you.feishuchannel-router | head -5
+# state = running    <- what you want to see
+```
 
-# Restart after a code update (KeepAlive relaunches it automatically otherwise)
-launchctl kickstart -k gui/$(id -u)/com.yourname.feishuchannel-router
+**3. Restart** after pulling a code update (`KeepAlive` only relaunches it on an unexpected exit, not on demand):
 
-# Service status (running/not, PID, last exit code)
-launchctl print gui/$(id -u)/com.yourname.feishuchannel-router
+```bash
+launchctl kickstart -k gui/$(id -u)/com.you.feishuchannel-router
+```
+
+**4. Uninstall**, if you go back to ad-hoc/`claude-feishu`-auto-spawn mode:
+
+```bash
+launchctl unload -w ~/Library/LaunchAgents/com.you.feishuchannel-router.plist
+rm ~/Library/LaunchAgents/com.you.feishuchannel-router.plist
 ```
 
 **Router-internal status** (connected workers, regardless of how the process was started):
