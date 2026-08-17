@@ -48,12 +48,13 @@ Map Feishu groups to project directories in `~/.claude/channels/feishu/access.js
 }
 ```
 
-> See [Multi-Group Router Setup](#multi-group-router-setup) for full configuration details.
+> See [Multi-Group Router Setup](#multi-group-router-setup) for full configuration details, or [OpenCode Backend](#opencode-backend) to route specific chats to OpenCode instead of Claude Code.
 
 ## Features
 
 - **Multi-group routing** — One Feishu bot serves multiple Claude Code instances, each in its own project
 - **Auto-managed router** — Router spawns on first launch, shuts down when all workers disconnect
+- **OpenCode backend (opt-in per group/DM)** — Route specific chats to [OpenCode](https://opencode.ai) instead of Claude Code, with sessions persisted in SQLite across router restarts
 - **Direct messages** — Chat with Claude through Feishu DMs
 - **Group chats** — Add the bot to group chats with @mention support
 - **Access control** — Pairing-based onboarding, allowlists, and per-group policies
@@ -210,6 +211,73 @@ kill -USR1 $(pgrep -f 'bun router.ts')
 cat ~/.claude/channels/feishu/router-debug.log | tail -10
 ```
 
+## OpenCode Backend
+
+The router can also dispatch a group (or DM) to [OpenCode](https://opencode.ai) instead of Claude Code — useful as an alternative backend for specific projects. This is opt-in per group/DM and has zero effect on anything not explicitly configured.
+
+**Prerequisites:** a running `opencode serve` instance, bound to localhost:
+
+```bash
+opencode serve --hostname 127.0.0.1 --port 4096
+```
+
+(Run it as a persistent daemon — e.g. via `launchd`/`systemd` — independent of the router's own lifecycle.)
+
+### 1. Declare backends and projects in `agents.yaml`
+
+Create `~/.claude/channels/feishu/agents.yaml` (optional — if this file is absent, everything stays Claude-only with unchanged behavior):
+
+```yaml
+version: 1
+defaults:
+  agent:
+    primary: claude
+    fallback: null
+agents:
+  claude:
+    type: claude-channel
+    socket: /Users/you/.claude/channels/feishu/router.sock
+    health:
+      workerTtlSeconds: 15
+  opencode:
+    type: opencode
+    baseUrl: http://127.0.0.1:4096
+    requestTimeoutSeconds: 30
+    taskTimeoutSeconds: 600
+    maxConcurrency: 4
+projects:
+  my-project:
+    workdir: /path/to/my-project
+    allowedAgents: [claude, opencode]
+fallback:
+  enabled: false   # Claude -> OpenCode auto-fallback on failure is designed but not wired into dispatch yet — leave this false
+```
+
+`agents.yaml` never decides which project a chat maps to — that's still `access.json`'s job (see below). It only declares which backends exist and which agents each project is allowed to use.
+
+### 2. Opt a group or DM into OpenCode via `access.json`
+
+`access.json` is the single source of truth for chat → project/agent mapping. Add an optional `agent` field to any group entry (or `defaultAgent` at the top level for DMs):
+
+```jsonc
+{
+  "groups": {
+    "oc_groupA": {
+      "workdir": "/path/to/my-project",
+      "agent": { "primary": "opencode", "fallback": null }
+    }
+  }
+}
+```
+
+Any group/DM without an explicit `agent` field stays on Claude, regardless of what's declared in `agents.yaml`. A request for an agent not in that project's `allowedAgents` (or a workdir not declared in `agents.yaml` at all) silently falls back to Claude-only — check `router-debug.log` if a group doesn't behave as expected.
+
+**Notes:**
+- OpenCode sessions are sticky per conversation and persisted in SQLite (`router.db`) — they survive a router restart.
+- Permission requests from OpenCode's tool calls surface as an interactive Feishu approve/deny card, same as Claude's.
+- Attachments aren't supported on the OpenCode path yet.
+- Fallback (auto-switching Claude → OpenCode on failure) is designed (see `docs/multi-agent-router-design.md`) but not wired into the live dispatch path — keep `agents.yaml`'s `fallback.enabled: false`.
+
 ## Access Management
 
 All access commands are run in your Claude Code terminal via `/feishu:access`.
@@ -286,13 +354,15 @@ Groups are off by default. The bot must be added to the group by a group admin f
 ```
 ~/.claude/channels/feishu/
 ├── .env              # App credentials (FEISHU_APP_ID, FEISHU_APP_SECRET)
-├── access.json       # Access control state (auto-managed)
+├── access.json       # Access control + chat->project/agent mapping (auto-managed)
+├── agents.yaml        # Optional backend/infra config for OpenCode (see OpenCode Backend)
 ├── approved/         # Pairing approval signals (transient)
 ├── inbox/            # Downloaded attachments
-├── debug.log         # Server debug log
-├── router-debug.log  # Router debug log (when using router)
-└── router/           # Router message inboxes (when using router)
-    └── <chat_id>/    # Per-group message files
+├── debug.log         # Worker (server.ts) debug log
+├── router-debug.log  # Router debug log
+├── router.sock       # Unix socket workers connect to
+├── router.db         # SQLite: conversation bindings, permission callbacks, processed-event dedup
+└── router.lock/       # Router singleton lock (prevents duplicate router processes)
 ```
 
 ## Environment Variables
