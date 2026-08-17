@@ -123,11 +123,13 @@ OpenCode Adapter：
 
 ## 五、配置设计
 
-建议拆分：
+> **修订（实现阶段）**：最初设计里 `router.yaml` 的 `routes.dms`/`routes.groups` 和 `access.json` 的 `groups.<chatId>.workdir` 是同一件事——"这个会话该落到哪个 project"——的两份平行定义。已改为下面这版：chat → project 的映射**始终只有 access.json 一个来源**，`router.yaml` 改名 `agents.yaml`，只保留跟入口安全无关的后端/项目白名单/fallback 配置。原因见下方"拆分理由"。
 
-- `access.json`：继续保存用户、群、mention、pairing 等入口安全配置。
+拆分：
 
-- `router.yaml`：新增后端、项目、路由和 fallback。
+- `access.json`：继续保存用户、群、mention、pairing 等入口安全配置；**新增**每个 group（及 `defaultAgent`）可选的 `agent: {primary, fallback, policy}` 字段——不填就是纯 Claude，完全向后兼容。这是 chat → project、chat → agent 的唯一来源。
+
+- `agents.yaml`（原 `router.yaml`）：只保留后端连接信息（agents）、项目白名单（projects：workdir + allowedAgents）、默认 agent 策略（defaults.agent，access.json 没显式指定时用）、fallback 策略。**不再有 `routes` 段**。
 
 - `.env`/Keychain：保存 secrets。
 
@@ -135,7 +137,6 @@ OpenCode Adapter：
 version: 1
 
 defaults:
-  project: inv
   agent:
     primary: claude
     fallback: null
@@ -166,30 +167,6 @@ projects:
     workdir: /Users/openclaw/Projects/feishuchannel
     allowedAgents: [claude, opencode]
 
-routes:
-  dms:
-    default:
-      project: inv
-      agent:
-        primary: claude
-        fallback: opencode
-        policy: pre_execution_only
-
-  groups:
-    oc_group_for_inv:
-      project: inv
-      requireMention: true
-      agent:
-        primary: claude
-        fallback: opencode
-        policy: pre_execution_only
-
-    oc_group_for_opencode:
-      project: feishuchannel
-      agent:
-        primary: opencode
-        fallback: null
-
 fallback:
   enabled: true
   triggerOn:
@@ -208,9 +185,34 @@ fallback:
   notifyUser: true
 ```
 
-解析优先级：主题临时绑定 → 群/私聊显式 route → defaults → 旧 `access.json` 兼容映射。旧配置推导出的 agent 默认为 Claude。
+access.json 里对应的扩展（示例）：
 
-启动时做 schema 和安全校验：workdir 必须为绝对路径且 canonicalize 后在允许根目录；route 引用必须存在；project 必须允许 primary/fallback；两者不能相同；secret 禁止直接写进 YAML。配置错误必须 fail-closed，不能回落到任意目录或 Agent。
+```json
+{
+  "groups": {
+    "oc_group_for_opencode": {
+      "workdir": "/Users/openclaw/Projects/feishuchannel",
+      "agent": { "primary": "opencode", "fallback": null }
+    },
+    "oc_group_for_inv": {
+      "workdir": "/Users/openclaw/Projects/inv",
+      "requireMention": true,
+      "agent": { "primary": "claude", "fallback": "opencode", "policy": "pre_execution_only" }
+    }
+  },
+  "defaultWorkdir": "/Users/openclaw/Projects/inv",
+  "defaultAgent": { "primary": "claude", "fallback": "opencode", "policy": "pre_execution_only" }
+}
+```
+
+**拆分理由**（不是为了"文件少即正义"，是两类东西的失败语义和写入路径根本不同）：
+
+- access.json 解析失败时静默兜底成安全默认值（fail-open：最坏情况没人能进来），这对访问控制是对的；agents.yaml 校验不过必须直接拒绝启动（fail-closed），绝不能带着错配置硬跑——同一份文件不能同时要两种失败语义。
+- access.json 由 `/feishu:access` 技能写，是暴露在飞书聊天场景里、需要防 prompt injection 的路径；agents.yaml 是运维手改、过 dry-run 再上线的纯基础设施配置，操作者和风险等级完全不同。
+
+解析优先级：主题临时绑定 → access.json 的 group/defaultAgent 显式 agent 字段 → agents.yaml 的 `defaults.agent` → 都没有则 Claude-only。project（workdir）本身没有优先级链——**永远只看 access.json**。
+
+**校验分两层**：agents.yaml 启动时做 schema 校验（workdir 必须绝对路径且 canonicalize 后在允许根目录内；`defaults.agent` 的 primary/fallback 不能相同）；但"access.json 里某个 chat 请求的 agent 是否在该 project 的 allowedAgents 白名单内"**不在启动时校验**——因为 access.json 可以在不重启 router 的情况下随时被 `/feishu:access` 改动。这项检查移到**每次路由解析时**：请求的 agent 不在白名单、或 workdir 根本没在 agents.yaml 里声明过对应 project，一律静默 fail-closed 回落到 Claude-only，不是启动错误。
 
 ## 六、路由与会话绑定
 
@@ -393,7 +395,7 @@ src/
 
 ## 十一、兼容与迁移
 
-- 没有 `router.yaml` 时行为与当前版本一致。
+- 没有 `agents.yaml` 时行为与当前版本一致（纯 Claude-only，access.json 驱动）。
 
 - 现有 `access.json` 不废弃，group.workdir/defaultWorkdir 自动映射为 Claude route。
 

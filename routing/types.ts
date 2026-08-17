@@ -11,12 +11,6 @@ export interface AgentPolicy {
   policy?: 'pre_execution_only'
 }
 
-export interface RouteConfig {
-  project: string
-  requireMention?: boolean
-  agent: AgentPolicy
-}
-
 export interface ProjectConfig {
   workdir: string
   allowedAgents: AgentKind[]
@@ -54,20 +48,24 @@ export type FallbackTrigger =
   | 'rate_limited'
   | 'capacity_exhausted'
 
+/**
+ * Backend/infra config only — NOT access control and NOT chat->project
+ * routing. Which project a chat maps to, and any per-chat agent override,
+ * live in access.json (extended with an optional `agent` field per group/DM)
+ * so there is exactly one place that owns "who can reach the bot and where
+ * their messages go" — see docs/multi-agent-router-design.md's revision
+ * after the original two-file split turned out to duplicate that mapping.
+ */
 export interface RouterConfig {
   version: 1
   defaults: {
-    project: string
+    /** Agent policy used when a chat's access.json entry doesn't specify one. */
     agent: AgentPolicy
     routingKey: 'thread' | 'chat'
     stickyBackend: boolean
   }
   agents: Partial<Record<AgentKind, AgentBackendConfig>>
   projects: Record<string, ProjectConfig>
-  routes: {
-    dms: Record<string, RouteConfig>
-    groups: Record<string, RouteConfig>
-  }
   fallback: FallbackConfig
 }
 

@@ -5,7 +5,7 @@ import { join } from 'path'
 import { loadRouterConfig, RouterConfigError, validateRouterConfig } from './config'
 
 function tmpRoot(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'router-cfg-'))
+  const dir = mkdtempSync(join(tmpdir(), 'agents-cfg-'))
   mkdirSync(join(dir, 'proj'), { recursive: true })
   return dir
 }
@@ -13,9 +13,8 @@ function tmpRoot(): string {
 function baseConfig(root: string) {
   return {
     version: 1,
-    defaults: { project: 'proj', agent: { primary: 'claude', fallback: null }, routingKey: 'chat', stickyBackend: true },
+    defaults: { agent: { primary: 'claude', fallback: null }, routingKey: 'chat', stickyBackend: true },
     projects: { proj: { workdir: join(root, 'proj'), allowedAgents: ['claude', 'opencode'] } },
-    routes: { dms: {}, groups: {} },
     fallback: { enabled: true, triggerOn: [], neverTriggerOn: [], maxAttempts: 1, cooldownSeconds: 300, notifyUser: true },
   }
 }
@@ -24,7 +23,8 @@ describe('validateRouterConfig', () => {
   test('accepts a minimal valid config', () => {
     const root = tmpRoot()
     const cfg = validateRouterConfig(baseConfig(root), [root])
-    expect(cfg.defaults.project).toBe('proj')
+    expect(cfg.defaults.agent).toEqual({ primary: 'claude', fallback: null })
+    expect(cfg.projects.proj.workdir).toBe(join(root, 'proj'))
   })
 
   test('rejects relative workdir', () => {
@@ -41,21 +41,6 @@ describe('validateRouterConfig', () => {
     expect(() => validateRouterConfig(raw, [other])).toThrow(RouterConfigError)
   })
 
-  test('rejects route referencing unknown project', () => {
-    const root = tmpRoot()
-    const raw: any = baseConfig(root)
-    raw.routes.groups['oc_x'] = { project: 'ghost', agent: { primary: 'claude', fallback: null } }
-    expect(() => validateRouterConfig(raw, [root])).toThrow(/unknown project/)
-  })
-
-  test('rejects agent not in project.allowedAgents', () => {
-    const root = tmpRoot()
-    const raw: any = baseConfig(root)
-    raw.projects.proj.allowedAgents = ['claude']
-    raw.routes.groups['oc_x'] = { project: 'proj', agent: { primary: 'opencode', fallback: null } }
-    expect(() => validateRouterConfig(raw, [root])).toThrow(/not in project/)
-  })
-
   test('rejects primary === fallback', () => {
     const root = tmpRoot()
     const raw: any = baseConfig(root)
@@ -69,21 +54,28 @@ describe('validateRouterConfig', () => {
     delete raw.version
     expect(() => validateRouterConfig(raw, [root])).toThrow(RouterConfigError)
   })
+
+  test('does not require defaults.agent to be valid for any specific project — that is checked per-chat at resolve time', () => {
+    const root = tmpRoot()
+    const raw: any = baseConfig(root)
+    raw.projects.proj.allowedAgents = ['claude'] // opencode not allowed for this project...
+    raw.defaults.agent = { primary: 'opencode', fallback: null } // ...but that's fine at load time
+    expect(() => validateRouterConfig(raw, [root])).not.toThrow()
+  })
 })
 
 describe('loadRouterConfig', () => {
   test('returns null when file does not exist (legacy-only mode)', () => {
     const root = tmpRoot()
-    expect(loadRouterConfig(join(root, 'no-such-router.yaml'), [root])).toBeNull()
+    expect(loadRouterConfig(join(root, 'no-such-agents.yaml'), [root])).toBeNull()
   })
 
   test('parses a real YAML file from disk', () => {
     const root = tmpRoot()
-    const yamlPath = join(root, 'router.yaml')
+    const yamlPath = join(root, 'agents.yaml')
     writeFileSync(yamlPath, `
 version: 1
 defaults:
-  project: proj
   agent:
     primary: claude
     fallback: null
@@ -93,12 +85,12 @@ projects:
     allowedAgents: [claude]
 `)
     const cfg = loadRouterConfig(yamlPath, [root])
-    expect(cfg?.defaults.project).toBe('proj')
+    expect(cfg?.projects.proj.allowedAgents).toEqual(['claude'])
   })
 
   test('throws (fail-closed) on malformed YAML rather than falling back silently', () => {
     const root = tmpRoot()
-    const yamlPath = join(root, 'router.yaml')
+    const yamlPath = join(root, 'agents.yaml')
     writeFileSync(yamlPath, 'defaults: [this is not, a valid config')
     expect(() => loadRouterConfig(yamlPath, [root])).toThrow()
   })

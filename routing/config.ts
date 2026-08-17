@@ -1,15 +1,20 @@
 /**
- * router.yaml loader — schema validation + fail-closed startup checks.
+ * agents.yaml loader — schema validation + fail-closed startup checks.
  *
- * A missing router.yaml is not an error: callers should fall back to legacy
- * access.json-only behavior (see resolver.ts). A *present but invalid*
- * router.yaml IS an error — we never silently fall back to an arbitrary
- * workdir or agent.
+ * Backend/infra config only (agents, projects, fallback policy) — NOT
+ * access control and NOT chat->project routing. That lives in access.json
+ * (see resolver.ts's LegacyAccess type), which is the single source of
+ * truth for which chat maps to which project and, optionally, which agent.
+ *
+ * A missing agents.yaml is not an error: callers fall back to Claude-only
+ * behavior driven entirely by access.json (see resolver.ts). A *present but
+ * invalid* agents.yaml IS an error — we never silently start with a
+ * partially-valid infra config.
  */
 import { existsSync, readFileSync, realpathSync } from 'fs'
 import { isAbsolute, resolve } from 'path'
 import { z } from 'zod'
-import type { AgentKind, RouterConfig } from './types'
+import type { RouterConfig } from './types'
 
 const agentPolicySchema = z.object({
   primary: z.enum(['claude', 'opencode']),
@@ -19,16 +24,9 @@ const agentPolicySchema = z.object({
   message: 'agent.fallback must differ from agent.primary',
 })
 
-const routeConfigSchema = z.object({
-  project: z.string().min(1),
-  requireMention: z.boolean().optional(),
-  agent: agentPolicySchema,
-})
-
 const routerConfigSchema = z.object({
   version: z.literal(1),
   defaults: z.object({
-    project: z.string().min(1),
     agent: agentPolicySchema,
     routingKey: z.enum(['thread', 'chat']).default('chat'),
     stickyBackend: z.boolean().default(true),
@@ -52,10 +50,6 @@ const routerConfigSchema = z.object({
     workdir: z.string().min(1),
     allowedAgents: z.array(z.enum(['claude', 'opencode'])).min(1),
   })),
-  routes: z.object({
-    dms: z.record(z.string(), routeConfigSchema).default({}),
-    groups: z.record(z.string(), routeConfigSchema).default({}),
-  }).default({ dms: {}, groups: {} }),
   fallback: z.object({
     enabled: z.boolean().default(true),
     triggerOn: z.array(z.enum(['backend_unavailable', 'startup_timeout', 'rate_limited', 'capacity_exhausted'])).default([]),
@@ -73,14 +67,16 @@ export class RouterConfigError extends Error {}
  * cross-field / filesystem invariants that zod can't express:
  *   - every project.workdir must be an absolute path that canonicalizes to
  *     somewhere inside `allowedRoots`
- *   - every route's `project` must reference a declared project
- *   - every route's primary/fallback agent must be in that project's allowedAgents
+ *   - defaults.agent's primary/fallback don't need to be valid for any
+ *     specific project here — that's checked per-chat at resolve time
+ *     (resolver.ts), since which project a chat uses comes from access.json
+ *     and can change without restarting the router.
  * Throws RouterConfigError on any violation — callers must fail closed.
  */
 export function validateRouterConfig(raw: unknown, allowedRoots: string[]): RouterConfig {
   const parsed = routerConfigSchema.safeParse(raw)
   if (!parsed.success) {
-    throw new RouterConfigError(`router.yaml schema invalid: ${parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ')}`)
+    throw new RouterConfigError(`agents.yaml schema invalid: ${parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ')}`)
   }
   const cfg = parsed.data as RouterConfig
 
@@ -103,31 +99,11 @@ export function validateRouterConfig(raw: unknown, allowedRoots: string[]): Rout
     }
   }
 
-  const checkRoute = (scope: string, chatId: string, route: RouterConfig['routes']['dms'][string]) => {
-    const proj = cfg.projects[route.project]
-    if (!proj) throw new RouterConfigError(`route ${scope}.${chatId}: unknown project "${route.project}"`)
-    checkAgentAllowed(scope, chatId, route.project, proj.allowedAgents, route.agent.primary, 'primary')
-    if (route.agent.fallback) checkAgentAllowed(scope, chatId, route.project, proj.allowedAgents, route.agent.fallback, 'fallback')
-  }
-  const checkAgentAllowed = (scope: string, chatId: string, projectId: string, allowed: AgentKind[], agent: AgentKind, role: string) => {
-    if (!allowed.includes(agent)) {
-      throw new RouterConfigError(`route ${scope}.${chatId}: ${role} agent "${agent}" not in project "${projectId}".allowedAgents [${allowed.join(', ')}]`)
-    }
-  }
-
-  const defaultProj = cfg.projects[cfg.defaults.project]
-  if (!defaultProj) throw new RouterConfigError(`defaults.project "${cfg.defaults.project}" is not a declared project`)
-  checkAgentAllowed('defaults', '(default)', cfg.defaults.project, defaultProj.allowedAgents, cfg.defaults.agent.primary, 'primary')
-  if (cfg.defaults.agent.fallback) checkAgentAllowed('defaults', '(default)', cfg.defaults.project, defaultProj.allowedAgents, cfg.defaults.agent.fallback, 'fallback')
-
-  for (const [chatId, route] of Object.entries(cfg.routes.dms)) checkRoute('dms', chatId, route)
-  for (const [chatId, route] of Object.entries(cfg.routes.groups)) checkRoute('groups', chatId, route)
-
   return cfg
 }
 
 /**
- * Load router.yaml from disk. Returns null if the file does not exist
+ * Load agents.yaml from disk. Returns null if the file does not exist
  * (legacy-only mode). Throws RouterConfigError if the file exists but is
  * malformed or violates an invariant — never returns a partially-valid config.
  */
@@ -137,7 +113,7 @@ export function loadRouterConfig(path: string, allowedRoots: string[]): RouterCo
   try {
     raw = Bun.YAML.parse(readFileSync(path, 'utf8'))
   } catch (e) {
-    throw new RouterConfigError(`router.yaml failed to parse: ${e}`)
+    throw new RouterConfigError(`agents.yaml failed to parse: ${e}`)
   }
   return validateRouterConfig(raw, allowedRoots)
 }
