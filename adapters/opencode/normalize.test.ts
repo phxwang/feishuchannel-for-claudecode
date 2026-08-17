@@ -18,9 +18,14 @@ describe('normalizeOpenCodeEvent', () => {
     expect(normalizeOpenCodeEvent({ type: 'session.idle' }, 't1')).toEqual({ type: 'session.idle', taskId: 't1' })
   })
 
-  test('session.error -> task.failed', () => {
-    expect(normalizeOpenCodeEvent({ type: 'session.error', properties: { error: 'boom' } }, 't1'))
-      .toEqual({ type: 'task.failed', taskId: 't1', reason: 'boom' })
+  test('session.error -> task.failed, extracting the structured error message', () => {
+    const raw = { type: 'session.error', properties: { error: { name: 'APIError', data: { message: 'boom', isRetryable: false } } } }
+    expect(normalizeOpenCodeEvent(raw, 't1')).toEqual({ type: 'task.failed', taskId: 't1', reason: 'boom' })
+  })
+
+  test('session.error falls back to the error name when data.message is missing', () => {
+    const raw = { type: 'session.error', properties: { error: { name: 'UnknownError', data: {} } } }
+    expect(normalizeOpenCodeEvent(raw, 't1')).toEqual({ type: 'task.failed', taskId: 't1', reason: 'UnknownError' })
   })
 
   test('text part -> text.delta', () => {
@@ -43,19 +48,18 @@ describe('normalizeOpenCodeEvent', () => {
     expect(normalizeOpenCodeEvent(raw, 't1')).toEqual({ type: 'tool.failed', taskId: 't1', toolName: 'bash', error: 'nope' })
   })
 
-  test('finished assistant message -> text.completed', () => {
-    const raw = { type: 'message.updated', properties: { info: { role: 'assistant', text: 'done', finished: true } } }
-    expect(normalizeOpenCodeEvent(raw, 't1')).toEqual({ type: 'text.completed', taskId: 't1', text: 'done' })
+  test('step-start/step-finish parts are not text/tool -> null', () => {
+    expect(normalizeOpenCodeEvent({ type: 'message.part.updated', properties: { part: { type: 'step-start' } } }, 't1')).toBeNull()
   })
 
-  test('unfinished assistant message -> null', () => {
-    const raw = { type: 'message.updated', properties: { info: { role: 'assistant', text: 'partial', finished: false } } }
+  test('message.updated is not modeled (AssistantMessage carries no full text) -> null', () => {
+    const raw = { type: 'message.updated', properties: { info: { role: 'assistant', sessionID: 's1' } } }
     expect(normalizeOpenCodeEvent(raw, 't1')).toBeNull()
   })
 
-  test('permission.updated -> permission.requested', () => {
-    const raw = { type: 'permission.updated', properties: { id: 'p1', tool: 'bash', description: 'run rm -rf' } }
-    expect(normalizeOpenCodeEvent(raw, 't1')).toEqual({ type: 'permission.requested', taskId: 't1', requestId: 'p1', toolName: 'bash', description: 'run rm -rf' })
+  test('permission.asked -> permission.requested', () => {
+    const raw = { type: 'permission.asked', properties: { id: 'per_1', sessionID: 's1', permission: 'bash', patterns: [], metadata: {}, always: [] } }
+    expect(normalizeOpenCodeEvent(raw, 't1')).toEqual({ type: 'permission.requested', taskId: 't1', requestId: 'per_1', toolName: 'bash', description: 'bash' })
   })
 
   test('unrecognized event type -> null (dropped, not guessed)', () => {
