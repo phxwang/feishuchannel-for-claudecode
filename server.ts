@@ -349,6 +349,24 @@ const mcp = new Server(
 const pendingPerms = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 const pendingConfirms = new Map<string, { chatId: string; senderId: string; title: string; content: string }>()
 
+// ── Worker protocol (router.ts side) ────────────────────────────────────────
+// See docs/multi-agent-router-design.md §4/§9 — router uses these to route
+// permission/confirm-card button clicks to this exact worker instead of
+// guessing from chat_id or broadcasting to every connected worker.
+const WORKER_ID = randomBytes(8).toString('hex')
+const WORKER_PROTOCOL_VERSION = 1
+const WORKER_CAPABILITIES = ['permission_request', 'confirm_card']
+let workerSock: import('net').Socket | null = null
+
+/** Tell the router which workdir issued a permission/confirm card `code`, so its
+ *  card.action.trigger handler can route the click precisely (routing/storage.ts PermissionRegistry). */
+function registerCallback(code: string) {
+  if (!workerSock) { dbg(`registerCallback(${code}): no router connection, precise routing unavailable for this card — falling back to chat_id lookup`); return }
+  try {
+    workerSock.write(JSON.stringify({ type: 'callback_registered', code, workdir: CLAUDE_WORKDIR ?? process.cwd() }) + '\n')
+  } catch (e) { dbg(`registerCallback failed: ${e}`) }
+}
+
 function buildPermCard(tool_name: string, description: string, request_id: string): string {
   return JSON.stringify({
     schema: '2.0',
@@ -518,6 +536,7 @@ mcp.setNotificationHandler(
     dbg(`permission_request received: tool=${params.tool_name} request_id=${params.request_id}`)
     const { request_id, tool_name, description } = params
     pendingPerms.set(request_id, params)
+    registerCallback(request_id)
     const card = buildPermCard(tool_name, description, request_id)
     const a = loadAccess()
     const chatForUser = Object.fromEntries(Object.entries(a.p2pChats).map(([cid, oid]) => [oid, cid]))
@@ -653,6 +672,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         assertAllowedChat(chatId, loadAccess())
         const code = genConfirmCode()
         pendingConfirms.set(code, { chatId, senderId: '', title, content })
+        registerCallback(code)
         const card = buildConfirmCard(title, content, code)
         const r = await apiClient.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: card } })
         const msgId = (r as any)?.message_id ?? (r as any)?.data?.message_id ?? ''
@@ -971,7 +991,14 @@ function connectWorker() {
   let sockBuf = ''
   const sock = netConnect(ROUTER_SOCK, () => {
     dbg('worker: connected to router')
-    sock.write(JSON.stringify({ type: 'register', workdir: CLAUDE_WORKDIR ?? process.cwd() }) + '\n')
+    workerSock = sock
+    sock.write(JSON.stringify({
+      type: 'register',
+      workdir: CLAUDE_WORKDIR ?? process.cwd(),
+      workerId: WORKER_ID,
+      capabilities: WORKER_CAPABILITIES,
+      protocolVersion: WORKER_PROTOCOL_VERSION,
+    }) + '\n')
   })
   sock.on('data', (chunk) => {
     sockBuf += chunk.toString()
@@ -996,8 +1023,8 @@ function connectWorker() {
       } catch (e) { dbg(`worker: bad message: ${e}`) }
     }
   })
-  sock.on('error', (e) => dbg(`worker: socket error: ${e}`))
-  sock.on('close', () => dbg('worker: router disconnected'))
+  sock.on('error', (e) => { dbg(`worker: socket error: ${e}`); if (workerSock === sock) workerSock = null })
+  sock.on('close', () => { dbg('worker: router disconnected'); if (workerSock === sock) workerSock = null })
 }
 
 if (WORKER_MODE) {
