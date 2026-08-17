@@ -202,13 +202,49 @@ claude-feishu
 
 The **first** instance auto-spawns the router. Subsequent instances connect as workers. The router matches incoming messages by `chat_id → workdir → connected worker`.
 
-> **Manual router start** (optional): Run `bun run router` in the plugin directory before starting any Claude instances.
+### 3. Running the Router as a Service (recommended for anything long-running)
 
-### 3. Check Status
+The auto-spawn behavior above is convenient for quick starts, but for a machine that stays up (a dev box, a server), run the router as a supervised background service instead — it survives crashes and reboots without depending on any particular `claude-feishu` instance staying alive to relaunch it. Ad-hoc `bun router.ts` or a tmux pane both work for testing, but **once a service is installed, don't also start the router manually** — `router-lock.ts` prevents two routers from serving traffic at once, so a manually-started process will just exit immediately (or fight with the service over the singleton lock).
+
+**macOS (launchd):** create `~/Library/LaunchAgents/com.yourname.feishuchannel-router.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.yourname.feishuchannel-router</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/bun</string>
+    <string>/path/to/feishuchannel/router.ts</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>WorkingDirectory</key><string>/path/to/feishuchannel</string>
+  <key>StandardOutPath</key><string>/path/to/logs/router.stdout.log</string>
+  <key>StandardErrorPath</key><string>/path/to/logs/router.stderr.log</string>
+</dict>
+</plist>
+```
 
 ```bash
-kill -USR1 $(pgrep -f 'bun router.ts')
-cat ~/.claude/channels/feishu/router-debug.log | tail -10
+# Load it (starts the router, and on every future login/reboot)
+launchctl load -w ~/Library/LaunchAgents/com.yourname.feishuchannel-router.plist
+
+# Restart after a code update (KeepAlive relaunches it automatically otherwise)
+launchctl kickstart -k gui/$(id -u)/com.yourname.feishuchannel-router
+
+# Service status (running/not, PID, last exit code)
+launchctl print gui/$(id -u)/com.yourname.feishuchannel-router
+```
+
+**Router-internal status** (connected workers, regardless of how the process was started):
+
+```bash
+kill -USR1 $(pgrep -f 'bun.*router.ts')
+tail -10 ~/.claude/channels/feishu/router-debug.log
 ```
 
 ## OpenCode Backend
