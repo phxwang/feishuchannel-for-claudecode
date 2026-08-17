@@ -482,10 +482,10 @@ async function handleInbound(data: any) {
   if (!content) return
 
   const workdir = route.workdir
+  const ocContent = atts.length ? `${content}\n\n(注意: OpenCode 当前不支持附件，已忽略)` : content
 
   if (route.agent.primary === 'opencode') {
     dbg(`routing ${chatId} (${chatType}) → ${workdir} via OpenCode`)
-    const ocContent = atts.length ? `${content}\n\n(注意: OpenCode 当前不支持附件，已忽略)` : content
     // Mark processed now, at dispatch — not after the task finishes (which can
     // take up to taskTimeoutSeconds). Marking late left a redelivery window
     // where the same Feishu message_id could dispatch a second concurrent
@@ -512,6 +512,17 @@ async function handleInbound(data: any) {
   })
   if (delivered) {
     markEventProcessed(db, messageId, new Date().toISOString())
+  } else if (route.agent.fallback === 'opencode' && infraConfig?.fallback.enabled && openCodeAdapter) {
+    // Design doc §7's strictest allowed-fallback case: the task was never
+    // delivered to Claude at all (no worker connected), so there is
+    // provably no side effect and no risk of duplicate execution. Any
+    // richer trigger (Claude accepted the task but then failed/hung) is
+    // deliberately NOT handled here — that needs real task-state tracking,
+    // which isn't wired up yet.
+    dbg(`${chatId}: Claude worker unavailable for ${workdir}, falling back to OpenCode (pre-execution, no side effect)`)
+    markEventProcessed(db, messageId, new Date().toISOString())
+    void replyText(chatId, messageId, '⚠️ Claude Code 当前不可用，已切换到 OpenCode 处理本次任务。')
+    void handleOpenCodeTask(route, chatId, messageId, chatKind, ocContent)
   } else {
     const hint = `⚠️ No active Claude Code session for \`${workdir}\`. Please run \`claude-feishu\` in that directory, then send your message again.`
     void (apiClient as any).im.message.reply({
