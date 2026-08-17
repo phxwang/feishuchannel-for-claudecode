@@ -17,7 +17,7 @@ import {
 import { homedir } from 'os'
 import { join, resolve } from 'path'
 import { acquireRouterLock, releaseRouterLock } from './router-lock'
-import { markEventProcessed, openDb, PermissionRegistry } from './routing/storage'
+import { markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, wasEventProcessed } from './routing/storage'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -242,7 +242,10 @@ async function handleInbound(data: any) {
   const mentions: any[] = message.mentions ?? []
   const createTime: string = message.create_time ?? ''
   if (!senderId || !chatId || !messageId) return
-  if (!markEventProcessed(db, messageId, new Date().toISOString())) { dbg(`duplicate event ${messageId}, dropping`); return }
+  // Peek only — recorded as processed further down, once delivery actually succeeds,
+  // so a Feishu redelivery of a message that failed to route (no worker connected yet)
+  // can still be retried instead of being dropped forever.
+  if (wasEventProcessed(db, messageId)) { dbg(`duplicate event ${messageId}, dropping`); return }
 
   let text = ''
   const postImageKeys: string[] = []
@@ -322,7 +325,9 @@ async function handleInbound(data: any) {
       ...(atts.length ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
     },
   })
-  if (!delivered) {
+  if (delivered) {
+    markEventProcessed(db, messageId, new Date().toISOString())
+  } else {
     const hint = `⚠️ No active Claude Code session for \`${workdir}\`. Please run \`claude-feishu\` in that directory, then send your message again.`
     void (apiClient as any).im.message.reply({
       path: { message_id: messageId },
@@ -344,22 +349,25 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   const chatId = data?.open_chat_id ?? ''
   const registered = permissionRegistry.resolve(code)
   const workdir = registered?.workdir ?? (chatId ? resolveWorkdir(chatId, 'group') ?? resolveWorkdir(chatId, 'p2p') : undefined)
-  if (registered) permissionRegistry.consume(code)
+  // Only consume the registry entry once delivery actually succeeds — if the worker
+  // has gone away, keep it so a retry (or a redelivered click) can still resolve it.
+  const consumeIfDelivered = (delivered: boolean) => { if (delivered && registered) permissionRegistry.consume(code) }
 
   if (action === 'perm_allow' || action === 'perm_deny') {
     const behavior = action === 'perm_deny' ? 'deny' : 'allow'
     const payload = { type: 'permission_response', request_id: code, behavior }
-    if (workdir) routeToWorkdir(workdir, payload)
-    else dbg(`callback code ${code} has no known workdir, dropping (not broadcasting)`)
+    const delivered = workdir ? routeToWorkdir(workdir, payload) : false
+    consumeIfDelivered(delivered)
+    if (!delivered) dbg(`callback code ${code} could not be delivered (workdir=${workdir ?? 'unknown'}), not broadcasting`)
 
-    const statusText = behavior === 'allow' ? '✅ 已允许' : '❌ 已拒绝'
+    const statusText = !delivered ? '⚠️ 未找到在线实例，请确认对应项目仍在运行后重试' : (behavior === 'allow' ? '✅ 已允许' : '❌ 已拒绝')
     return {
-      toast: { type: behavior === 'deny' ? 'info' : 'success', content: statusText },
+      toast: { type: !delivered ? 'warning' : (behavior === 'deny' ? 'info' : 'success'), content: statusText },
       card: {
         type: 'raw',
         data: {
           schema: '2.0', config: { wide_screen_mode: true },
-          header: { title: { tag: 'plain_text', content: `🔐 Permission Request — ${statusText}` }, template: behavior === 'deny' ? 'grey' : 'green' },
+          header: { title: { tag: 'plain_text', content: `🔐 Permission Request — ${statusText}` }, template: !delivered ? 'red' : (behavior === 'deny' ? 'grey' : 'green') },
           body: { elements: [{ tag: 'hr' }, { tag: 'markdown', content: `**${statusText}**` }] },
         },
       },
@@ -380,17 +388,18 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
         chat_type: 'p2p',
       },
     }
-    if (workdir) routeToWorkdir(workdir, payload)
-    else dbg(`callback code ${code} has no known workdir, dropping (not broadcasting)`)
+    const delivered = workdir ? routeToWorkdir(workdir, payload) : false
+    consumeIfDelivered(delivered)
+    if (!delivered) dbg(`callback code ${code} could not be delivered (workdir=${workdir ?? 'unknown'}), not broadcasting`)
 
-    const statusText = isConfirm ? '✅ 已确认' : '❌ 已取消'
+    const statusText = !delivered ? '⚠️ 未找到在线实例，请确认对应项目仍在运行后重试' : (isConfirm ? '✅ 已确认' : '❌ 已取消')
     return {
-      toast: { type: isConfirm ? 'success' : 'info', content: statusText },
+      toast: { type: !delivered ? 'warning' : (isConfirm ? 'success' : 'info'), content: statusText },
       card: {
         type: 'raw',
         data: {
           schema: '2.0', config: { wide_screen_mode: true },
-          header: { title: { tag: 'plain_text', content: `⚡ 操作确认 — ${statusText}` }, template: isConfirm ? 'green' : 'grey' },
+          header: { title: { tag: 'plain_text', content: `⚡ 操作确认 — ${statusText}` }, template: !delivered ? 'red' : (isConfirm ? 'green' : 'grey') },
           body: { elements: [{ tag: 'hr' }, { tag: 'markdown', content: `**${statusText}**` }] },
         },
       },
@@ -458,6 +467,14 @@ process.on('exit', () => releaseRouterLock(LOCK_DIR))
 const access = readAccess()
 const groupCount = Object.keys(access.groups).length
 dbg(`router ready — ${groupCount} groups, defaultWorkdir=${access.defaultWorkdir ?? '(none)'}`)
+
+// Prune processed_events so a long-running router's SQLite file doesn't grow unbounded.
+const PRUNE_INTERVAL_MS = 6 * 3600 * 1000
+const PRUNE_RETENTION_MS = 7 * 24 * 3600 * 1000
+setInterval(() => {
+  const n = pruneProcessedEvents(db, new Date(Date.now() - PRUNE_RETENTION_MS).toISOString())
+  if (n) dbg(`pruned ${n} old processed_events rows`)
+}, PRUNE_INTERVAL_MS)
 
 // Keep alive
 await new Promise(() => {})

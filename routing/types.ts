@@ -109,5 +109,14 @@ export interface TaskContext {
   attemptedAgents: AgentKind[]
   /** true once the primary has produced any visible text, tool call, file change, or permission request */
   hasSideEffect: boolean
+  /**
+   * Only meaningful in SUBMITTED: true once the Adapter has positive proof the
+   * backend never received the task (e.g. an immediate connection-refused/4xx
+   * before any ack). Design doc §7 allows fallback only for "已确认未接收"
+   * SUBMITTED tasks — without this proof, SUBMITTED must NOT be treated as
+   * fallback-eligible just because no side effect has been observed yet, since
+   * the backend may simply not have started executing yet.
+   */
+  confirmedNotReceived?: boolean
   failureReason?: FallbackTrigger | 'permission_denied' | 'user_abort' | 'invalid_request' | 'tool_failure' | 'partial_execution' | 'unknown'
 }

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
-import { markEventProcessed, openDb, PermissionRegistry, SqliteBindingStore } from './storage'
+import {
+  markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, SqliteBindingStore, wasEventProcessed,
+} from './storage'
 import { createBinding, switchActiveAgent } from './bindings'
 
 describe('SqliteBindingStore', () => {
@@ -66,5 +68,26 @@ describe('markEventProcessed', () => {
     const db = openDb(':memory:')
     markEventProcessed(db, 'evt-1', '2026-01-01T00:00:00Z')
     expect(markEventProcessed(db, 'evt-1', '2026-01-01T00:00:01Z')).toBe(false)
+  })
+})
+
+describe('wasEventProcessed', () => {
+  test('false before recording, true after', () => {
+    const db = openDb(':memory:')
+    expect(wasEventProcessed(db, 'evt-1')).toBe(false)
+    markEventProcessed(db, 'evt-1', '2026-01-01T00:00:00Z')
+    expect(wasEventProcessed(db, 'evt-1')).toBe(true)
+  })
+})
+
+describe('pruneProcessedEvents', () => {
+  test('deletes rows older than the cutoff, keeps newer ones', () => {
+    const db = openDb(':memory:')
+    markEventProcessed(db, 'old', '2026-01-01T00:00:00Z')
+    markEventProcessed(db, 'new', '2026-06-01T00:00:00Z')
+    const deleted = pruneProcessedEvents(db, '2026-03-01T00:00:00Z')
+    expect(deleted).toBe(1)
+    expect(wasEventProcessed(db, 'old')).toBe(false)
+    expect(wasEventProcessed(db, 'new')).toBe(true)
   })
 })

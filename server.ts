@@ -361,7 +361,7 @@ let workerSock: import('net').Socket | null = null
 /** Tell the router which workdir issued a permission/confirm card `code`, so its
  *  card.action.trigger handler can route the click precisely (routing/storage.ts PermissionRegistry). */
 function registerCallback(code: string) {
-  if (!workerSock) return
+  if (!workerSock) { dbg(`registerCallback(${code}): no router connection, precise routing unavailable for this card — falling back to chat_id lookup`); return }
   try {
     workerSock.write(JSON.stringify({ type: 'callback_registered', code, workdir: CLAUDE_WORKDIR ?? process.cwd() }) + '\n')
   } catch (e) { dbg(`registerCallback failed: ${e}`) }

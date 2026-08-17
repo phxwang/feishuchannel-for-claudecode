@@ -52,7 +52,12 @@ const NEVER_FALLBACK_REASONS = [
  * every rule here must have a corresponding negative test.
  */
 export function isFallbackEligible(ctx: TaskContext, reason: TaskContext['failureReason']): boolean {
-  if (ctx.state !== 'PRIMARY_PREFLIGHT' && ctx.state !== 'SUBMITTED') return false
+  const stateEligible = ctx.state === 'PRIMARY_PREFLIGHT'
+    // SUBMITTED alone is not enough — "no side effect observed yet" could just mean the
+    // backend hasn't started, not that it never received the task. Only a SUBMITTED task
+    // the Adapter has positively confirmed as unreceived may fall back (design doc §7).
+    || (ctx.state === 'SUBMITTED' && ctx.confirmedNotReceived === true)
+  if (!stateEligible) return false
   if (!ctx.fallback) return false
   if (ctx.attemptedAgents.length >= 1) return false // at most one fallback attempt, no Claude→OpenCode→Claude loop
   if (ctx.hasSideEffect) return false // primary already produced visible output/tool call/permission request
@@ -63,6 +68,11 @@ export function isFallbackEligible(ctx: TaskContext, reason: TaskContext['failur
 
 export function markSideEffect(ctx: TaskContext): TaskContext {
   return { ...ctx, hasSideEffect: true }
+}
+
+/** Call only once the Adapter has positive proof (e.g. connection refused before any ack) that a SUBMITTED task never reached the backend. */
+export function markConfirmedNotReceived(ctx: TaskContext): TaskContext {
+  return { ...ctx, confirmedNotReceived: true }
 }
 
 /** Move a task into fallback, recording the agent switch. Throws if not eligible. */

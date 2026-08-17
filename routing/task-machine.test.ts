@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   beginFallback, canTransition, createTask, InvalidTransitionError,
-  isFallbackEligible, markSideEffect, transition,
+  isFallbackEligible, markConfirmedNotReceived, markSideEffect, transition,
 } from './task-machine'
 
 function preflightTask(fallback: 'opencode' | null = 'opencode') {
@@ -41,8 +41,8 @@ describe('fallback eligibility — allowed cases (design doc §7)', () => {
     expect(isFallbackEligible(t, 'capacity_exhausted')).toBe(true)
   })
 
-  test('submitted-but-unreceived may still fall back', () => {
-    const t = transition(preflightTask(), 'SUBMITTED')
+  test('submitted, confirmed unreceived -> still eligible', () => {
+    const t = markConfirmedNotReceived(transition(preflightTask(), 'SUBMITTED'))
     expect(isFallbackEligible(t, 'startup_timeout')).toBe(true)
   })
 
@@ -87,8 +87,14 @@ describe('fallback eligibility — forbidden cases (design doc §7)', () => {
 
   test('already attempted a fallback once -> no second attempt (no ping-pong)', () => {
     const t = beginFallback(preflightTask(), 'backend_unavailable')
-    const resubmitted = transition(transition(t, 'FALLBACK_PREFLIGHT'), 'SUBMITTED')
+    const resubmitted = markConfirmedNotReceived(transition(transition(t, 'FALLBACK_PREFLIGHT'), 'SUBMITTED'))
     expect(isFallbackEligible(resubmitted, 'backend_unavailable')).toBe(false)
+  })
+
+  test('submitted but NOT confirmed unreceived -> not eligible (backend may just not have started yet)', () => {
+    const t = transition(preflightTask(), 'SUBMITTED')
+    expect(t.confirmedNotReceived).toBeUndefined()
+    expect(isFallbackEligible(t, 'startup_timeout')).toBe(false)
   })
 
   test('wrong state (RUNNING) -> not eligible even with a valid reason', () => {

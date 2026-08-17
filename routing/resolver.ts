@@ -74,7 +74,11 @@ export function resolveRoute(input: ResolveInput, config: RouterConfig | null, l
     }
   }
 
-  // Legacy access.json fallback: agent is always Claude-only.
+  // Legacy access.json fallback: agent is always Claude-only. access.json has no
+  // project registry, so `project` here is the workdir itself, NOT a key into
+  // RouterConfig.projects like every other branch returns — callers that treat
+  // ResolvedRoute.project as a config.projects lookup key must special-case
+  // source === 'legacy_access' (it's still a stable, unique id, just not that kind).
   const legacyWorkdir = input.chatType === 'group' ? legacy.groups[input.chatId]?.workdir : undefined
   const workdir = legacyWorkdir ?? legacy.defaultWorkdir
   if (!workdir) return null

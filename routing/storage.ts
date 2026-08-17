@@ -127,12 +127,24 @@ export class PermissionRegistry {
 
 // ── Inbound event idempotency ────────────────────────────────────────────
 
+/** Peek without recording — use before doing any work, to skip an event already fully handled. */
+export function wasEventProcessed(db: Database, eventId: string): boolean {
+  return !!db.query('SELECT 1 FROM processed_events WHERE event_id = ?').get(eventId)
+}
+
 /**
- * Marks a Feishu event/message id as processed. Returns true if this is the
- * first time we've seen it (caller should proceed), false if it's a
- * duplicate delivery (caller should drop it).
+ * Record a Feishu event/message id as processed. Callers should only call
+ * this once the event has actually been delivered/handled — recording it
+ * before a delivery attempt that can fail would make a legitimate Feishu
+ * redelivery (e.g. after the target worker reconnects) get silently
+ * dropped forever instead of retried.
  */
 export function markEventProcessed(db: Database, eventId: string, now: string): boolean {
   const result = db.query('INSERT OR IGNORE INTO processed_events (event_id, processed_at) VALUES (?, ?)').run(eventId, now)
   return result.changes > 0
+}
+
+/** Sweep rows older than the cutoff so the table doesn't grow unbounded on a long-running router. Returns rows deleted. */
+export function pruneProcessedEvents(db: Database, olderThanIso: string): number {
+  return db.query('DELETE FROM processed_events WHERE processed_at < ?').run(olderThanIso).changes
 }
