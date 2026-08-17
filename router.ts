@@ -16,6 +16,7 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { join, resolve } from 'path'
+import { acquireRouterLock, releaseRouterLock } from './router-lock'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -24,6 +25,7 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const DEBUG_LOG = join(STATE_DIR, 'router-debug.log')
 const SOCK_PATH = join(STATE_DIR, 'router.sock')
+const LOCK_DIR = join(STATE_DIR, 'router.lock')
 
 function dbg(msg: string) {
   const line = `${new Date().toISOString()} [router] ${msg}\n`
@@ -378,6 +380,10 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
 
 dbg('router starting')
 mkdirSync(STATE_DIR, { recursive: true })
+if (!acquireRouterLock(LOCK_DIR)) {
+  dbg('router already owned by another live process; exiting')
+  process.exit(0)
+}
 await fetchBotOpenId()
 
 // Clean up stale socket
@@ -417,11 +423,13 @@ function shutdown() {
   dbg('shutting down')
   sockServer.close()
   try { unlinkSync(SOCK_PATH) } catch {}
+  releaseRouterLock(LOCK_DIR)
   try { (wsClient as any).disconnect?.() } catch {}
   setTimeout(() => process.exit(0), 2000)
 }
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+process.on('exit', () => releaseRouterLock(LOCK_DIR))
 
 const access = readAccess()
 const groupCount = Object.keys(access.groups).length
