@@ -20,6 +20,7 @@ import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { clearWorkerSockIfCurrent, DEFAULT_DEGRADED_MS, registerCallback, sendDegraded, setWorkerSock, WORKER_CAPABILITIES, WORKER_ID, WORKER_PROTOCOL_VERSION } from './worker-link'
+import { parseRateLimitResetTime } from './rate-limit-reset'
 
 /** Walk up the process tree to find the Claude ancestor with --channels feishu.
  *  Returns its PID (or 0 if not found). */
@@ -904,7 +905,11 @@ function handleTranscriptEvent(ev: any) {
   // Tell the router this worker can't take new tasks for a while, so it can
   // skip straight to an OpenCode fallback (if that group has one configured)
   // instead of routing here and getting the same rate_limit error back.
-  sendDegraded('rate_limited', Date.now() + DEFAULT_DEGRADED_MS, dbg)
+  // Prefer the reset time Claude itself reported (e.g. "resets 9:30pm
+  // (Asia/Singapore)"); fall back to a short default if that can't be parsed.
+  const parsedReset = parseRateLimitResetTime(text)
+  const until = parsedReset ? parsedReset.getTime() : Date.now() + DEFAULT_DEGRADED_MS
+  sendDegraded('rate_limited', until, dbg)
 }
 
 async function pollTranscript() {

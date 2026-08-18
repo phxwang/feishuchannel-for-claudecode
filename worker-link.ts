@@ -29,10 +29,8 @@ export function registerCallback(code: string, workdir: string, dbg: (msg: strin
   } catch (e) { dbg(`registerCallback failed: ${e}`) }
 }
 
-/** Default cooldown applied when this worker reports itself rate-limited. Deliberately not
- *  derived from Claude's reset-time text (e.g. "resets 9:30pm (Asia/Singapore)") — parsing
- *  that reliably across timezones/DST isn't worth it when a short, self-refreshing window
- *  works just as well: each new rate_limit event pushes the window out again. */
+/** Fallback cooldown when this worker reports itself rate-limited but Claude's own reset-time
+ *  text (e.g. "resets 9:30pm (Asia/Singapore)", parsed by rate-limit-reset.ts) can't be parsed. */
 export const DEFAULT_DEGRADED_MS = 30 * 60 * 1000
 
 /** Tell the router this worker's Claude Code instance is rate-limited and won't produce

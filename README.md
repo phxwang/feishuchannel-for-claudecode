@@ -342,7 +342,7 @@ Any group/DM without an explicit `agent` field stays on Claude, regardless of wh
 Set `agent.fallback: "opencode"` on a group/DM (alongside `primary: "claude"`) and `agents.yaml`'s `fallback.enabled: true` to let that chat fail over to OpenCode. This covers two narrow, safe cases where the message provably never reached Claude, so there's no partial work to reconcile:
 
 - **No Claude Code worker connected** for that project at all.
-- **Claude Code is rate-limited.** The worker tails its own transcript for the `error:"rate_limit"` event Claude Code writes when it hits a usage limit, and tells the router it's unavailable for a cooldown window (30 min by default, refreshed on each new rate_limit event — see `worker-link.ts`'s `sendDegraded`/`DEFAULT_DEGRADED_MS`). The router skips routing to that worker entirely for the rest of the window.
+- **Claude Code is rate-limited.** The worker tails its own transcript for the `error:"rate_limit"` event Claude Code writes when it hits a usage limit, and tells the router it's unavailable until Claude's own stated reset time (`rate-limit-reset.ts` parses text like `"...resets 9:30pm (Asia/Singapore)"` — the IANA zone Claude reports is used directly, so this is correct even across timezones/DST). If that text can't be parsed, it falls back to a fixed 30-minute cooldown (`worker-link.ts`'s `DEFAULT_DEGRADED_MS`), refreshed on each new rate_limit event. The router skips routing to that worker entirely until the window ends.
 
 In either case the router replies with a one-line notice and hands the task to OpenCode instead of showing the usual "no active session" error.
 
