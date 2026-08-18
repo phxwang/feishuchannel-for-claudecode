@@ -169,6 +169,8 @@ You're ready — send messages to the bot and Claude will respond.
 
 ## Multi-Group Router Setup
 
+> The steps below start with the zero-config ad-hoc flow (fine for quick local testing), but if you're relying on this daily — or running any group on OpenCode, which has no worker to auto-spawn the router — install the router as a persistent service first (**[step 3](#3-running-the-router-as-a-service-recommended-for-anything-long-running)**) and skip step 2's manual spawn-ordering entirely: each `claude-feishu` just connects to the already-running router.
+
 ### 1. Configure Group Workdirs
 
 Add `workdir` to each group in `~/.claude/channels/feishu/access.json`:
@@ -203,7 +205,7 @@ cd /path/to/project-b
 claude-feishu
 ```
 
-The **first** instance auto-spawns the router. Subsequent instances connect as workers. The router matches incoming messages by `chat_id → workdir → connected worker`.
+The **first** instance auto-spawns the router (unless a router is already running as a service, in which case it just connects). Subsequent instances connect as workers. The router matches incoming messages by `chat_id → project → backend (Claude Code worker, or OpenCode directly)`.
 
 ### 3. Running the Router as a Service (recommended for anything long-running)
 
