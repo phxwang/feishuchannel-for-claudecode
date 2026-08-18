@@ -274,8 +274,14 @@ async function replyText(chatId: string, messageId: string, text: string) {
 }
 
 // ── OpenCode task execution ─────────────────────────────────────────────────
-// Design doc step 5: route-level primary:opencode, fallback intentionally NOT
-// wired here yet (agents.yaml has fallback.enabled: false for now).
+// Route-level primary:opencode dispatch, plus the design doc §7 pre-execution
+// fallback case: if routeToWorkdir() finds no connected Claude worker at all
+// (task never delivered, so no side effect to reconcile), and the route
+// declares agent.fallback:'opencode' with agents.yaml's fallback.enabled:true,
+// the task is handed to OpenCode instead (see handleInbound below). The richer
+// "Claude accepted then failed mid-task" case from the design doc is not
+// implemented — that needs real task-state tracking (routing/task-machine.ts
+// exists for this but isn't wired in).
 
 // conversationKey -> OpenCode sessionId is persisted in SQLite (openCodeBindings,
 // routing/storage.ts SqliteBindingStore) so a session survives a router restart

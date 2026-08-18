@@ -57,6 +57,7 @@ Map Feishu groups to project directories in `~/.claude/channels/feishu/access.js
 - **Multi-group routing** — One Feishu bot serves multiple Claude Code instances, each in its own project
 - **Auto-managed router** — Router spawns on first launch, shuts down when all workers disconnect
 - **OpenCode backend (opt-in per group/DM)** — Route specific chats to [OpenCode](https://opencode.ai) instead of Claude Code, with sessions persisted in SQLite across router restarts
+- **Claude → OpenCode fallback (opt-in)** — If no Claude Code worker is connected for a group's project, hand that message to OpenCode instead of dropping it (pre-execution cases only, see [Fallback to OpenCode](#fallback-to-opencode))
 - **Direct messages** — Chat with Claude through Feishu DMs
 - **Group chats** — Add the bot to group chats with @mention support
 - **Access control** — Pairing-based onboarding, allowlists, and per-group policies
@@ -307,10 +308,15 @@ projects:
     workdir: /path/to/my-project
     allowedAgents: [claude, opencode]
 fallback:
-  enabled: false   # Claude -> OpenCode auto-fallback on failure is designed but not wired into dispatch yet — leave this false
+  enabled: true    # see "Fallback to OpenCode" below for exactly what this does
+  triggerOn: []              # reserved for a future richer fallback state machine, currently unused
+  neverTriggerOn: [permission_denied, user_abort, invalid_request, tool_failure, partial_execution]  # reserved, currently unused
+  maxAttempts: 1              # reserved, currently unused
+  cooldownSeconds: 300         # reserved, currently unused
+  notifyUser: true            # reserved, currently unused
 ```
 
-`agents.yaml` never decides which project a chat maps to — that's still `access.json`'s job (see below). It only declares which backends exist and which agents each project is allowed to use.
+`agents.yaml` never decides which project a chat maps to — that's still `access.json`'s job (see below). It only declares which backends exist and which agents each project is allowed to use. Only `fallback.enabled` is actually read by the router today — the other `fallback.*` fields are validated but not yet consulted anywhere in dispatch; they're placeholders for a future richer fallback policy.
 
 ### 2. Opt a group or DM into OpenCode via `access.json`
 
@@ -329,11 +335,17 @@ fallback:
 
 Any group/DM without an explicit `agent` field stays on Claude, regardless of what's declared in `agents.yaml`. A request for an agent not in that project's `allowedAgents` (or a workdir not declared in `agents.yaml` at all) silently falls back to Claude-only — check `router-debug.log` if a group doesn't behave as expected.
 
+### Fallback to OpenCode
+
+Set `agent.fallback: "opencode"` on a group/DM (alongside `primary: "claude"`) and `agents.yaml`'s `fallback.enabled: true` to let that chat fail over to OpenCode. This only covers one narrow, safe case: **no Claude Code worker is connected for that project at all**, so the message was never delivered and there's no partial work to reconcile. In that case the router replies with a one-line notice and hands the task to OpenCode instead of showing the usual "no active session" error.
+
+It does **not** cover a Claude worker accepting a task and then failing partway through — that needs real task-state tracking (the design doc's full fallback state machine, `routing/task-machine.ts`), which exists as pure logic but isn't wired into the live dispatch path yet.
+
 **Notes:**
 - OpenCode sessions are sticky per conversation and persisted in SQLite (`router.db`) — they survive a router restart.
 - Permission requests from OpenCode's tool calls surface as an interactive Feishu approve/deny card, same as Claude's.
 - Attachments aren't supported on the OpenCode path yet.
-- Fallback (auto-switching Claude → OpenCode on failure) is designed (see `docs/multi-agent-router-design.md`) but not wired into the live dispatch path — keep `agents.yaml`'s `fallback.enabled: false`.
+- OpenCode replies are chunked at a fixed 4096 chars — they don't honor a group's `textChunkLimit` override (that setting only applies to Claude Code replies today).
 
 ## Access Management
 
@@ -430,8 +442,8 @@ Groups are off by default. The bot must be added to the group by a group admin f
 | `FEISHU_APP_SECRET` | Yes | Feishu app secret |
 | `FEISHU_ENCRYPT_KEY` | No | Event payload encryption key |
 | `FEISHU_ACCESS_MODE` | No | Set to `static` to disable pairing |
-| `FEISHU_STATE_DIR` | No | Override state directory path |
-| `FEISHU_CHAT_ID` | No | Set by router — puts server.ts in worker mode |
+| `FEISHU_STATE_DIR` | No | Override state directory path (default `~/.claude/channels/feishu`) |
+| `FEISHU_PROJECTS_ROOT` | No | Root directory `agents.yaml` project workdirs must resolve under (default `~/Projects`) |
 
 ## How It Works
 
@@ -449,7 +461,7 @@ When the parent Claude process exits, the plugin detects the ppid change within 
 bun test
 ```
 
-Tests cover access control (gate logic), text chunking, mention detection, permission reply parsing, confirm code generation, chat authorization, and router workdir resolution.
+147 tests across 10 files. `server.test.ts` covers access control (gate logic), text chunking, mention detection, permission reply parsing, confirm code generation, and chat authorization. `routing/*.test.ts` covers config loading/validation, route resolution (`access.json` + `agents.yaml` merge, sanitization), conversation bindings, SQLite storage, and the (currently-unwired) fallback state machine. `adapters/**/*.test.ts` covers the OpenCode HTTP/SSE client (including the event-stream-never-closes edge case) and the Claude adapter's capability boundaries.
 
 ## Security
 
