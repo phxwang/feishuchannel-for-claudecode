@@ -13,6 +13,10 @@
  */
 const RESET_RE = /resets\s+(\d{1,2}):(\d{2})\s*(am|pm)\s*\(([^)]+)\)/i
 
+function partsToMap(parts: Intl.DateTimeFormatPart[]): Record<string, string> {
+  return Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]))
+}
+
 function formatAsUtcMillis(instantMs: number, tz: string): number | null {
   let parts: Intl.DateTimeFormatPart[]
   try {
@@ -21,7 +25,7 @@ function formatAsUtcMillis(instantMs: number, tz: string): number | null {
       year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
     }).formatToParts(new Date(instantMs))
   } catch { return null } // unknown/invalid IANA zone name
-  const map = Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]))
+  const map = partsToMap(parts)
   return Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second)
 }
 
@@ -57,15 +61,16 @@ export function parseRateLimitResetTime(text: string, now: Date = new Date()): D
       timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
     }).formatToParts(now)
   } catch { return null } // unknown/invalid IANA zone name
-  const nowMap = Object.fromEntries(nowParts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]))
+  const nowMap = partsToMap(nowParts)
 
   const y = +nowMap.year, mo = +nowMap.month, d = +nowMap.day
   let resetMs = zonedWallTimeToUtc(y, mo, d, hour, minute, tz)
   if (resetMs === null) return null
 
   // "resets 9:30pm" already elapsed today in that zone → it means tomorrow.
+  // `tz` already succeeded above, so this second lookup can't fail — no `?? fallback` needed.
   if (resetMs <= now.getTime()) {
-    resetMs = zonedWallTimeToUtc(y, mo, d + 1, hour, minute, tz) ?? resetMs + 24 * 60 * 60 * 1000
+    resetMs = zonedWallTimeToUtc(y, mo, d + 1, hour, minute, tz)!
   }
   return new Date(resetMs)
 }
