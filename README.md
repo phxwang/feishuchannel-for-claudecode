@@ -57,7 +57,7 @@ Map Feishu groups to project directories in `~/.claude/channels/feishu/access.js
 - **Multi-group routing** — One Feishu bot serves multiple Claude Code instances, each in its own project
 - **Auto-managed router** — Router spawns on first launch, shuts down when all workers disconnect
 - **OpenCode backend (opt-in per group/DM)** — Route specific chats to [OpenCode](https://opencode.ai) instead of Claude Code, with sessions persisted in SQLite across router restarts
-- **Claude → OpenCode fallback (opt-in)** — If no Claude Code worker is connected for a group's project, hand that message to OpenCode instead of dropping it (pre-execution cases only, see [Fallback to OpenCode](#fallback-to-opencode))
+- **Claude → OpenCode fallback (opt-in)** — If no Claude Code worker is connected, or Claude Code just hit its usage rate limit, hand that message to OpenCode instead of dropping it (pre-execution cases only, see [Fallback to OpenCode](#fallback-to-opencode))
 - **Direct messages** — Chat with Claude through Feishu DMs
 - **Group chats** — Add the bot to group chats with @mention support
 - **Access control** — Pairing-based onboarding, allowlists, and per-group policies
@@ -339,7 +339,12 @@ Any group/DM without an explicit `agent` field stays on Claude, regardless of wh
 
 ### Fallback to OpenCode
 
-Set `agent.fallback: "opencode"` on a group/DM (alongside `primary: "claude"`) and `agents.yaml`'s `fallback.enabled: true` to let that chat fail over to OpenCode. This only covers one narrow, safe case: **no Claude Code worker is connected for that project at all**, so the message was never delivered and there's no partial work to reconcile. In that case the router replies with a one-line notice and hands the task to OpenCode instead of showing the usual "no active session" error.
+Set `agent.fallback: "opencode"` on a group/DM (alongside `primary: "claude"`) and `agents.yaml`'s `fallback.enabled: true` to let that chat fail over to OpenCode. This covers two narrow, safe cases where the message provably never reached Claude, so there's no partial work to reconcile:
+
+- **No Claude Code worker connected** for that project at all.
+- **Claude Code is rate-limited.** The worker tails its own transcript for the `error:"rate_limit"` event Claude Code writes when it hits a usage limit, and tells the router it's unavailable until Claude's own stated reset time (`rate-limit-reset.ts` parses text like `"...resets 9:30pm (Asia/Singapore)"` — the IANA zone Claude reports is used directly, so this is correct even across timezones/DST). If that text can't be parsed, it falls back to a fixed 30-minute cooldown (`worker-link.ts`'s `DEFAULT_DEGRADED_MS`), refreshed on each new rate_limit event. The router skips routing to that worker entirely until the window ends.
+
+In either case the router replies with a one-line notice and hands the task to OpenCode instead of showing the usual "no active session" error.
 
 It does **not** cover a Claude worker accepting a task and then failing partway through — that needs real task-state tracking (the design doc's full fallback state machine, `routing/task-machine.ts`), which exists as pure logic but isn't wired into the live dispatch path yet.
 

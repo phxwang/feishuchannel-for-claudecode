@@ -28,3 +28,17 @@ export function registerCallback(code: string, workdir: string, dbg: (msg: strin
     workerSock.write(JSON.stringify({ type: 'callback_registered', code, workdir }) + '\n')
   } catch (e) { dbg(`registerCallback failed: ${e}`) }
 }
+
+/** Fallback cooldown when this worker reports itself rate-limited but Claude's own reset-time
+ *  text (e.g. "resets 9:30pm (Asia/Singapore)", parsed by rate-limit-reset.ts) can't be parsed. */
+export const DEFAULT_DEGRADED_MS = 30 * 60 * 1000
+
+/** Tell the router this worker's Claude Code instance is rate-limited and won't produce
+ *  a real reply until `untilMs` — the router can use this to skip straight to an
+ *  OpenCode fallback (if configured) instead of routing to a worker that will just fail. */
+export function sendDegraded(reason: string, untilMs: number, dbg: (msg: string) => void) {
+  if (!workerSock) { dbg(`sendDegraded(${reason}): no router connection, router won't know to fall back`); return }
+  try {
+    workerSock.write(JSON.stringify({ type: 'degraded', reason, until: untilMs }) + '\n')
+  } catch (e) { dbg(`sendDegraded failed: ${e}`) }
+}
