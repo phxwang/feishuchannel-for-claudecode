@@ -26,6 +26,7 @@ import { OpenCodeAdapter } from './adapters/opencode/opencode-adapter'
 import type { AgentEvent } from './adapters/agent-adapter'
 import { createBinding } from './routing/bindings'
 import { chunkText, MAX_CHUNK } from './chunk-text'
+import { DegradedTracker } from './routing/degraded'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -175,6 +176,8 @@ type Worker = {
 }
 
 const workers = new Map<Socket, Worker>()
+/** Workdirs whose Claude Code worker just reported itself rate-limited (see worker-link.ts sendDegraded). */
+const degraded = new DegradedTracker()
 
 /** Find worker whose workdir matches the target. */
 function findWorker(workdir: string): Worker | undefined {
@@ -235,6 +238,11 @@ const sockServer = createServer((socket) => {
           dbg(`worker registered: ${w.workdir}${w.workerId ? ` (id=${w.workerId}, v${w.protocolVersion ?? '?'})` : ''}`)
         } else if (msg.type === 'callback_registered' && typeof msg.code === 'string' && typeof msg.workdir === 'string') {
           permissionRegistry.register(msg.code, resolve(msg.workdir), typeof msg.taskId === 'string' ? msg.taskId : null, new Date().toISOString())
+        } else if (msg.type === 'degraded' && typeof msg.until === 'number') {
+          if (w.workdir) {
+            degraded.markDegraded(w.workdir, msg.until)
+            dbg(`worker degraded: ${w.workdir} until ${new Date(msg.until).toISOString()} (${typeof msg.reason === 'string' ? msg.reason : 'unknown'})`)
+          }
         }
       } catch (e) { dbg(`bad message from worker: ${e}`) }
     }
@@ -502,7 +510,9 @@ async function handleInbound(data: any) {
   }
 
   dbg(`routing ${chatId} (${chatType}) → ${workdir}${parentId ? ' (reply)' : ''}`)
-  const delivered = routeToWorkdir(workdir, {
+  const rateLimited = degraded.isDegraded(resolve(workdir))
+  if (rateLimited) dbg(`${chatId}: ${workdir} is rate-limited, skipping Claude Code attempt`)
+  const delivered = !rateLimited && routeToWorkdir(workdir, {
     type: 'channel_message',
     content,
     meta: {
@@ -520,17 +530,22 @@ async function handleInbound(data: any) {
     markEventProcessed(db, messageId, new Date().toISOString())
   } else if (route.agent.fallback === 'opencode' && infraConfig?.fallback.enabled && openCodeAdapter) {
     // Design doc §7's strictest allowed-fallback case: the task was never
-    // delivered to Claude at all (no worker connected), so there is
-    // provably no side effect and no risk of duplicate execution. Any
-    // richer trigger (Claude accepted the task but then failed/hung) is
+    // delivered to Claude at all — either no worker was connected, or the
+    // worker reported itself rate-limited (see worker-link.ts sendDegraded) —
+    // so there is provably no side effect and no risk of duplicate execution.
+    // Any richer trigger (Claude accepted the task but then failed/hung) is
     // deliberately NOT handled here — that needs real task-state tracking,
     // which isn't wired up yet.
-    dbg(`${chatId}: Claude worker unavailable for ${workdir}, falling back to OpenCode (pre-execution, no side effect)`)
+    dbg(`${chatId}: Claude unavailable for ${workdir} (${rateLimited ? 'rate-limited' : 'no worker connected'}), falling back to OpenCode (pre-execution, no side effect)`)
     markEventProcessed(db, messageId, new Date().toISOString())
-    void replyText(chatId, messageId, '⚠️ Claude Code 当前不可用，已切换到 OpenCode 处理本次任务。')
+    void replyText(chatId, messageId, rateLimited
+      ? '⚠️ Claude Code 当前已达到使用限额，已切换到 OpenCode 处理本次任务。'
+      : '⚠️ Claude Code 当前不可用，已切换到 OpenCode 处理本次任务。')
     void handleOpenCodeTask(route, chatId, messageId, chatKind, ocContent)
   } else {
-    const hint = `⚠️ No active Claude Code session for \`${workdir}\`. Please run \`claude-feishu\` in that directory, then send your message again.`
+    const hint = rateLimited
+      ? `⚠️ Claude Code hit its usage limit for \`${workdir}\` and hasn't reset yet. Please retry shortly.`
+      : `⚠️ No active Claude Code session for \`${workdir}\`. Please run \`claude-feishu\` in that directory, then send your message again.`
     void (apiClient as any).im.message.reply({
       path: { message_id: messageId },
       data: { msg_type: 'text', content: JSON.stringify({ text: hint }), reply_in_thread: false },

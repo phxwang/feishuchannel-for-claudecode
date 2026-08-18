@@ -19,7 +19,7 @@ import {
 import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
 import { chunkText, MAX_CHUNK } from './chunk-text'
-import { clearWorkerSockIfCurrent, registerCallback, setWorkerSock, WORKER_CAPABILITIES, WORKER_ID, WORKER_PROTOCOL_VERSION } from './worker-link'
+import { clearWorkerSockIfCurrent, DEFAULT_DEGRADED_MS, registerCallback, sendDegraded, setWorkerSock, WORKER_CAPABILITIES, WORKER_ID, WORKER_PROTOCOL_VERSION } from './worker-link'
 
 /** Walk up the process tree to find the Claude ancestor with --channels feishu.
  *  Returns its PID (or 0 if not found). */
@@ -901,6 +901,10 @@ function handleTranscriptEvent(ev: any) {
     for (const c of contents) if (c?.type === 'text' && c?.text) { text = c.text; break }
   }
   void sendRateLimitNotice(text)
+  // Tell the router this worker can't take new tasks for a while, so it can
+  // skip straight to an OpenCode fallback (if that group has one configured)
+  // instead of routing here and getting the same rate_limit error back.
+  sendDegraded('rate_limited', Date.now() + DEFAULT_DEGRADED_MS, dbg)
 }
 
 async function pollTranscript() {
