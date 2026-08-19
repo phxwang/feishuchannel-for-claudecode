@@ -41,7 +41,17 @@ function startMockServer() {
       if (req.method === 'GET' && url.pathname === '/session/missing') return new Response('not found', { status: 404 })
       if (req.method === 'POST' && url.pathname === '/session/sess-1/message') {
         lastSentBody = await req.json()
-        if (sendGate) await sendGate
+        if (sendGate) {
+          // Race against the client's own abort so a never-resolving sendGate
+          // (simulating an unanswered permission) doesn't leak a hung handler
+          // past the client's timeout — matches how a real server would also
+          // stop caring once the client disconnects.
+          await Promise.race([
+            sendGate,
+            new Promise<void>((_, reject) => req.signal.addEventListener('abort', () => reject(new Error('client aborted')))),
+          ]).catch(() => {})
+        }
+        if (req.signal.aborted) return new Response(null, { status: 499 })
         return sendStatus === 200 ? Response.json(sendBody) : new Response(null, { status: sendStatus })
       }
       if (req.method === 'POST' && url.pathname === '/session/sess-1/abort') return new Response(null, { status: 200 })
@@ -205,6 +215,40 @@ describe('send — SSE watched concurrently for mid-task events', () => {
     const out: string[] = []
     for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e.type)
     expect(out).toEqual(['task.started', 'text.completed', 'session.idle'])
+  })
+})
+
+describe('send — failure reason distinguishes why the task never came back', () => {
+  test('a stuck POST that never resolves (e.g. an unanswered mid-task permission) times out as task_timeout, having watched the whole time', async () => {
+    sendGate = new Promise<void>(() => {}) // never resolves — server hangs, matches an unanswered permission.asked
+    const out: any[] = []
+    for await (const e of adapter({ taskTimeoutSeconds: 0.15 }).send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e)
+    expect(out.at(-1)).toEqual({ type: 'task.failed', taskId: 't1', reason: 'task_timeout' })
+  })
+
+  test('the same stuck POST, but the /event stream itself never connected — a mid-task permission would have been unobservable', async () => {
+    const noEventFetch: typeof fetch = ((url: any, init: any) => {
+      const u = new URL(String(url))
+      if (u.pathname === '/event') return Promise.resolve(new Response('nope', { status: 500 }))
+      return fetch(url, init)
+    }) as typeof fetch
+    const a = new OpenCodeAdapter({ baseUrl, requestTimeoutSeconds: 5, taskTimeoutSeconds: 0.15 }, noEventFetch)
+    sendGate = new Promise<void>(() => {})
+    const out: any[] = []
+    for await (const e of a.send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e)
+    expect(out.at(-1)).toEqual({ type: 'task.failed', taskId: 't1', reason: 'task_timeout_no_event_stream' })
+  })
+
+  test('the POST itself fails outright (network error, not a timeout) reports connection_failed with the underlying message', async () => {
+    const brokenFetch: typeof fetch = ((url: any, init: any) => {
+      const u = new URL(String(url))
+      if (u.pathname === '/session/sess-1/message') return Promise.reject(new Error('socket hang up'))
+      return fetch(url, init)
+    }) as typeof fetch
+    const a = new OpenCodeAdapter({ baseUrl, requestTimeoutSeconds: 5, taskTimeoutSeconds: 5 }, brokenFetch)
+    const out: any[] = []
+    for await (const e of a.send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e)
+    expect(out.at(-1)).toEqual({ type: 'task.failed', taskId: 't1', reason: 'connection_failed: socket hang up' })
   })
 })
 

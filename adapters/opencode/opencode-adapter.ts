@@ -142,7 +142,8 @@ export class OpenCodeAdapter implements AgentAdapter {
     const promptController = new AbortController()
     const onAbort = () => promptController.abort()
     signal.addEventListener('abort', onAbort)
-    const deadline = setTimeout(() => promptController.abort(), this.config.taskTimeoutSeconds * 1000)
+    let timedOut = false
+    const deadline = setTimeout(() => { timedOut = true; promptController.abort() }, this.config.taskTimeoutSeconds * 1000)
 
     const promptPromise = this.fetchImpl(this.url(this.paths.sendMessage(task.sessionId)), {
       method: 'POST',
@@ -161,7 +162,8 @@ export class OpenCodeAdapter implements AgentAdapter {
     // `eventsExhausted` switches the raced slot to a promise that never
     // resolves once that happens, so the loop only ever proceeds when
     // sentTagged (real I/O) settles.
-    const events = this.openEventStream(task, promptController.signal)
+    const sseStatus = { connected: false }
+    const events = this.openEventStream(task, promptController.signal, sseStatus)
     let eventsExhausted = false
     const neverResolves = new Promise<never>(() => {})
     try {
@@ -189,9 +191,18 @@ export class OpenCodeAdapter implements AgentAdapter {
         promptController.abort()
         await events.return?.(undefined).catch(() => {})
         if (!raced.r.ok) {
-          yield signal.aborted
-            ? { type: 'task.aborted', taskId: task.taskId }
-            : { type: 'task.failed', taskId: task.taskId, reason: 'startup_timeout' }
+          if (signal.aborted) {
+            yield { type: 'task.aborted', taskId: task.taskId }
+          } else if (timedOut) {
+            // Distinguish "we watched for a permission.asked the whole time and
+            // nothing came" from "we couldn't even watch" — the latter means any
+            // mid-task permission request was unobservable and unanswerable from
+            // here, which reads very differently in the logs/user-facing message.
+            yield { type: 'task.failed', taskId: task.taskId, reason: sseStatus.connected ? 'task_timeout' : 'task_timeout_no_event_stream' }
+          } else {
+            const err = raced.r.err
+            yield { type: 'task.failed', taskId: task.taskId, reason: `connection_failed: ${err instanceof Error ? err.message : String(err)}` }
+          }
           return
         }
         yield* this.finalizeFromResponse(task, raced.r.res)
@@ -229,12 +240,13 @@ export class OpenCodeAdapter implements AgentAdapter {
     yield { type: 'session.idle', taskId: task.taskId }
   }
 
-  private async *openEventStream(task: AgentTask, signal: AbortSignal): AsyncGenerator<AgentEvent> {
+  private async *openEventStream(task: AgentTask, signal: AbortSignal, status: { connected: boolean }): AsyncGenerator<AgentEvent> {
     let res: Response
     try {
       res = await this.fetchImpl(this.url(this.paths.events), { headers: this.authHeaders(), signal })
     } catch { return }
     if (!res.ok || !res.body) return
+    status.connected = true
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     const buf = new SSEBuffer()
