@@ -215,16 +215,44 @@ export class OpenCodeAdapter implements AgentAdapter {
     }
   }
 
+  /**
+   * `POST /session/{id}/message` is documented (and was originally verified)
+   * as returning the full turn — but a turn that takes multiple steps (e.g.
+   * navigate, then screenshot, then a final text summary) actually creates
+   * *several* assistant messages sharing one `parentID` (the user message),
+   * and the POST response is only the LAST of them. Confirmed against a real
+   * turn: the screenshot tool call — and its attachment — lived in a middle
+   * message the POST response never included, so it was silently invisible
+   * here even though `res.json()` succeeded and looked complete. This fetches
+   * every sibling message and merges their parts so nothing from earlier
+   * steps in the same turn gets lost. Falls back to just the POST response's
+   * own parts if this fetch fails — a real reply beats no reply.
+   */
+  private async collectTurnParts(task: AgentTask, body: { info?: { parentID?: string }; parts?: RawPart[] }): Promise<RawPart[]> {
+    const ownParts = body.parts ?? []
+    const parentID = body.info?.parentID
+    if (!parentID) return ownParts
+    try {
+      const messages = await this.requestJson(this.paths.messages(task.sessionId)) as Array<{ info?: { parentID?: string; role?: string }; parts?: RawPart[] }>
+      const siblings = messages.filter(m => m.info?.parentID === parentID && m.info?.role === 'assistant')
+      if (siblings.length <= 1) return ownParts // just the one message we already have — no earlier steps to merge in
+      return siblings.flatMap(m => m.parts ?? [])
+    } catch {
+      return ownParts // best effort — don't fail the whole task over this supplementary fetch
+    }
+  }
+
   private async *finalizeFromResponse(task: AgentTask, res: Response): AsyncGenerator<AgentEvent> {
     if (!res.ok) {
       const reason = res.status === 429 ? 'rate_limited' : res.status === 503 ? 'capacity_exhausted' : 'backend_unavailable'
       yield { type: 'task.failed', taskId: task.taskId, reason }
       return
     }
-    let body: { info?: { error?: unknown }; parts?: RawPart[] }
+    let body: { info?: { error?: unknown; parentID?: string }; parts?: RawPart[] }
     try { body = await res.json() } catch { yield { type: 'task.failed', taskId: task.taskId, reason: 'backend_unavailable' }; return }
 
-    for (const part of body.parts ?? []) {
+    const turnParts = await this.collectTurnParts(task, body)
+    for (const part of turnParts) {
       if (part?.type !== 'tool') continue
       const toolName = String(part.tool ?? 'unknown')
       const completed = part.state?.status === 'completed'
@@ -247,6 +275,10 @@ export class OpenCodeAdapter implements AgentAdapter {
       return
     }
 
+    // Text specifically comes from `body` (the POST response's own last message), not
+    // turnParts — the final summary is what the user should see, not text from earlier
+    // steps in the same turn (which in practice don't carry text parts anyway, just
+    // reasoning/tool parts, but this keeps the intent explicit).
     const text = (body.parts ?? []).filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text as string).join('')
     if (text) yield { type: 'text.completed', taskId: task.taskId, text }
     yield { type: 'session.idle', taskId: task.taskId }
