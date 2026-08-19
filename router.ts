@@ -86,6 +86,7 @@ const openCodeAdapter = openCodeCfg
       requestTimeoutSeconds: openCodeCfg.requestTimeoutSeconds,
       taskTimeoutSeconds: openCodeCfg.taskTimeoutSeconds,
       passwordEnv: openCodeCfg.passwordEnv,
+      onWarn: dbg,
     })
   : null
 
