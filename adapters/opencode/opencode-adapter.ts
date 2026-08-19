@@ -62,6 +62,10 @@ export interface OpenCodeAdapterConfig {
   taskTimeoutSeconds: number
   passwordEnv?: string
   paths?: Partial<OpenCodeApiPaths>
+  /** Called with a message when something recoverable goes wrong internally (e.g. the
+   *  supplementary message-list fetch in collectTurnParts fails) — the adapter itself
+   *  has no logger, so wire this to the caller's own (router.ts's `dbg`, in practice). */
+  onWarn?: (msg: string) => void
 }
 
 type RawAttachment = { type?: string; mime?: string; url?: string; filename?: string }
@@ -206,6 +210,15 @@ export class OpenCodeAdapter implements AgentAdapter {
           }
           return
         }
+        // Known limitation: if the SSE stream (watched above) is actually delivering
+        // events in this deployment, a tool from an earlier step in a multi-step turn
+        // could get tool.completed/tool.failed reported twice — once live via SSE, once
+        // here via collectTurnParts' sibling-message merge (normalize.ts's SSE handling
+        // doesn't carry a part id/callID to dedupe against). Not fixed: production
+        // evidence so far shows this opencode serve's /event stream never actually
+        // delivers session events at all (see send()'s doc comment), so it's a
+        // theoretical double-report for a path this deployment doesn't exercise, and
+        // router.ts doesn't consume tool.completed/tool.failed today either way.
         yield* this.finalizeFromResponse(task, raced.r.res)
         return
       }
@@ -215,16 +228,57 @@ export class OpenCodeAdapter implements AgentAdapter {
     }
   }
 
+  /**
+   * `POST /session/{id}/message` is documented (and was originally verified)
+   * as returning the full turn — but a turn that takes multiple steps (e.g.
+   * navigate, then screenshot, then a final text summary) actually creates
+   * *several* assistant messages sharing one `parentID` (the user message),
+   * and the POST response is only the LAST of them. Confirmed against a real
+   * turn: the screenshot tool call — and its attachment — lived in a middle
+   * message the POST response never included, so it was silently invisible
+   * here even though `res.json()` succeeded and looked complete.
+   *
+   * `parentID` is set on essentially every assistant reply (single-step
+   * turns included), not just multi-step ones, so there's no cheap way to
+   * tell in advance whether this extra fetch is actually needed — it always
+   * runs when `parentID` is present. That's a real extra round-trip per
+   * turn, but it's a fast local call to the same opencode serve process
+   * already handling the turn, and `siblings.length <= 1` makes the
+   * single-message (common) case a no-op merge once the fetch returns.
+   * Falls back to just the POST response's own parts if the fetch fails —
+   * a real (if partial) reply beats no reply — logging via `onWarn` so a
+   * production run doesn't silently and invisibly lose tool/attachment
+   * events from earlier steps.
+   */
+  private async collectTurnParts(task: AgentTask, body: { info?: { parentID?: string }; parts?: RawPart[] }): Promise<RawPart[]> {
+    const ownParts = body.parts ?? []
+    const parentID = body.info?.parentID
+    if (!parentID) return ownParts
+    try {
+      const messages = await this.requestJson(this.paths.messages(task.sessionId)) as Array<{ info?: { parentID?: string; role?: string; time?: { created?: number } }; parts?: RawPart[] }>
+      const siblings = messages.filter(m => m.info?.parentID === parentID && m.info?.role === 'assistant')
+      if (siblings.length <= 1) return ownParts // just the one message we already have — no earlier steps to merge in
+      // Defensive: sort by creation time rather than trusting the API's own
+      // array order, since that ordering isn't documented as guaranteed.
+      siblings.sort((a, b) => (a.info?.time?.created ?? 0) - (b.info?.time?.created ?? 0))
+      return siblings.flatMap(m => m.parts ?? [])
+    } catch (e) {
+      this.config.onWarn?.(`opencode adapter: fetching sibling messages for turn ${parentID} failed, using the POST response's own parts only: ${e}`)
+      return ownParts // best effort — don't fail the whole task over this supplementary fetch
+    }
+  }
+
   private async *finalizeFromResponse(task: AgentTask, res: Response): AsyncGenerator<AgentEvent> {
     if (!res.ok) {
       const reason = res.status === 429 ? 'rate_limited' : res.status === 503 ? 'capacity_exhausted' : 'backend_unavailable'
       yield { type: 'task.failed', taskId: task.taskId, reason }
       return
     }
-    let body: { info?: { error?: unknown }; parts?: RawPart[] }
+    let body: { info?: { error?: unknown; parentID?: string }; parts?: RawPart[] }
     try { body = await res.json() } catch { yield { type: 'task.failed', taskId: task.taskId, reason: 'backend_unavailable' }; return }
 
-    for (const part of body.parts ?? []) {
+    const turnParts = await this.collectTurnParts(task, body)
+    for (const part of turnParts) {
       if (part?.type !== 'tool') continue
       const toolName = String(part.tool ?? 'unknown')
       const completed = part.state?.status === 'completed'
@@ -247,6 +301,10 @@ export class OpenCodeAdapter implements AgentAdapter {
       return
     }
 
+    // Text specifically comes from `body` (the POST response's own last message), not
+    // turnParts — the final summary is what the user should see, not text from earlier
+    // steps in the same turn (which in practice don't carry text parts anyway, just
+    // reasoning/tool parts, but this keeps the intent explicit).
     const text = (body.parts ?? []).filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text as string).join('')
     if (text) yield { type: 'text.completed', taskId: task.taskId, text }
     yield { type: 'session.idle', taskId: task.taskId }

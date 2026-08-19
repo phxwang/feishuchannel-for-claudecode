@@ -20,6 +20,9 @@ let sendBody: any = { info: {}, parts: [{ type: 'text', text: 'hi there' }] }
 let sendGate: Promise<void> | null = null
 /** When true, /event never closes and never sends anything after the initial `events` — matches the real OpenCode global stream, which stays open indefinitely and can go quiet for a while. */
 let eventStreamNeverCloses = false
+/** Overrides GET /session/sess-1/message's response — null uses the fixed default (used by getFinalMessage's test). */
+let messageListBody: any[] | null = null
+let messageListStatus = 200
 
 function encoder() { return new TextEncoder() }
 
@@ -31,6 +34,8 @@ function startMockServer() {
   sendBody = { info: {}, parts: [{ type: 'text', text: 'hi there' }] }
   sendGate = null
   eventStreamNeverCloses = false
+  messageListBody = null
+  messageListStatus = 200
   server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -60,7 +65,8 @@ function startMockServer() {
         return new Response(null, { status: 200 })
       }
       if (req.method === 'GET' && url.pathname === '/session/sess-1/message') {
-        return Response.json([
+        if (messageListStatus !== 200) return new Response(null, { status: messageListStatus })
+        return Response.json(messageListBody ?? [
           { info: { role: 'user' }, parts: [{ type: 'text', text: 'hello' }] },
           { info: { role: 'assistant' }, parts: [{ type: 'text', text: 'part1' }, { type: 'text', text: 'part2' }] },
         ])
@@ -217,6 +223,93 @@ describe('send — synchronous POST response is authoritative', () => {
     const out: any[] = []
     for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e)
     expect(out.at(-1)).toEqual({ type: 'task.failed', taskId: 't1', reason: 'capacity_exhausted' })
+  })
+
+  describe('multi-step turns — the POST response is only the LAST of several assistant messages', () => {
+    // Confirmed against a real opencode turn: navigate + screenshot + final text
+    // summary land as three separate assistant messages sharing one parentID
+    // (the user message), and POST /message only returns the last one.
+    test('merges tool calls (and their attachments) from earlier sibling messages the POST response never included', async () => {
+      sendBody = { info: { id: 'msg_3', parentID: 'msg_user' }, parts: [{ type: 'text', text: 'done' }] }
+      messageListBody = [
+        { info: { id: 'msg_user', role: 'user' }, parts: [{ type: 'text', text: 'go' }] },
+        { info: { id: 'msg_1', parentID: 'msg_user', role: 'assistant' }, parts: [{ type: 'tool', tool: 'navigate', state: { status: 'completed' } }] },
+        {
+          info: { id: 'msg_2', parentID: 'msg_user', role: 'assistant' },
+          parts: [{
+            type: 'tool', tool: 'screenshot',
+            state: { status: 'completed', attachments: [{ id: 'prt_1', type: 'file', mime: 'image/png', url: 'data:image/png;base64,AAAA' }] },
+          }],
+        },
+        { info: { id: 'msg_3', parentID: 'msg_user', role: 'assistant' }, parts: [{ type: 'text', text: 'done' }] },
+      ]
+      const out: any[] = []
+      for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'go' }, new AbortController().signal)) out.push(e)
+      expect(out).toEqual([
+        { type: 'task.started', taskId: 't1' },
+        { type: 'tool.completed', taskId: 't1', toolName: 'navigate' },
+        { type: 'tool.completed', taskId: 't1', toolName: 'screenshot' },
+        { type: 'attachment.completed', taskId: 't1', mime: 'image/png', dataUrl: 'data:image/png;base64,AAAA', filename: undefined },
+        { type: 'text.completed', taskId: 't1', text: 'done' },
+        { type: 'session.idle', taskId: 't1' },
+      ])
+    })
+
+    test('a single-step turn (its own message is the only sibling) falls back to the POST response, even if the fetched list is stale/empty', async () => {
+      // parentID is set on essentially every assistant reply, not just multi-step ones,
+      // so the message-list fetch still happens here — this only tests the *merge*
+      // correctly no-ops (via siblings.length <= 1) rather than trusting a fetched
+      // list that doesn't even contain this message.
+      sendBody = { info: { id: 'msg_1', parentID: 'msg_user' }, parts: [{ type: 'text', text: 'hi' }] }
+      messageListBody = []
+      const out: any[] = []
+      for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hi' }, new AbortController().signal)) out.push(e)
+      expect(out).toEqual([
+        { type: 'task.started', taskId: 't1' },
+        { type: 'text.completed', taskId: 't1', text: 'hi' },
+        { type: 'session.idle', taskId: 't1' },
+      ])
+    })
+
+    test('sorts sibling messages by creation time rather than trusting the fetched array order', async () => {
+      sendBody = { info: { id: 'msg_3', parentID: 'msg_user' }, parts: [{ type: 'text', text: 'done' }] }
+      // Deliberately out of chronological order (msg_2 before msg_1) — if the code
+      // trusted array order instead of sorting by info.time.created, the screenshot's
+      // attachment (msg_2) would incorrectly appear before the navigate tool (msg_1).
+      messageListBody = [
+        { info: { id: 'msg_user', role: 'user', time: { created: 1 } }, parts: [{ type: 'text', text: 'go' }] },
+        {
+          info: { id: 'msg_2', parentID: 'msg_user', role: 'assistant', time: { created: 3 } },
+          parts: [{ type: 'tool', tool: 'screenshot', state: { status: 'completed' } }],
+        },
+        {
+          info: { id: 'msg_1', parentID: 'msg_user', role: 'assistant', time: { created: 2 } },
+          parts: [{ type: 'tool', tool: 'navigate', state: { status: 'completed' } }],
+        },
+        { info: { id: 'msg_3', parentID: 'msg_user', role: 'assistant', time: { created: 4 } }, parts: [{ type: 'text', text: 'done' }] },
+      ]
+      const out: any[] = []
+      for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'go' }, new AbortController().signal)) out.push(e)
+      expect(out.map(e => e.type === 'tool.completed' ? e.toolName : e.type)).toEqual([
+        'task.started', 'navigate', 'screenshot', 'text.completed', 'session.idle',
+      ])
+    })
+
+    test('falls back to the POST response and reports via onWarn if the supplementary fetch throws', async () => {
+      sendBody = { info: { id: 'msg_1', parentID: 'msg_user' }, parts: [{ type: 'text', text: 'hi' }] }
+      messageListStatus = 500
+      const warnings: string[] = []
+      const a = new OpenCodeAdapter({ baseUrl, requestTimeoutSeconds: 5, taskTimeoutSeconds: 5, onWarn: (msg) => warnings.push(msg) })
+      const out: any[] = []
+      for await (const e of a.send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hi' }, new AbortController().signal)) out.push(e)
+      expect(out).toEqual([
+        { type: 'task.started', taskId: 't1' },
+        { type: 'text.completed', taskId: 't1', text: 'hi' },
+        { type: 'session.idle', taskId: 't1' },
+      ])
+      expect(warnings.length).toBe(1)
+      expect(warnings[0]).toContain('msg_user')
+    })
   })
 })
 
