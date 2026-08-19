@@ -227,8 +227,10 @@ export class OpenCodeAdapter implements AgentAdapter {
     for (const part of body.parts ?? []) {
       if (part?.type !== 'tool') continue
       const toolName = String(part.tool ?? 'unknown')
-      if (part.state?.status === 'completed') yield { type: 'tool.completed', taskId: task.taskId, toolName }
+      const completed = part.state?.status === 'completed'
+      if (completed) yield { type: 'tool.completed', taskId: task.taskId, toolName }
       else if (part.state?.status === 'error') yield { type: 'tool.failed', taskId: task.taskId, toolName, error: String(part.state.error ?? 'tool failed') }
+      if (!completed) continue // a failed tool's attachments (if any) may be partial/garbage — don't forward them
       // Tools that produce a file (e.g. a browser screenshot MCP tool) attach it
       // as a `data:` URI on the tool's own state — confirmed against a real
       // opencode serve response; there's no separate top-level `file` message

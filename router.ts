@@ -12,7 +12,7 @@
 import * as lark from '@larksuiteoapi/node-sdk'
 import { createServer, type Socket } from 'net'
 import {
-  readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync, createReadStream,
+  readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync,
 } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
@@ -27,6 +27,8 @@ import type { AgentEvent } from './adapters/agent-adapter'
 import { createBinding } from './routing/bindings'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { DegradedTracker } from './routing/degraded'
+import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
+import { decodeBase64DataUri } from './data-uri'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -343,35 +345,27 @@ function buildOpenCodePermCard(toolName: string, description: string, code: stri
   })
 }
 
-// Feishu file_type enum values it accepts for im.file.create — mirrors server.ts's FEISHU_FTYPES.
-const MIME_EXT: Record<string, { ext: string; feishuFileType?: string }> = {
-  'image/png': { ext: 'png' },
-  'image/jpeg': { ext: 'jpg' },
-  'image/gif': { ext: 'gif' },
-  'image/webp': { ext: 'webp' },
-  'application/pdf': { ext: 'pdf', feishuFileType: 'pdf' },
+// Extension used for the temp file we write before handing it to sendFeishuFile
+// (which branches image-vs-file by extension, via feishu-attachment.ts's
+// IMAGE_EXTS/FEISHU_FTYPES) — only needs to cover mime types OpenCode tools
+// actually produce; falls back to the mime subtype for anything else.
+const MIME_EXT: Record<string, string> = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'application/pdf': 'pdf',
 }
 
 /** Decode a tool-produced `data:` attachment (e.g. a screenshot) and send it to Feishu as an image or file message. */
 async function sendOpenCodeAttachment(chatId: string, mime: string, dataUrl: string, filename: string | undefined, dbgTag: string) {
-  const commaIdx = dataUrl.indexOf(',')
-  if (commaIdx === -1) { dbg(`${dbgTag}: malformed data URI, skipping attachment`); return }
-  const buf = Buffer.from(dataUrl.slice(commaIdx + 1), 'base64')
-  const { ext, feishuFileType } = MIME_EXT[mime] ?? { ext: mime.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin' }
+  const buf = decodeBase64DataUri(dataUrl)
+  if (!buf) { dbg(`${dbgTag}: attachment data URI isn't base64-encoded, skipping (unsupported for now)`); return }
+  if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
+    dbg(`${dbgTag}: attachment too large (${buf.byteLength} bytes > ${MAX_ATTACHMENT_BYTES}), skipping`)
+    return
+  }
+  const ext = MIME_EXT[mime] ?? mime.split('/')[1]?.replace(/[^a-z0-9]/gi, '') ?? 'bin'
   const tmpPath = join(tmpdir(), `oc-attach-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
   try {
     writeFileSync(tmpPath, buf)
-    if (mime.startsWith('image/')) {
-      const r = await (apiClient as any).im.image.create({ data: { image_type: 'message', image: createReadStream(tmpPath) } })
-      const key = r?.image_key ?? r?.data?.image_key
-      if (!key) throw new Error(`image upload had no image_key: ${JSON.stringify(r)}`)
-      await (apiClient as any).im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'image', content: JSON.stringify({ image_key: key }) } })
-    } else {
-      const r = await (apiClient as any).im.file.create({ data: { file_type: feishuFileType ?? 'stream', file_name: filename ?? `attachment.${ext}`, file: createReadStream(tmpPath) } })
-      const key = r?.file_key ?? r?.data?.file_key
-      if (!key) throw new Error(`file upload had no file_key: ${JSON.stringify(r)}`)
-      await (apiClient as any).im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'file', content: JSON.stringify({ file_key: key }) } })
-    }
+    await sendFeishuFile(apiClient, chatId, tmpPath, filename)
   } catch (e) {
     dbg(`${dbgTag}: attachment upload failed: ${e}`)
   } finally {

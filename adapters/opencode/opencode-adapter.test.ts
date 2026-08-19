@@ -162,6 +162,24 @@ describe('send — synchronous POST response is authoritative', () => {
     expect(out).toEqual(['task.started', 'tool.completed', 'session.idle'])
   })
 
+  test('does not forward an attachment from a tool that errored (may be partial/garbage)', async () => {
+    sendBody = {
+      info: {},
+      parts: [
+        {
+          type: 'tool', tool: 'playwright_browser_take_screenshot',
+          state: {
+            status: 'error', error: 'crashed mid-capture',
+            attachments: [{ id: 'prt_1', type: 'file', mime: 'image/png', url: 'data:image/png;base64,AAAA' }],
+          },
+        },
+      ],
+    }
+    const out: any[] = []
+    for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e.type)
+    expect(out).toEqual(['task.started', 'tool.failed', 'session.idle'])
+  })
+
   test('emits tool.completed/tool.failed for tool parts in the response', async () => {
     sendBody = {
       info: {},
