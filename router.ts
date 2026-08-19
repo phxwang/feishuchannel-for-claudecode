@@ -345,6 +345,7 @@ function buildOpenCodePermCard(toolName: string, description: string, code: stri
 
 async function handleOpenCodePermission(event: Extract<AgentEvent, { type: 'permission.requested' }>, chatId: string) {
   openCodePermissionCodes.add(event.requestId)
+  dbg(`opencode: permission requested (${event.toolName}), sending card for ${event.requestId}`)
   try {
     await (apiClient as any).im.message.create({
       params: { receive_id_type: 'chat_id' },
