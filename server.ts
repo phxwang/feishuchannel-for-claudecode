@@ -17,11 +17,12 @@ import {
   statSync, renameSync, realpathSync, chmodSync, createReadStream, existsSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join, sep, extname, basename } from 'path'
+import { join, sep, extname } from 'path'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { clearWorkerSockIfCurrent, DEFAULT_DEGRADED_MS, registerCallback, sendDegraded, setWorkerSock, WORKER_CAPABILITIES, WORKER_ID, WORKER_PROTOCOL_VERSION } from './worker-link'
 import { parseRateLimitResetTime } from './rate-limit-reset'
 import { nextReconnectDelay, RECONNECT_BASE_DELAY_MS } from './reconnect-backoff'
+import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
 
 /** Walk up the process tree to find the Claude ancestor with --channels feishu.
  *  Returns its PID (or 0 if not found). */
@@ -166,9 +167,7 @@ type Access = {
   ackReaction?: string       // Feishu emoji_type code, e.g. "Get"
   textChunkLimit?: number
 }
-const MAX_FILE = 30 * 1024 * 1024
-const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'])
-const FEISHU_FTYPES: Record<string, string> = { '.pdf': 'pdf', '.doc': 'doc', '.docx': 'doc', '.xls': 'xls', '.xlsx': 'xls', '.ppt': 'ppt', '.pptx': 'ppt', '.mp4': 'mp4', '.opus': 'opus' }
+const MAX_FILE = MAX_ATTACHMENT_BYTES
 
 function defAccess(): Access { return { dmPolicy: 'pairing', allowFrom: [], p2pChats: {}, groups: {}, pending: {}, ackReaction: 'Get' } }
 
@@ -558,21 +557,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const id = r?.message_id ?? r?.data?.message_id ?? ''; if (id) ids.push(id)
         }
         for (const fp of files) {
-          const ext = extname(fp).toLowerCase()
-          let r2: any, msgType: string, content: Record<string, string>
-          if (IMAGE_EXTS.has(ext)) {
-            r2 = await (apiClient as any).im.image.create({ data: { image_type: 'message', image: createReadStream(fp) } })
-            const key = r2?.image_key ?? r2?.data?.image_key
-            if (!key) throw new Error(`image upload failed: ${fp}`)
-            msgType = 'image'; content = { image_key: key }
-          } else {
-            r2 = await (apiClient as any).im.file.create({ data: { file_type: FEISHU_FTYPES[ext] ?? 'stream', file_name: basename(fp), file: createReadStream(fp) } })
-            const key = r2?.file_key ?? r2?.data?.file_key
-            if (!key) throw new Error(`file upload failed: ${fp}`)
-            msgType = 'file'; content = { file_key: key }
-          }
-          const r3 = await apiClient.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: msgType, content: JSON.stringify(content) } })
-          const id = r3?.message_id ?? (r3 as any)?.data?.message_id ?? ''; if (id) ids.push(id)
+          const id = await sendFeishuFile(apiClient, chatId, fp)
+          if (id) ids.push(id)
         }
         clearReminder(chatId)
         return { content: [{ type: 'text', text: ids.length === 1 ? `sent (id: ${ids[0]})` : `sent ${ids.length} messages (ids: ${ids.join(', ')})` }] }

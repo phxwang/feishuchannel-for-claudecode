@@ -12,9 +12,9 @@
 import * as lark from '@larksuiteoapi/node-sdk'
 import { createServer, type Socket } from 'net'
 import {
-  readFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync,
+  readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync,
 } from 'fs'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { acquireRouterLock, releaseRouterLock } from './router-lock'
 import { markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, SqliteBindingStore, wasEventProcessed } from './routing/storage'
@@ -27,6 +27,8 @@ import type { AgentEvent } from './adapters/agent-adapter'
 import { createBinding } from './routing/bindings'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { DegradedTracker } from './routing/degraded'
+import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
+import { decodeBase64DataUri } from './data-uri'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -343,6 +345,35 @@ function buildOpenCodePermCard(toolName: string, description: string, code: stri
   })
 }
 
+// Extension used for the temp file we write before handing it to sendFeishuFile
+// (which branches image-vs-file by extension, via feishu-attachment.ts's
+// IMAGE_EXTS/FEISHU_FTYPES) — only needs to cover mime types OpenCode tools
+// actually produce; falls back to the mime subtype for anything else.
+const MIME_EXT: Record<string, string> = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'application/pdf': 'pdf',
+}
+
+/** Decode a tool-produced `data:` attachment (e.g. a screenshot) and send it to Feishu as an image or file message. */
+async function sendOpenCodeAttachment(chatId: string, mime: string, dataUrl: string, filename: string | undefined, dbgTag: string) {
+  const decoded = decodeBase64DataUri(dataUrl, MAX_ATTACHMENT_BYTES)
+  if (!decoded.ok) {
+    dbg(decoded.reason === 'too_large'
+      ? `${dbgTag}: attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes, skipping`
+      : `${dbgTag}: attachment data URI isn't base64-encoded, skipping (unsupported for now)`)
+    return
+  }
+  const ext = MIME_EXT[mime] ?? mime.split('/')[1]?.replace(/[^a-z0-9]/gi, '') ?? 'bin'
+  const tmpPath = join(tmpdir(), `oc-attach-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
+  try {
+    writeFileSync(tmpPath, decoded.buf)
+    await sendFeishuFile(apiClient, chatId, tmpPath, filename)
+  } catch (e) {
+    dbg(`${dbgTag}: attachment upload failed: ${e}`)
+  } finally {
+    try { unlinkSync(tmpPath) } catch (e) { dbg(`${dbgTag}: failed to clean up temp attachment file ${tmpPath}: ${e}`) }
+  }
+}
+
 async function handleOpenCodePermission(event: Extract<AgentEvent, { type: 'permission.requested' }>, chatId: string) {
   openCodePermissionCodes.add(event.requestId)
   dbg(`opencode: permission requested (${event.toolName}), sending card for ${event.requestId}`)
@@ -376,12 +407,22 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
   const taskId = `oc-${messageId}`
   const controller = new AbortController()
   let finalText = ''
+  const attachments: Extract<AgentEvent, { type: 'attachment.completed' }>[] = []
+  // A tool can produce an attachment (e.g. a screenshot) in an earlier step of the
+  // same turn that later fails/aborts — that capture is still real and worth
+  // sending, so every early-return path flushes whatever was collected so far
+  // instead of silently dropping it.
+  const flushAttachments = () => Promise.all(
+    attachments.map(att => sendOpenCodeAttachment(chatId, att.mime, att.dataUrl, att.filename, `opencode: task ${taskId}`)),
+  )
   try {
     for await (const event of openCodeAdapter.send({ taskId, sessionId, prompt: content }, controller.signal)) {
       if (event.type === 'permission.requested') {
         void handleOpenCodePermission(event, chatId)
       } else if (event.type === 'text.completed') {
         finalText = event.text
+      } else if (event.type === 'attachment.completed') {
+        attachments.push(event)
       } else if (event.type === 'task.failed') {
         dbg(`opencode: task ${taskId} failed: ${event.reason}`)
         // The cached session may no longer be valid (e.g. opencode serve
@@ -389,9 +430,11 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
         // one instead of repeating the same failure forever.
         openCodeBindings.delete(key)
         void replyText(chatId, messageId, `⚠️ OpenCode 执行失败：${event.reason}`)
+        await flushAttachments()
         return
       } else if (event.type === 'task.aborted') {
         void replyText(chatId, messageId, `⚠️ OpenCode 任务被中断`)
+        await flushAttachments()
         return
       }
     }
@@ -399,14 +442,16 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
     dbg(`opencode: send() threw: ${e}`)
     openCodeBindings.delete(key)
     void replyText(chatId, messageId, `⚠️ OpenCode 执行出错：${e}`)
+    await flushAttachments()
     return
   }
 
   if (finalText) {
     for (const chunk of chunkText(finalText, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
-  } else {
+  } else if (attachments.length === 0) {
     dbg(`opencode: task ${taskId} completed with no text output`)
   }
+  await flushAttachments()
 }
 
 async function handleInbound(data: any) {
