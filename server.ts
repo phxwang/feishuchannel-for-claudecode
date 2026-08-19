@@ -21,6 +21,7 @@ import { join, sep, extname, basename } from 'path'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { clearWorkerSockIfCurrent, DEFAULT_DEGRADED_MS, registerCallback, sendDegraded, setWorkerSock, WORKER_CAPABILITIES, WORKER_ID, WORKER_PROTOCOL_VERSION } from './worker-link'
 import { parseRateLimitResetTime } from './rate-limit-reset'
+import { nextReconnectDelay, RECONNECT_BASE_DELAY_MS } from './reconnect-backoff'
 
 /** Walk up the process tree to find the Claude ancestor with --channels feishu.
  *  Returns its PID (or 0 if not found). */
@@ -909,6 +910,7 @@ function handleTranscriptEvent(ev: any) {
   // (Asia/Singapore)"); fall back to a short default if that can't be parsed.
   const parsedReset = parseRateLimitResetTime(text)
   const until = parsedReset ? parsedReset.getTime() : Date.now() + DEFAULT_DEGRADED_MS
+  lastDegradedUntil = until
   sendDegraded('rate_limited', until, dbg)
 }
 
@@ -967,11 +969,43 @@ dbg(`server starting (CHANNEL_MODE=${CHANNEL_MODE}, WORKER_MODE=${WORKER_MODE}, 
 
 let wsClient: lark.WSClient | null = null
 
+// If the router restarts (redeploy, crash-and-KeepAlive-relaunch), this worker's
+// socket just closes — nothing here reconnects it on its own otherwise, leaving
+// the worker silently unreachable until the whole Claude Code session is
+// restarted (see the 2026-08-19 inv4 incident: router restarted, this worker's
+// old process stayed up but never came back). Reconnect with capped exponential
+// backoff instead.
+let reconnectDelayMs = RECONNECT_BASE_DELAY_MS
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+// Last rate-limit cooldown this worker told the router about (see sendDegraded
+// above). The router's DegradedTracker is in-memory only, so a router restart
+// while this worker is still within that window would otherwise forget it was
+// rate-limited and route new messages here anyway — resend it on reconnect.
+let lastDegradedUntil = 0
+
+function scheduleReconnect() {
+  if (reconnectTimer) return
+  dbg(`worker: reconnecting in ${reconnectDelayMs}ms`)
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    connectWorker()
+  }, reconnectDelayMs)
+  reconnectDelayMs = nextReconnectDelay(reconnectDelayMs)
+}
+
 function connectWorker() {
+  // The router this worker was talking to might itself be gone, not just this
+  // socket — the default (non-service) setup has no supervisor to relaunch a
+  // crashed router, so without this a worker whose router died would retry
+  // netConnect against a router.sock that will never come back on its own.
+  // ensureRouter() is cheap to call repeatedly: it no-ops if the socket file
+  // already exists.
+  ensureRouter()
   dbg(`worker mode: connecting to ${ROUTER_SOCK}`)
   let sockBuf = ''
   const sock = netConnect(ROUTER_SOCK, () => {
     dbg('worker: connected to router')
+    reconnectDelayMs = RECONNECT_BASE_DELAY_MS
     setWorkerSock(sock)
     sock.write(JSON.stringify({
       type: 'register',
@@ -980,6 +1014,7 @@ function connectWorker() {
       capabilities: WORKER_CAPABILITIES,
       protocolVersion: WORKER_PROTOCOL_VERSION,
     }) + '\n')
+    if (lastDegradedUntil > Date.now()) sendDegraded('rate_limited', lastDegradedUntil, dbg)
   })
   sock.on('data', (chunk) => {
     sockBuf += chunk.toString()
@@ -1004,8 +1039,8 @@ function connectWorker() {
       } catch (e) { dbg(`worker: bad message: ${e}`) }
     }
   })
-  sock.on('error', (e) => { dbg(`worker: socket error: ${e}`); clearWorkerSockIfCurrent(sock) })
-  sock.on('close', () => { dbg('worker: router disconnected'); clearWorkerSockIfCurrent(sock) })
+  sock.on('error', (e) => { dbg(`worker: socket error: ${e}`); clearWorkerSockIfCurrent(sock); scheduleReconnect() })
+  sock.on('close', () => { dbg('worker: router disconnected'); clearWorkerSockIfCurrent(sock); scheduleReconnect() })
 }
 
 if (WORKER_MODE) {
@@ -1031,6 +1066,7 @@ function shutdown() {
   if (shuttingDown) return; shuttingDown = true
   process.stderr.write('feishu channel: shutting down\n')
   try { (wsClient as any)?.disconnect?.() } catch {}
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   setTimeout(() => process.exit(0), 2000)
 }
 process.stdin.on('end', shutdown)
