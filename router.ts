@@ -355,21 +355,22 @@ const MIME_EXT: Record<string, string> = {
 
 /** Decode a tool-produced `data:` attachment (e.g. a screenshot) and send it to Feishu as an image or file message. */
 async function sendOpenCodeAttachment(chatId: string, mime: string, dataUrl: string, filename: string | undefined, dbgTag: string) {
-  const buf = decodeBase64DataUri(dataUrl)
-  if (!buf) { dbg(`${dbgTag}: attachment data URI isn't base64-encoded, skipping (unsupported for now)`); return }
-  if (buf.byteLength > MAX_ATTACHMENT_BYTES) {
-    dbg(`${dbgTag}: attachment too large (${buf.byteLength} bytes > ${MAX_ATTACHMENT_BYTES}), skipping`)
+  const decoded = decodeBase64DataUri(dataUrl, MAX_ATTACHMENT_BYTES)
+  if (!decoded.ok) {
+    dbg(decoded.reason === 'too_large'
+      ? `${dbgTag}: attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes, skipping`
+      : `${dbgTag}: attachment data URI isn't base64-encoded, skipping (unsupported for now)`)
     return
   }
   const ext = MIME_EXT[mime] ?? mime.split('/')[1]?.replace(/[^a-z0-9]/gi, '') ?? 'bin'
   const tmpPath = join(tmpdir(), `oc-attach-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
   try {
-    writeFileSync(tmpPath, buf)
+    writeFileSync(tmpPath, decoded.buf)
     await sendFeishuFile(apiClient, chatId, tmpPath, filename)
   } catch (e) {
     dbg(`${dbgTag}: attachment upload failed: ${e}`)
   } finally {
-    try { unlinkSync(tmpPath) } catch {}
+    try { unlinkSync(tmpPath) } catch (e) { dbg(`${dbgTag}: failed to clean up temp attachment file ${tmpPath}: ${e}`) }
   }
 }
 
@@ -407,6 +408,13 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
   const controller = new AbortController()
   let finalText = ''
   const attachments: Extract<AgentEvent, { type: 'attachment.completed' }>[] = []
+  // A tool can produce an attachment (e.g. a screenshot) in an earlier step of the
+  // same turn that later fails/aborts — that capture is still real and worth
+  // sending, so every early-return path flushes whatever was collected so far
+  // instead of silently dropping it.
+  const flushAttachments = () => Promise.all(
+    attachments.map(att => sendOpenCodeAttachment(chatId, att.mime, att.dataUrl, att.filename, `opencode: task ${taskId}`)),
+  )
   try {
     for await (const event of openCodeAdapter.send({ taskId, sessionId, prompt: content }, controller.signal)) {
       if (event.type === 'permission.requested') {
@@ -422,9 +430,11 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
         // one instead of repeating the same failure forever.
         openCodeBindings.delete(key)
         void replyText(chatId, messageId, `⚠️ OpenCode 执行失败：${event.reason}`)
+        await flushAttachments()
         return
       } else if (event.type === 'task.aborted') {
         void replyText(chatId, messageId, `⚠️ OpenCode 任务被中断`)
+        await flushAttachments()
         return
       }
     }
@@ -432,6 +442,7 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
     dbg(`opencode: send() threw: ${e}`)
     openCodeBindings.delete(key)
     void replyText(chatId, messageId, `⚠️ OpenCode 执行出错：${e}`)
+    await flushAttachments()
     return
   }
 
@@ -440,7 +451,7 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
   } else if (attachments.length === 0) {
     dbg(`opencode: task ${taskId} completed with no text output`)
   }
-  for (const att of attachments) await sendOpenCodeAttachment(chatId, att.mime, att.dataUrl, att.filename, `opencode: task ${taskId}`)
+  await flushAttachments()
 }
 
 async function handleInbound(data: any) {
