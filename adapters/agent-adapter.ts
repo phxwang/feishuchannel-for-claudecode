@@ -63,6 +63,7 @@ export type AgentEvent =
   | { type: 'tool.completed'; taskId: string; toolName: string }
   | { type: 'tool.failed'; taskId: string; toolName: string; error: string }
   | { type: 'permission.requested'; taskId: string; requestId: string; toolName: string; description: string }
+  | { type: 'attachment.completed'; taskId: string; mime: string; dataUrl: string; filename?: string }
   | { type: 'session.idle'; taskId: string }
   | { type: 'task.failed'; taskId: string; reason: string }
   | { type: 'task.aborted'; taskId: string }

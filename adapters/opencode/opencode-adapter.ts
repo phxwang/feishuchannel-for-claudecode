@@ -64,7 +64,8 @@ export interface OpenCodeAdapterConfig {
   paths?: Partial<OpenCodeApiPaths>
 }
 
-type RawPart = { type?: string; text?: string; tool?: string; state?: { status?: string; error?: string } }
+type RawAttachment = { type?: string; mime?: string; url?: string; filename?: string }
+type RawPart = { type?: string; text?: string; tool?: string; state?: { status?: string; error?: string; attachments?: RawAttachment[] } }
 type RawEvent = { type?: string; properties?: Record<string, unknown> }
 
 export class OpenCodeAdapter implements AgentAdapter {
@@ -228,6 +229,15 @@ export class OpenCodeAdapter implements AgentAdapter {
       const toolName = String(part.tool ?? 'unknown')
       if (part.state?.status === 'completed') yield { type: 'tool.completed', taskId: task.taskId, toolName }
       else if (part.state?.status === 'error') yield { type: 'tool.failed', taskId: task.taskId, toolName, error: String(part.state.error ?? 'tool failed') }
+      // Tools that produce a file (e.g. a browser screenshot MCP tool) attach it
+      // as a `data:` URI on the tool's own state — confirmed against a real
+      // opencode serve response; there's no separate top-level `file` message
+      // part the way the OpenAPI FilePart schema might suggest.
+      for (const att of part.state?.attachments ?? []) {
+        if (att?.type === 'file' && typeof att.mime === 'string' && typeof att.url === 'string' && att.url.startsWith('data:')) {
+          yield { type: 'attachment.completed', taskId: task.taskId, mime: att.mime, dataUrl: att.url, filename: att.filename }
+        }
+      }
     }
 
     if (body.info?.error) {

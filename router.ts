@@ -12,9 +12,9 @@
 import * as lark from '@larksuiteoapi/node-sdk'
 import { createServer, type Socket } from 'net'
 import {
-  readFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync,
+  readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync, createReadStream,
 } from 'fs'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { acquireRouterLock, releaseRouterLock } from './router-lock'
 import { markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, SqliteBindingStore, wasEventProcessed } from './routing/storage'
@@ -343,6 +343,42 @@ function buildOpenCodePermCard(toolName: string, description: string, code: stri
   })
 }
 
+// Feishu file_type enum values it accepts for im.file.create — mirrors server.ts's FEISHU_FTYPES.
+const MIME_EXT: Record<string, { ext: string; feishuFileType?: string }> = {
+  'image/png': { ext: 'png' },
+  'image/jpeg': { ext: 'jpg' },
+  'image/gif': { ext: 'gif' },
+  'image/webp': { ext: 'webp' },
+  'application/pdf': { ext: 'pdf', feishuFileType: 'pdf' },
+}
+
+/** Decode a tool-produced `data:` attachment (e.g. a screenshot) and send it to Feishu as an image or file message. */
+async function sendOpenCodeAttachment(chatId: string, mime: string, dataUrl: string, filename: string | undefined, dbgTag: string) {
+  const commaIdx = dataUrl.indexOf(',')
+  if (commaIdx === -1) { dbg(`${dbgTag}: malformed data URI, skipping attachment`); return }
+  const buf = Buffer.from(dataUrl.slice(commaIdx + 1), 'base64')
+  const { ext, feishuFileType } = MIME_EXT[mime] ?? { ext: mime.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin' }
+  const tmpPath = join(tmpdir(), `oc-attach-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
+  try {
+    writeFileSync(tmpPath, buf)
+    if (mime.startsWith('image/')) {
+      const r = await (apiClient as any).im.image.create({ data: { image_type: 'message', image: createReadStream(tmpPath) } })
+      const key = r?.image_key ?? r?.data?.image_key
+      if (!key) throw new Error(`image upload had no image_key: ${JSON.stringify(r)}`)
+      await (apiClient as any).im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'image', content: JSON.stringify({ image_key: key }) } })
+    } else {
+      const r = await (apiClient as any).im.file.create({ data: { file_type: feishuFileType ?? 'stream', file_name: filename ?? `attachment.${ext}`, file: createReadStream(tmpPath) } })
+      const key = r?.file_key ?? r?.data?.file_key
+      if (!key) throw new Error(`file upload had no file_key: ${JSON.stringify(r)}`)
+      await (apiClient as any).im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'file', content: JSON.stringify({ file_key: key }) } })
+    }
+  } catch (e) {
+    dbg(`${dbgTag}: attachment upload failed: ${e}`)
+  } finally {
+    try { unlinkSync(tmpPath) } catch {}
+  }
+}
+
 async function handleOpenCodePermission(event: Extract<AgentEvent, { type: 'permission.requested' }>, chatId: string) {
   openCodePermissionCodes.add(event.requestId)
   dbg(`opencode: permission requested (${event.toolName}), sending card for ${event.requestId}`)
@@ -376,12 +412,15 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
   const taskId = `oc-${messageId}`
   const controller = new AbortController()
   let finalText = ''
+  const attachments: Extract<AgentEvent, { type: 'attachment.completed' }>[] = []
   try {
     for await (const event of openCodeAdapter.send({ taskId, sessionId, prompt: content }, controller.signal)) {
       if (event.type === 'permission.requested') {
         void handleOpenCodePermission(event, chatId)
       } else if (event.type === 'text.completed') {
         finalText = event.text
+      } else if (event.type === 'attachment.completed') {
+        attachments.push(event)
       } else if (event.type === 'task.failed') {
         dbg(`opencode: task ${taskId} failed: ${event.reason}`)
         // The cached session may no longer be valid (e.g. opencode serve
@@ -404,9 +443,10 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
 
   if (finalText) {
     for (const chunk of chunkText(finalText, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
-  } else {
+  } else if (attachments.length === 0) {
     dbg(`opencode: task ${taskId} completed with no text output`)
   }
+  for (const att of attachments) await sendOpenCodeAttachment(chatId, att.mime, att.dataUrl, att.filename, `opencode: task ${taskId}`)
 }
 
 async function handleInbound(data: any) {

@@ -124,6 +124,44 @@ describe('send — synchronous POST response is authoritative', () => {
     expect(lastSentBody).toEqual({ parts: [{ type: 'text', text: 'hello' }] })
   })
 
+  test('emits attachment.completed for a data: URI file attached to a tool state (e.g. a screenshot tool)', async () => {
+    sendBody = {
+      info: {},
+      parts: [
+        {
+          type: 'tool', tool: 'playwright_browser_take_screenshot',
+          state: {
+            status: 'completed',
+            attachments: [{ id: 'prt_1', type: 'file', mime: 'image/png', url: 'data:image/png;base64,AAAA' }],
+          },
+        },
+      ],
+    }
+    const out: any[] = []
+    for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e)
+    expect(out).toEqual([
+      { type: 'task.started', taskId: 't1' },
+      { type: 'tool.completed', taskId: 't1', toolName: 'playwright_browser_take_screenshot' },
+      { type: 'attachment.completed', taskId: 't1', mime: 'image/png', dataUrl: 'data:image/png;base64,AAAA', filename: undefined },
+      { type: 'session.idle', taskId: 't1' },
+    ])
+  })
+
+  test('ignores a tool attachment whose url is not a data: URI (unsupported for now)', async () => {
+    sendBody = {
+      info: {},
+      parts: [
+        {
+          type: 'tool', tool: 'bash',
+          state: { status: 'completed', attachments: [{ id: 'prt_1', type: 'file', mime: 'image/png', url: 'https://example.com/x.png' }] },
+        },
+      ],
+    }
+    const out: any[] = []
+    for await (const e of adapter().send({ taskId: 't1', sessionId: 'sess-1', prompt: 'hello' }, new AbortController().signal)) out.push(e.type)
+    expect(out).toEqual(['task.started', 'tool.completed', 'session.idle'])
+  })
+
   test('emits tool.completed/tool.failed for tool parts in the response', async () => {
     sendBody = {
       info: {},
