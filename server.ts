@@ -21,6 +21,7 @@ import { join, sep, extname, basename } from 'path'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { clearWorkerSockIfCurrent, DEFAULT_DEGRADED_MS, registerCallback, sendDegraded, setWorkerSock, WORKER_CAPABILITIES, WORKER_ID, WORKER_PROTOCOL_VERSION } from './worker-link'
 import { parseRateLimitResetTime } from './rate-limit-reset'
+import { nextReconnectDelay, RECONNECT_BASE_DELAY_MS } from './reconnect-backoff'
 
 /** Walk up the process tree to find the Claude ancestor with --channels feishu.
  *  Returns its PID (or 0 if not found). */
@@ -967,11 +968,31 @@ dbg(`server starting (CHANNEL_MODE=${CHANNEL_MODE}, WORKER_MODE=${WORKER_MODE}, 
 
 let wsClient: lark.WSClient | null = null
 
+// If the router restarts (redeploy, crash-and-KeepAlive-relaunch), this worker's
+// socket just closes — nothing here reconnects it on its own otherwise, leaving
+// the worker silently unreachable until the whole Claude Code session is
+// restarted (see the 2026-08-19 inv4 incident: router restarted, this worker's
+// old process stayed up but never came back). Reconnect with capped exponential
+// backoff instead.
+let reconnectDelayMs = RECONNECT_BASE_DELAY_MS
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleReconnect() {
+  if (reconnectTimer) return
+  dbg(`worker: reconnecting in ${reconnectDelayMs}ms`)
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    connectWorker()
+  }, reconnectDelayMs)
+  reconnectDelayMs = nextReconnectDelay(reconnectDelayMs)
+}
+
 function connectWorker() {
   dbg(`worker mode: connecting to ${ROUTER_SOCK}`)
   let sockBuf = ''
   const sock = netConnect(ROUTER_SOCK, () => {
     dbg('worker: connected to router')
+    reconnectDelayMs = RECONNECT_BASE_DELAY_MS
     setWorkerSock(sock)
     sock.write(JSON.stringify({
       type: 'register',
@@ -1004,8 +1025,8 @@ function connectWorker() {
       } catch (e) { dbg(`worker: bad message: ${e}`) }
     }
   })
-  sock.on('error', (e) => { dbg(`worker: socket error: ${e}`); clearWorkerSockIfCurrent(sock) })
-  sock.on('close', () => { dbg('worker: router disconnected'); clearWorkerSockIfCurrent(sock) })
+  sock.on('error', (e) => { dbg(`worker: socket error: ${e}`); clearWorkerSockIfCurrent(sock); scheduleReconnect() })
+  sock.on('close', () => { dbg('worker: router disconnected'); clearWorkerSockIfCurrent(sock); scheduleReconnect() })
 }
 
 if (WORKER_MODE) {
