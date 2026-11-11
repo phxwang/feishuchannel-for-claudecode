@@ -257,6 +257,11 @@ launchctl print gui/$(id -u)/com.you.feishuchannel-router | head -5
 launchctl kickstart -k gui/$(id -u)/com.you.feishuchannel-router
 ```
 
+**Which code change needs which action** — the two halves of this plugin are deployed completely differently:
+
+- **`router.ts` and anything it imports** (`routing/*`, `adapters/*`, `claude-tmux-worker.ts`, `feishu-attachment.ts`, `feishu-download.ts`, `data-uri.ts`, `chunk-text.ts`, `rate-limit-reset.ts`, `reconnect-backoff.ts`, `router-lock.ts`) run as this standalone service, executed directly from the repo's working directory (see `ProgramArguments`/`WorkingDirectory` above). A code change here needs **only a restart** (`launchctl kickstart -k ...`) — there is no separate install step, since the service always re-reads the files from this same path on every launch.
+- **`server.ts`** (and `worker-link.ts`) runs as an MCP plugin *inside* each Claude Code process, loaded from `~/.claude/plugins/cache/feishu-local/feishu/<version>/` — a cached copy, not this repo directly. A change here needs the plugin cache refreshed: bump the version in `.claude-plugin/plugin.json` and `package.json`, then `claude plugin marketplace update feishu-local && claude plugin update feishu@feishu-local`, then restart each Claude Code instance (the worker) so it picks up the new plugin version.
+
 **4. Uninstall**, if you go back to ad-hoc/`claude-feishu`-auto-spawn mode:
 
 ```bash
