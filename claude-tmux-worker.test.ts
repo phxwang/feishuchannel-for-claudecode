@@ -69,6 +69,39 @@ describe('parseAssistantTextLines', () => {
     ]
     expect(parseAssistantTextLines(lines)).toEqual(['first', 'second'])
   })
+
+  // Captured verbatim (2026-11-11) from a real transcript: a repeat /model
+  // with nothing to pick resolves instantly with no real assistant turn and
+  // no Stop-hook signal at all — reported live as "/model stuck again"
+  // because sendAndAwaitReply had nothing else to notice it was done.
+  test('surfaces a local_command system line\'s stdout (current CLI build)', () => {
+    const lines = [
+      JSON.stringify({ type: 'system', subtype: 'local_command', content: '<local-command-name>/model</local-command-name>' }),
+      JSON.stringify({ type: 'system', subtype: 'local_command', content: '<local-command-stdout>Kept model as `Opus 5.5`</local-command-stdout>' }),
+    ]
+    expect(parseAssistantTextLines(lines)).toEqual(['Kept model as `Opus 5.5`'])
+  })
+
+  test('surfaces a user-line-wrapped local-command-stdout (older CLI build)', () => {
+    const lines = [
+      JSON.stringify({ type: 'user', message: { content: '<command-name>/model</command-name>' } }),
+      JSON.stringify({ type: 'user', message: { content: '<local-command-stdout>Set model to `Opus 5.5` and saved as your default for new sessions</local-command-stdout>' } }),
+    ]
+    expect(parseAssistantTextLines(lines)).toEqual(['Set model to `Opus 5.5` and saved as your default for new sessions'])
+  })
+
+  test('does not mistake an ordinary user message for local-command output', () => {
+    const lines = [JSON.stringify({ type: 'user', message: { content: 'hello there' } })]
+    expect(parseAssistantTextLines(lines)).toEqual([])
+  })
+
+  test('rejects a mismatched stdout-open/stderr-close wrapper instead of extracting it anyway', () => {
+    const lines = [JSON.stringify({
+      type: 'system', subtype: 'local_command',
+      content: '<local-command-stdout>partial</local-command-stderr>',
+    })]
+    expect(parseAssistantTextLines(lines)).toEqual([])
+  })
 })
 
 describe('stopSignalPathFor', () => {

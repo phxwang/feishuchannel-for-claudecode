@@ -85,15 +85,45 @@ export function escapeWorkdirForTranscriptDir(workdir: string): string {
 
 export interface TranscriptLine {
   type?: string
+  subtype?: string
+  content?: unknown
   message?: { role?: string; content?: unknown }
 }
 
 /**
- * Extract plain assistant text from raw JSONL transcript lines. Lines that
- * aren't valid JSON, aren't assistant messages, or carry no text content
- * (e.g. a pure tool_use turn) are skipped rather than throwing — a
- * transcript is append-only but a partially-written last line while the
- * CLI is still flushing is expected, not an error.
+ * Pulls the text out of a `<local-command-stdout>...</local-command-stdout>`
+ * (or `-stderr`) wrapper, or null if `value` isn't a string containing one.
+ * The closing tag is a backreference to the opener, not matched
+ * independently — otherwise a malformed/interleaved
+ * `<local-command-stdout>...</local-command-stderr>` would still match and
+ * get extracted as one blob instead of being rejected.
+ */
+const LOCAL_COMMAND_OUTPUT_RE = /<local-command-(std(?:out|err))>([\s\S]*?)<\/local-command-\1>/
+function extractLocalCommandOutput(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const m = value.match(LOCAL_COMMAND_OUTPUT_RE)
+  return m ? m[2].trim() || null : null
+}
+
+/**
+ * Extract plain reply text from raw JSONL transcript lines. Lines that
+ * aren't valid JSON or carry no text content (e.g. a pure tool_use turn)
+ * are skipped rather than throwing — a transcript is append-only but a
+ * partially-written last line while the CLI is still flushing is expected,
+ * not an error.
+ *
+ * Besides real assistant turns, also surfaces a slash command's own output
+ * when it resolves with nothing to pick (e.g. a repeat `/model` when the
+ * model is already set just prints "Kept model as X") — found live that
+ * this never produces a real assistant turn or a Stop-hook signal at all,
+ * so without this, sendAndAwaitReply would sit polling for the full
+ * replyTimeoutMs (10 minutes by default) even though the CLI already
+ * answered on screen. This is recorded in the transcript as either a
+ * `type: 'system', subtype: 'local_command'` line (content at the top
+ * level) or, in an older/different CLI build, a `type: 'user'` line
+ * wrapping the same `<local-command-stdout>` tag in message.content — never
+ * matched for an ordinary `type: 'user'` line with the user's own plain
+ * text, since that never contains the wrapper tag.
  */
 export function parseAssistantTextLines(lines: string[]): string[] {
   const out: string[] = []
@@ -101,6 +131,16 @@ export function parseAssistantTextLines(lines: string[]): string[] {
     if (!line.trim()) continue
     let parsed: TranscriptLine
     try { parsed = JSON.parse(line) } catch { continue }
+    if (parsed.type === 'system' && parsed.subtype === 'local_command') {
+      const stdout = extractLocalCommandOutput(parsed.content)
+      if (stdout) out.push(stdout)
+      continue
+    }
+    if (parsed.type === 'user') {
+      const stdout = extractLocalCommandOutput(parsed.message?.content)
+      if (stdout) out.push(stdout)
+      continue
+    }
     if (parsed.type !== 'assistant') continue
     const content = parsed.message?.content
     if (typeof content === 'string') {
