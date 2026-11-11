@@ -158,6 +158,10 @@ export interface SendAndAwaitReplyOptions {
 
 const OPTION_LINE_RE = /^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$/
 const DIVIDER_LINE_RE = /^[\s─╌│]*$/
+/** A line that's known decoration rather than further prompt content when it trails an option block — a collapsed-submenu marker (e.g. /model's "▸ More models") or an effort/mode indicator (e.g. "◐ Medium effort (default) ←/→ to adjust"). Narrow on purpose: this only has to cover known real panels, not every possible glyph. */
+const TRAILING_DECORATION_RE = /^\s*[▸◐]/
+/** An "Esc to <verb>" footer hint, case-insensitively (parseTabBar's own "Esc to cancel", or /model's "Enter to set as default · s to use this session only · Esc to cancel") — narrower than matching the bare word "esc" anywhere, which could otherwise wrongly tolerate ordinary reply text that happens to mention "esc" in some other context (e.g. discussing the key itself) after an option block. */
+const ESC_HINT_RE = /\besc\s+to\s+\w+/i
 const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*m/g
 
 /** Strip SGR color/style escape codes so layout-based parsing (parseDialogOptions) sees plain text. */
@@ -200,7 +204,9 @@ export function parseDialogOptions(paneText: string): Dialog | null {
   if (options.length === 0) return null
   if (!options.every((o, idx) => o.number === String(idx + 1))) return null
   for (let i = lastOptionIdx + 1; i < lines.length; i++) {
-    if (lines[i].trim() !== '') return null  // something else follows — not the bottom of the screen
+    const line = lines[i]
+    if (line.trim() === '' || TRAILING_DECORATION_RE.test(line) || ESC_HINT_RE.test(line)) continue
+    return null  // something else follows — not the bottom of the screen
   }
 
   let question = ''

@@ -187,6 +187,73 @@ describe('parseDialogOptions', () => {
     const text = ['1. Yes', '2. No', ''].join('\n')
     expect(parseDialogOptions(text)!.question).toBe('Claude 需要你的输入')
   })
+
+  // Captured verbatim (2026-11-11) from a real /model panel — reported live
+  // as "no card" because its trailing "▸ More models" / effort-indicator /
+  // "Enter to set as default · s to use this session only · Esc to cancel"
+  // footer isn't literally blank, which the original "must be the literal
+  // bottom of the screen" rule rejected outright.
+  const realModelPicker = [
+    '❯ /model',
+    '',
+    '────────────────────',
+    '  Select model',
+    '  Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.',
+    '',
+    '    1.  Default (recommended)  Opus 5.5 · Best for everyday, complex tasks',
+    '  ❯ 2.  Opus 5.5 ✔             For complex work and everyday tasks',
+    '    3.  Fable 5.2              For your toughest challenges',
+    '    4.  Sonnet 5.5             Most efficient for simpler tasks',
+    '    5.  Haiku 5.5              Fastest for quick answers',
+    '    ▸   More models',
+    '',
+    '  ◐ Medium effort (default) ←/→ to adjust',
+    '',
+    '  Enter to set as default · s to use this session only · Esc to cancel',
+    '',
+  ].join('\n')
+
+  test('tolerates /model\'s trailing "more models"/effort/footer decoration', () => {
+    const dialog = parseDialogOptions(realModelPicker)
+    expect(dialog).not.toBeNull()
+    expect(dialog!.options).toEqual([
+      { number: '1', label: 'Default (recommended)  Opus 5.5 · Best for everyday, complex tasks' },
+      { number: '2', label: 'Opus 5.5 ✔             For complex work and everyday tasks' },
+      { number: '3', label: 'Fable 5.2              For your toughest challenges' },
+      { number: '4', label: 'Sonnet 5.5             Most efficient for simpler tasks' },
+      { number: '5', label: 'Haiku 5.5              Fastest for quick answers' },
+    ])
+  })
+
+  test('rejects a reply that happens to mention "esc" without the "Esc to <verb>" footer shape', () => {
+    const text = [
+      'Pick one:', '1. Yes', '2. No', '',
+      'Note: pressing esc elsewhere in this app does something unrelated.',
+    ].join('\n')
+    expect(parseDialogOptions(text)).toBeNull()
+  })
+
+  test('still rejects a finished reply whose trailing lines mention neither Esc nor the decoration glyphs', () => {
+    // Same shape as the "finished reply" guard above, confirming the new
+    // trailing-decoration tolerance doesn't quietly widen that hole.
+    const finishedReply = [
+      '❯ give me three steps',
+      '',
+      '⏺ Here are three steps:',
+      '',
+      '  1. First, do this',
+      '  2. Then do that',
+      '  3. Finally, done',
+      '',
+      '✻ Cooked for 3s · done 6:00 PM',
+      '',
+      '────────────────────',
+      '❯ ',
+      '────────────────────',
+      '  ⏸ manual mode on · ? for shortcuts',
+    ].join('\n')
+    expect(parseDialogOptions(finishedReply)).toBeNull()
+  })
 })
 
 describe('parseTabBar', () => {
