@@ -368,11 +368,13 @@ An alternative delivery mode for `primary: "claude"`, selected per group/DM via 
   "groups": {
     "oc_groupA": {
       "workdir": "/path/to/my-project",
-      "agent": { "primary": "claude", "fallback": null, "mode": "tmux" }
+      "agent": { "primary": "claude", "fallback": null, "mode": "tmux", "model": "opus" }
     }
   }
 }
 ```
+
+`model` (optional, e.g. `"opus"`, `"sonnet"`, `"fable"`, or a full model name — anything `claude --model` accepts) is passed on spawn only; it has no effect on an already-running session, so changing it requires `/restart` (see below) to take effect.
 
 Omitting `mode` (or setting `"socket"`) keeps today's behavior: `server.ts` runs as an MCP plugin inside the Claude Code process and messages arrive as `notifications/claude/channel`. `"tmux"` instead keeps a real interactive `claude` CLI running in a detached tmux session per workdir (`claude-tmux-worker.ts`) and delivers messages as literal keystrokes (`tmux paste-buffer`), so the CLI can't tell them apart from someone typing at the terminal.
 
@@ -389,16 +391,20 @@ Do you want to allow Claude to fetch this content?
   2. Yes, and don't ask again for example.com
   3. No, and tell Claude what to do differently (esc)
 ```
-the router sends a Feishu card with one button per option plus a fixed 🚪 Esc button, every time, as a safe way out even if none of the parsed options turn out to be what you actually want. Clicking a numbered option types that number into the pane and presses Enter; clicking Esc just presses Escape. Detection is deliberately conservative (consecutive options starting at 1, and the menu must be the last thing on screen) specifically so a numbered list inside Claude's own *finished* reply text is never mistaken for a pending menu. An unanswered card times out after 30 minutes (cancelled automatically, with a notice) rather than blocking that workdir's queue forever.
+the router sends a Feishu card with one button per option plus a fixed 🚪 Esc button, every time, as a safe way out even if none of the parsed options turn out to be what you actually want. Clicking a numbered option types that number into the pane and presses Enter; clicking Esc just presses Escape. Detection is deliberately conservative (consecutive options starting at 1, and the menu must be the last thing on screen — tolerating a short, specific list of known trailing decoration like `/model`'s "▸ More models" / effort indicator / "Enter to set as default · ... Esc to cancel" footer, not just any text) specifically so a numbered list inside Claude's own *finished* reply text is never mistaken for a pending menu. An unanswered card times out after 30 minutes; unlike an explicit `/esc`/`/restart` cancellation (which has already dealt with the session its own way and gets no extra keystroke), a genuine timeout also sends a real Escape so the CLI isn't left sitting on an open menu indefinitely.
+
+Cards are built as Feishu interactive-card schema 2.0, which dropped the older `tag: 'action'` button-row wrapper — each option is its own full-width `column_set` row instead.
 
 `/restart` and `/esc` both cancel any dialog this workdir is still waiting on before acting — otherwise a click arriving after a `/restart` would hit a brand-new, unrelated session under the same name.
 
-A plain tab bar with no numbered options (`/status`'s "Settings  Status   Config   Usage   Stats") also gets a card — one button per tab name — but navigating it is necessarily an *approximation*: which tab is actually focused is conveyed by color/style alone, invisible to a plain-text pane capture, so `parseTabBar` just assumes the panel opened on the leftmost tab and reaches option N by pressing Right (N-1) times. If that assumption is wrong, you land on the wrong tab — ask again (a fresh card, or `/esc`) rather than expecting this to track real state it fundamentally can't observe from plain text.
+A plain tab bar with no numbered options (`/status`'s "Settings  Status   Config   Usage   Stats") also gets a card — one button per tab name — but navigating it is necessarily an *approximation*: which tab is actually focused is conveyed by color/style alone, invisible to a plain-text pane capture, so `parseTabBar` just assumes the panel opened on the leftmost tab and reaches option N by pressing Right (N-1) times, wrapping circularly since there's no Left. After a switch, a screenshot of wherever it actually landed is sent, followed automatically by a fresh card offering the same tab choices again — and that repeat card (and its Right-press math) is relative to the *real* last-clicked tab, not re-assuming leftmost every time, so a chain of switches stays accurate even if the first guess wasn't. That tracking only lives for one message's whole switching chain, though — pressing Esc, or sending a new message later, resets back to the leftmost assumption.
 
 This doesn't catch every possible interactive state — a deeper nested view inside a panel (e.g. `/status`'s own Settings tab, itself a scrollable, searchable list of toggles) has neither a numbered menu nor a plain tab bar to convert, so it still just sits there. For that case, `pane-screenshot.ts` instead renders the pane (ANSI colors included, via `ansi-to-html` + a headless Chromium) to a PNG and sends it as an image — so you can at least see what's on screen, even though clicking into it isn't possible. Falls back to doing nothing (logged, not an error) if this machine has no cached Playwright Chromium build. `/esc` (a bare Escape keypress straight to the session) and `/restart` (kill + respawn) remain the ways to actually get past a stuck panel like this.
 
+Not every slash command produces a real assistant turn at all — a repeat `/model` when the model is already set, for instance, just prints "Kept model as X" instantly with no panel and no Stop-hook signal. That output is recognized too (it's recorded in the transcript as local-command output, not an assistant message) and surfaced the same way a normal reply would be, instead of the router sitting there until the full reply timeout elapses with nothing to show for it.
+
 **Known gaps:**
-- Tab-bar navigation (`/status`'s top-level tabs) is a best-effort guess, not a measured fact — it can land on the wrong tab. Deeper nested views inside a panel get a screenshot instead of a card; use `/esc` to actually dismiss one.
+- Tab-bar navigation (`/status`'s top-level tabs) is a best-effort guess, not a measured fact — it can land on the wrong tab, and the tracking that keeps repeat switches relative to the real last click doesn't survive past Esc or a new message. Deeper nested views inside a panel get a screenshot instead of a card; use `/esc` to actually dismiss one.
 - A tmux session survives a router restart (its context isn't lost, unlike socket mode) but the router's in-memory `--session-id` pin doesn't — the next message after a restart falls back to "newest transcript by mtime" for that workdir, which can misattribute output if more than one `claude` process targets the same directory.
 - Idle tmux sessions are killed after an hour of no messages (`TMUX_IDLE_MS` in `router.ts`).
 - The `claude` binary is resolved once at startup (`Bun.which`, then `~/.local/bin/claude` and a couple of other common install paths) rather than trusting PATH inside the spawned tmux pane — found the hard way when a launchd service's stripped PATH didn't include it, see `claude-tmux-worker.ts`'s `resolveClaudeBin`.
