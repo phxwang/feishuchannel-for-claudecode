@@ -490,11 +490,23 @@ function pruneOldTmuxAttachments() {
  * cleaned up after the task) since the CLI may read them later in the
  * conversation, not necessarily during this exact turn.
  */
+/**
+ * `tmuxClaude.sendAndAwaitReply` throwing is, by contract (see its own
+ * doc comment in claude-tmux-worker.ts), always a *pre-delivery* failure —
+ * the message never reached the CLI (tmux new-session or send-keys/
+ * paste-buffer itself failed) — so it's provably safe to fall back to
+ * OpenCode here, the same "no side effect" guarantee the socket-worker
+ * path requires before falling back (see handleInbound's own fallback
+ * branch below). A failure *after* delivery is swallowed inside
+ * sendAndAwaitReply itself and never reaches this catch.
+ */
 async function handleClaudeTmuxTask(
-  workdir: string, chatId: string, messageId: string, content: string,
+  route: NonNullable<ReturnType<typeof resolveRoute>>, chatId: string, messageId: string, chatType: 'p2p' | 'group',
+  content: string, ocContent: string,
   attDownloads: { fileKey: string; type: 'file' | 'image'; fileName: string }[],
-  model: string | undefined,
 ) {
+  const workdir = route.workdir
+  const model = route.agent.model
   dbg(`routing ${chatId} → ${workdir} via Claude-tmux`)
   let effectiveContent = content
   if (attDownloads.length > 0) {
@@ -518,6 +530,12 @@ async function handleClaudeTmuxTask(
       dbg(`claude-tmux: ${workdir} produced no text reply for ${messageId}`)
     }
   } catch (e) {
+    if (route.agent.fallback === 'opencode' && infraConfig?.fallback.enabled && openCodeAdapter) {
+      dbg(`claude-tmux: ${workdir} unavailable (${e}), falling back to OpenCode (pre-delivery, no side effect)`)
+      void replyText(chatId, messageId, '⚠️ Claude Code (tmux) 当前不可用，已切换到 OpenCode 处理本次任务。')
+      void handleOpenCodeTask(route, chatId, messageId, chatType, ocContent)
+      return
+    }
     dbg(`claude-tmux: task for ${workdir} failed: ${e}`)
     void replyText(chatId, messageId, `⚠️ Claude (tmux) 执行失败：${e}`)
   }
@@ -644,7 +662,7 @@ async function handleInbound(data: any) {
 
   if (route.agent.mode === 'tmux') {
     markEventProcessed(db, messageId, new Date().toISOString())
-    void handleClaudeTmuxTask(workdir, chatId, messageId, content, attDownloads, route.agent.model)
+    void handleClaudeTmuxTask(route, chatId, messageId, chatKind, content, ocContent, attDownloads)
     return
   }
 

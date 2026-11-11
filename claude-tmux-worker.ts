@@ -305,7 +305,26 @@ export class TmuxClaudeManager {
     const baselineStopMs = signalPath && existsSync(signalPath) ? statSync(signalPath).mtimeMs : 0
 
     await this.sendKeys(name, text)
+    // Everything above this line either throws (ensureSession/sendKeys failing
+    // — the message never reached the CLI, so it's provably safe for a caller
+    // to fall back to another backend) or succeeds (the message IS now
+    // delivered). Everything below must never throw past this point: once
+    // delivery has happened, a caller falling back to e.g. OpenCode on a
+    // later error here would risk running the same task twice. Any
+    // unexpected failure while waiting for the reply is swallowed and
+    // whatever text was collected so far (possibly none) is returned instead.
+    try {
+      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs)
+    } catch (e) {
+      this.dbg(`tmux: error while waiting for ${workdir}'s reply (message was already delivered, not retryable): ${e}`)
+      return ''
+    }
+  }
 
+  private async collectReply(
+    workdir: string, sessionId: string | undefined, beforeSendMs: number,
+    transcriptBefore: string | null, startOffset: number, signalPath: string | null, baselineStopMs: number,
+  ): Promise<string> {
     const deadline = beforeSendMs + this.replyTimeoutMs
     let lastChangeMs = Date.now()
     let lastSize = startOffset
