@@ -32,7 +32,7 @@ import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
 import { downloadFeishuResource } from './feishu-download'
 import { renderPaneScreenshot } from './pane-screenshot'
 import { decodeBase64DataUri } from './data-uri'
-import { TmuxClaudeManager, DIALOG_ESCAPE_CHOICE, type Dialog } from './claude-tmux-worker'
+import { TmuxClaudeManager, DIALOG_ESCAPE_CHOICE, DIALOG_TIMED_OUT_CHOICE, type Dialog } from './claude-tmux-worker'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -484,8 +484,15 @@ function pruneOldTmuxAttachments() {
   if (pruned) dbg(`claude-tmux: pruned ${pruned} old attachment file(s)`)
 }
 
-/** `number: -1` is the "no real choice" sentinel: cancelled (see cancelPendingTmuxDialogs), or timed out waiting for a click. claude-tmux-worker.ts treats any number that doesn't match a real option the same way — give up without sending a keystroke, never guess. */
-const TMUX_DIALOG_CANCELLED = -1
+/**
+ * `number: -2` is the "explicitly cancelled" sentinel for cancelPendingTmuxDialogs
+ * (used by `/esc`/`/restart`, which have already dealt with the session their
+ * own way) — distinct from claude-tmux-worker.ts's own DIALOG_TIMED_OUT_CHOICE
+ * (-1, used below when a card's own timer fires with no click at all) so it
+ * can tell the two apart and only send an automatic Escape for a genuine
+ * timeout, not a redundant one on top of what /esc/`/restart` already did.
+ */
+const TMUX_DIALOG_CANCELLED = -2
 const TMUX_DIALOG_TIMEOUT_MS = 30 * 60 * 1000
 const TMUX_PENDING_DIALOGS = new Map<string, { workdir: string; resolve: (choice: number) => void }>()
 
@@ -571,7 +578,7 @@ function makeTmuxDialogHandler(workdir: string, chatId: string, messageId: strin
         if (!TMUX_PENDING_DIALOGS.delete(code)) return  // already resolved by a real click
         dbg(`claude-tmux: dialog ${code} for ${workdir} timed out waiting for a Feishu click`)
         void replyText(chatId, messageId, '⚠️ 等待选择超时，已取消本次操作，可以重新发送消息。')
-        resolve(TMUX_DIALOG_CANCELLED)
+        resolve(DIALOG_TIMED_OUT_CHOICE)
       }, TMUX_DIALOG_TIMEOUT_MS)
       TMUX_PENDING_DIALOGS.set(code, {
         workdir,

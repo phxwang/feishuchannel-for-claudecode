@@ -132,14 +132,19 @@ export interface Dialog {
 }
 /**
  * Given the parsed dialog, resolve with the chosen option's number (as sent
- * back to the pane), or `DIALOG_ESCAPE_CHOICE` for a caller-side "just press
+ * back to the pane), `DIALOG_ESCAPE_CHOICE` for a caller-side "just press
  * Escape instead" button (e.g. router.ts adds one to every card so there's
  * always a safe way out, including for dialogs this code can detect but
- * can't map to a clean single keystroke). Any other value that doesn't
- * match a real option is treated as cancelled — see collectReply.
+ * can't map to a clean single keystroke), or `DIALOG_TIMED_OUT_CHOICE` if
+ * nobody answered at all. Any other value is treated as an explicit
+ * cancellation (e.g. router.ts's `/esc`/`/restart` invalidating a stale
+ * dialog, which already resolved the matter its own way) — see collectReply
+ * for why that case alone does *not* get an automatic Escape.
  */
 export type DialogHandler = (dialog: Dialog) => Promise<number>
 export const DIALOG_ESCAPE_CHOICE = 0
+/** Resolve a DialogHandler with this when nobody answered the card before its own timeout, as opposed to an explicit /esc or /restart cancellation (any other non-matching number) — only this value gets collectReply to send a real Escape keystroke on the caller's behalf, since unlike that cancellation case, nothing else is going to clean up the open menu. */
+export const DIALOG_TIMED_OUT_CHOICE = -1
 /** Called (at most once per stuck episode) with the raw ANSI pane text when the session is blocked on something that isn't a parseable dialog — e.g. a `/status`-style panel. Purely informational: the caller decides what to do with it (render+send a screenshot, etc.); this code takes no further action afterward. */
 export type StuckPaneHandler = (paneAnsiText: string) => Promise<void>
 /** Called with the raw ANSI pane text right after a `kind: 'tabs'` choice's Right-key presses land — since the chosen tab can't be confirmed from plain-text parsing (see parseTabBar's "assumed leftmost tab" caveat), the caller is expected to render and send a screenshot so the user can see which tab was actually reached. Purely informational, like StuckPaneHandler; the next dialog card (offering the same tab choices again) is sent automatically afterward once the still-visible tab bar is re-detected on the next poll. */
@@ -627,15 +632,28 @@ export class TmuxClaudeManager {
               if (await this.hasSession(name)) await runTmux(['send-keys', '-t', name, 'Escape'])
               break
             }
+            if (chosenNumber === DIALOG_TIMED_OUT_CHOICE) {
+              // Nobody answered the card at all — unlike an explicit
+              // /esc/`/restart` cancellation (which has already dealt with
+              // the session its own way, see the fallthrough below), nothing
+              // else is going to clean this up. Send the same Escape the
+              // card's own 🚪 button would have, so the CLI isn't left
+              // sitting on an open menu indefinitely, confusing whatever
+              // message comes next.
+              this.dbg(`tmux: dialog for ${workdir} timed out with no answer — sending Escape to close it`)
+              if (await this.hasSession(name)) await runTmux(['send-keys', '-t', name, 'Escape'])
+              return collected.join('\n\n')
+            }
             const option = currentDialog.options.find(o => Number(o.number) === chosenNumber)
             if (!option) {
-              // No match — either the caller explicitly cancelled (e.g. /restart
-              // or /esc invalidating a stale dialog, see router.ts) or something
-              // genuinely unexpected happened. Either way, guessing an option
-              // (the previous behavior defaulted to options[0], effectively
-              // auto-picking "Yes" on an unanswered permission prompt) is worse
-              // than just giving up on this reply.
-              this.dbg(`tmux: dialog choice for ${workdir} didn't resolve to a real option (cancelled or invalid) — not sending a keystroke`)
+              // Any other non-matching value is an explicit cancellation
+              // (e.g. /restart already killed/is killing the session, or
+              // /esc already sent its own Escape directly) rather than a
+              // timeout — something else already resolved this, so (as
+              // before the Escape-on-timeout change above) guessing an
+              // option here, or sending a redundant keystroke into whatever
+              // the session is doing now, is worse than just giving up.
+              this.dbg(`tmux: dialog choice for ${workdir} didn't resolve to a real option (cancelled) — not sending a keystroke`)
               // Ends the whole wait immediately, same as the outer poll loop
               // timing out — not just this inner loop, which would otherwise
               // fall through to the deadline reset below and keep polling a
