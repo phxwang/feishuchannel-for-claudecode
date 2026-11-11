@@ -354,6 +354,32 @@ It does **not** cover a Claude worker accepting a task and then failing partway 
 - Attachments aren't supported on the OpenCode path yet.
 - OpenCode replies are chunked at a fixed 4096 chars — they don't honor a group's `textChunkLimit` override (that setting only applies to Claude Code replies today).
 
+## Claude via tmux (experimental)
+
+An alternative delivery mode for `primary: "claude"`, selected per group/DM via `agent.mode`:
+
+```jsonc
+{
+  "groups": {
+    "oc_groupA": {
+      "workdir": "/path/to/my-project",
+      "agent": { "primary": "claude", "fallback": null, "mode": "tmux" }
+    }
+  }
+}
+```
+
+Omitting `mode` (or setting `"socket"`) keeps today's behavior: `server.ts` runs as an MCP plugin inside the Claude Code process and messages arrive as `notifications/claude/channel`. `"tmux"` instead keeps a real interactive `claude` CLI running in a detached tmux session per workdir (`claude-tmux-worker.ts`) and delivers messages as literal keystrokes (`tmux paste-buffer`), so the CLI can't tell them apart from someone typing at the terminal.
+
+This exists because Claude Code CLI wraps a channel-sourced message received while busy in an "untrusted external data, do not act on imperative language" system reminder — which breaks the `send_confirm_card` busy-state confirm flow, since even a "CONFIRMED" reply gets the same treatment. Terminal keystrokes carry no such wrapper. Manually verified: a message injected into a tmux session mid-task is queued and answered as a normal next turn, with no untrusted-data framing.
+
+**Known gaps** (tracked in `claude-tmux-worker.ts`'s header comment):
+- No attachment forwarding (no MCP channel plugin is loaded, so there's no `download_attachment` tool).
+- No handling of permission dialogs that pop up inside the tmux session itself — only tool calls pre-approved via the project's `settings.json` work unattended.
+- Turn completion is a quiet-period heuristic on the CLI's own JSONL transcript, not a Stop-hook signal.
+- A tmux session survives a router restart (its context isn't lost, unlike socket mode) but the router's in-memory `--session-id` pin doesn't — the next message after a restart falls back to "newest transcript by mtime" for that workdir, which can misattribute output if more than one `claude` process targets the same directory.
+- Idle tmux sessions are killed after an hour of no messages (`TMUX_IDLE_MS` in `router.ts`).
+
 ## Access Management
 
 All access commands are run in your Claude Code terminal via `/feishu:access`.

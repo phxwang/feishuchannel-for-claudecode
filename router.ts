@@ -802,5 +802,12 @@ setInterval(() => {
   if (n) dbg(`pruned ${n} old processed_events rows`)
 }, PRUNE_INTERVAL_MS)
 
+// Unlike a socket worker (whose Claude Code process exits and takes the
+// connection down with it), a tmux Claude session just sits there forever
+// with nothing to notice it's unused — sweep for idle ones periodically.
+const TMUX_IDLE_MS = 60 * 60 * 1000
+const TMUX_IDLE_SWEEP_MS = 10 * 60 * 1000
+setInterval(() => { void tmuxClaude.killIdleSessions(TMUX_IDLE_MS) }, TMUX_IDLE_SWEEP_MS)
+
 // Keep alive
 await new Promise(() => {})

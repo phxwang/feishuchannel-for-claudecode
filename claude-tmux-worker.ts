@@ -155,6 +155,8 @@ export class TmuxClaudeManager {
   private sessionIds = new Map<string, string>()
   /** workdir -> tail of the in-flight sendAndAwaitReply call, so a second message for the same workdir queues instead of racing the first one on the same tmux pane/transcript. */
   private queues = new Map<string, Promise<unknown>>()
+  /** workdir -> last time a message was sent to it, for killIdleSessions(). */
+  private lastUsedAt = new Map<string, number>()
 
   constructor(opts: TmuxClaudeManagerOptions = {}) {
     this.dbg = opts.dbg ?? (() => {})
@@ -239,6 +241,7 @@ export class TmuxClaudeManager {
   }
 
   private async doSendAndAwaitReply(workdir: string, text: string): Promise<string> {
+    this.lastUsedAt.set(workdir, Date.now())
     const name = await this.ensureSession(workdir)
     const sessionId = this.sessionIds.get(workdir)
     const beforeSendMs = Date.now()
@@ -281,6 +284,23 @@ export class TmuxClaudeManager {
     const name = sessionNameFor(workdir)
     this.knownAlive.delete(workdir)
     this.sessionIds.delete(workdir)
+    this.lastUsedAt.delete(workdir)
     await runTmux(['kill-session', '-t', name])
+  }
+
+  /**
+   * Kill tmux sessions idle for at least `idleMs`. Unlike the socket-worker
+   * mode (whose Claude Code process exits and takes the worker down with
+   * it), a tmux session just sits there forever with nothing to notice it's
+   * unused — callers should run this on an interval.
+   */
+  async killIdleSessions(idleMs: number): Promise<void> {
+    const now = Date.now()
+    for (const [workdir, lastUsed] of this.lastUsedAt) {
+      if (now - lastUsed >= idleMs) {
+        this.dbg(`tmux: ${workdir} idle for ${Math.round((now - lastUsed) / 1000)}s, killing session`)
+        await this.killSession(workdir)
+      }
+    }
   }
 }
