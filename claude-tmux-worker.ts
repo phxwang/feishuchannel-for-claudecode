@@ -140,10 +140,13 @@ export type DialogHandler = (dialog: Dialog) => Promise<number>
 export const DIALOG_ESCAPE_CHOICE = 0
 /** Called (at most once per stuck episode) with the raw ANSI pane text when the session is blocked on something that isn't a parseable dialog — e.g. a `/status`-style panel. Purely informational: the caller decides what to do with it (render+send a screenshot, etc.); this code takes no further action afterward. */
 export type StuckPaneHandler = (paneAnsiText: string) => Promise<void>
+/** Called with the raw ANSI pane text right after a `kind: 'tabs'` choice's Right-key presses land — since the chosen tab can't be confirmed from plain-text parsing (see parseTabBar's "assumed leftmost tab" caveat), the caller is expected to render and send a screenshot so the user can see which tab was actually reached. Purely informational, like StuckPaneHandler; the next dialog card (offering the same tab choices again) is sent automatically afterward once the still-visible tab bar is re-detected on the next poll. */
+export type TabSwitchedHandler = (paneAnsiText: string) => Promise<void>
 export interface SendAndAwaitReplyOptions {
   model?: string
   onDialog?: DialogHandler
   onStuckPane?: StuckPaneHandler
+  onTabSwitched?: TabSwitchedHandler
 }
 
 const OPTION_LINE_RE = /^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$/
@@ -478,7 +481,7 @@ export class TmuxClaudeManager {
   }
 
   private async doSendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions): Promise<string> {
-    const { model, onDialog, onStuckPane } = opts
+    const { model, onDialog, onStuckPane, onTabSwitched } = opts
     this.lastUsedAt.set(workdir, Date.now())
     const name = await this.ensureSession(workdir, model)
     const sessionId = this.sessionIds.get(workdir)
@@ -501,7 +504,7 @@ export class TmuxClaudeManager {
     // unexpected failure while waiting for the reply is swallowed and
     // whatever text was collected so far (possibly none) is returned instead.
     try {
-      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane)
+      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane, onTabSwitched)
     } catch (e) {
       this.dbg(`tmux: error while waiting for ${workdir}'s reply (message was already delivered, not retryable): ${e}`)
       return ''
@@ -511,7 +514,7 @@ export class TmuxClaudeManager {
   private async collectReply(
     workdir: string, sessionId: string | undefined, beforeSendMs: number,
     transcriptBefore: string | null, startOffset: number, signalPath: string | null, baselineStopMs: number,
-    onDialog?: DialogHandler, onStuckPane?: StuckPaneHandler,
+    onDialog?: DialogHandler, onStuckPane?: StuckPaneHandler, onTabSwitched?: TabSwitchedHandler,
   ): Promise<string> {
     let deadline = beforeSendMs + this.replyTimeoutMs
     let lastChangeMs = Date.now()
@@ -590,42 +593,60 @@ export class TmuxClaudeManager {
         const plainPane = stripAnsi(rawPane)
         const dialog = onDialog ? (parseDialogOptions(plainPane) ?? parseTabBar(plainPane)) : null
         if (dialog && onDialog) {
-          this.dbg(`tmux: ${workdir} is showing a dialog ("${dialog.question}"), asking caller for a choice`)
-          // Keep this workdir looking "in use" for the whole wait — it's
-          // paced by a human clicking a Feishu card, not by anything this
-          // loop controls, so killIdleSessions must not reap the session
-          // out from under an answer that's about to arrive.
-          this.lastUsedAt.set(workdir, Date.now())
-          const chosenNumber = await onDialog(dialog)
-          this.lastUsedAt.set(workdir, Date.now())
-          if (chosenNumber === DIALOG_ESCAPE_CHOICE) {
-            if (await this.hasSession(name)) await runTmux(['send-keys', '-t', name, 'Escape'])
-            deadline = Date.now() + this.replyTimeoutMs
-            lastChangeMs = Date.now()
-            continue
-          }
-          const option = dialog.options.find(o => Number(o.number) === chosenNumber)
-          if (!option) {
-            // No match — either the caller explicitly cancelled (e.g. /restart
-            // or /esc invalidating a stale dialog, see router.ts) or something
-            // genuinely unexpected happened. Either way, guessing an option
-            // (the previous behavior defaulted to options[0], effectively
-            // auto-picking "Yes" on an unanswered permission prompt) is worse
-            // than just giving up on this reply.
-            this.dbg(`tmux: dialog choice for ${workdir} didn't resolve to a real option (cancelled or invalid) — not sending a keystroke`)
-            break
-          }
-          if (!(await this.hasSession(name))) {
-            // The session this dialog belonged to is gone (e.g. restarted
-            // while the card was still pending) — sending the chosen digit
-            // now would hit a different, unrelated session under the same
-            // name. router.ts is expected to have already cancelled this
-            // dialog in that case, but check directly too rather than rely
-            // solely on that.
-            this.dbg(`tmux: ${workdir}'s session is gone by the time a dialog choice came back — not sending a keystroke`)
-            break
-          }
-          if (dialog.kind === 'tabs') {
+          // For a `kind: 'tabs'` choice, re-offer the SAME card after each
+          // switch instead of returning to the generic poll loop and hoping
+          // it re-detects the still-visible tab bar on its own: found live
+          // that re-detection is not reliable (a freshly-focused tab's exact
+          // pane text doesn't always still match parseTabBar's shape), which
+          // left the user with a screenshot but no way to switch again
+          // without sending a brand new message. Looping here guarantees the
+          // next card goes out regardless of what the pane now looks like.
+          // Only a real option number keeps this loop going (a numbered
+          // dialog's single selectDialogOption call, an Escape, or "no
+          // matching option" all exit after one iteration).
+          let currentDialog = dialog
+          while (true) {
+            this.dbg(`tmux: ${workdir} is showing a dialog ("${currentDialog.question}"), asking caller for a choice`)
+            // Keep this workdir looking "in use" for the whole wait — it's
+            // paced by a human clicking a Feishu card, not by anything this
+            // loop controls, so killIdleSessions must not reap the session
+            // out from under an answer that's about to arrive.
+            this.lastUsedAt.set(workdir, Date.now())
+            const chosenNumber = await onDialog(currentDialog)
+            this.lastUsedAt.set(workdir, Date.now())
+            if (chosenNumber === DIALOG_ESCAPE_CHOICE) {
+              if (await this.hasSession(name)) await runTmux(['send-keys', '-t', name, 'Escape'])
+              break
+            }
+            const option = currentDialog.options.find(o => Number(o.number) === chosenNumber)
+            if (!option) {
+              // No match — either the caller explicitly cancelled (e.g. /restart
+              // or /esc invalidating a stale dialog, see router.ts) or something
+              // genuinely unexpected happened. Either way, guessing an option
+              // (the previous behavior defaulted to options[0], effectively
+              // auto-picking "Yes" on an unanswered permission prompt) is worse
+              // than just giving up on this reply.
+              this.dbg(`tmux: dialog choice for ${workdir} didn't resolve to a real option (cancelled or invalid) — not sending a keystroke`)
+              // Ends the whole wait immediately, same as the outer poll loop
+              // timing out — not just this inner loop, which would otherwise
+              // fall through to the deadline reset below and keep polling a
+              // session that has nothing more to say.
+              return collected.join('\n\n')
+            }
+            if (!(await this.hasSession(name))) {
+              // The session this dialog belonged to is gone (e.g. restarted
+              // while the card was still pending) — sending the chosen digit
+              // now would hit a different, unrelated session under the same
+              // name. router.ts is expected to have already cancelled this
+              // dialog in that case, but check directly too rather than rely
+              // solely on that.
+              this.dbg(`tmux: ${workdir}'s session is gone by the time a dialog choice came back — not sending a keystroke`)
+              return collected.join('\n\n')
+            }
+            if (currentDialog.kind !== 'tabs') {
+              await this.selectDialogOption(name, option)
+              break
+            }
             // No numbered jump target exists — approximate by assuming we
             // started on the leftmost tab (see parseTabBar) and pressing
             // Right (option.number - 1) times to reach the chosen one.
@@ -634,17 +655,28 @@ export class TmuxClaudeManager {
             // concurrent /restart to kill this session (or respawn a new,
             // unrelated one under the same name) partway through otherwise.
             const rightPresses = Number(option.number) - 1
+            let sessionGone = false
             for (let i = 0; i < rightPresses; i++) {
               if (!(await this.hasSession(name))) {
                 this.dbg(`tmux: ${workdir}'s session disappeared mid tab-navigation — stopping`)
+                sessionGone = true
                 break
               }
               await runTmux(['send-keys', '-t', name, 'Right'])
             }
-          } else {
-            await this.selectDialogOption(name, option)
+            if (sessionGone) break
+            if (onTabSwitched) {
+              // Give the pane a moment to redraw the newly-focused tab before
+              // capturing it — the Right keypresses above are fire-and-forget.
+              await new Promise(r => setTimeout(r, 300))
+              const rawPane = await this.capturePane(name)
+              try { await onTabSwitched(rawPane) } catch (e) { this.dbg(`tmux: onTabSwitched callback for ${workdir} threw: ${e}`) }
+            }
+            // Loop back around and offer the same tab choices again — the
+            // caller (router.ts) sends a fresh card and waits for another
+            // click, same as the first time.
           }
-          // The user's click can take any amount of time — don't let that
+          // The user's click(s) can take any amount of time — don't let that
           // count against the reply deadline, and give the chosen action a
           // fresh window to actually run and produce output.
           deadline = Date.now() + this.replyTimeoutMs

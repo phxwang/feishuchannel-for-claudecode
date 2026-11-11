@@ -586,18 +586,35 @@ function makeTmuxDialogHandler(workdir: string, chatId: string, messageId: strin
  * machine (see renderPaneScreenshot) — this is a nice-to-have, not core
  * functionality worth erroring the whole task over.
  */
-function makeStuckPaneHandler(chatId: string) {
-  return async (paneAnsiText: string): Promise<void> => {
-    const png = await renderPaneScreenshot(paneAnsiText)
-    if (!png) { dbg(`claude-tmux: stuck-pane screenshot unavailable (no cached Chromium build)`); return }
-    const pngPath = join(tmpdir(), `claude-tmux-pane-${Date.now()}-${Math.random().toString(36).slice(2)}.png`)
-    try {
-      writeFileSync(pngPath, png)
-      await sendFeishuFile(apiClient, chatId, pngPath, 'claude-session.png')
-    } finally {
-      try { unlinkSync(pngPath) } catch (e) { dbg(`claude-tmux: failed to clean up pane screenshot ${pngPath}: ${e}`) }
-    }
+/** Shared by onStuckPane and onTabSwitched — both just need "render this pane capture and send it as an image", differing only in when claude-tmux-worker.ts decides to call them. */
+async function sendPaneScreenshot(chatId: string, paneAnsiText: string, dbgTag: string): Promise<void> {
+  const png = await renderPaneScreenshot(paneAnsiText)
+  if (!png) { dbg(`${dbgTag}: screenshot unavailable (no cached Chromium build)`); return }
+  const pngPath = join(tmpdir(), `claude-tmux-pane-${Date.now()}-${Math.random().toString(36).slice(2)}.png`)
+  try {
+    writeFileSync(pngPath, png)
+    await sendFeishuFile(apiClient, chatId, pngPath, 'claude-session.png')
+  } finally {
+    try { unlinkSync(pngPath) } catch (e) { dbg(`${dbgTag}: failed to clean up pane screenshot ${pngPath}: ${e}`) }
   }
+}
+
+function makeStuckPaneHandler(chatId: string) {
+  return (paneAnsiText: string) => sendPaneScreenshot(chatId, paneAnsiText, 'claude-tmux: stuck-pane')
+}
+
+/**
+ * Builds the onTabSwitched callback: after claude-tmux-worker.ts presses
+ * Right the approximated number of times for a tab choice, sends a
+ * screenshot of wherever that actually landed — since parseTabBar can't
+ * confirm which tab is now focused from plain text alone (see its "assumed
+ * leftmost tab" caveat), this is the only way for the user to see whether
+ * the switch landed where they expected. A fresh choice card for the same
+ * tabs follows automatically once the still-visible tab bar is re-detected
+ * on claude-tmux-worker.ts's next poll — no action needed here for that.
+ */
+function makeTabSwitchedHandler(chatId: string) {
+  return (paneAnsiText: string) => sendPaneScreenshot(chatId, paneAnsiText, 'claude-tmux: tab-switched')
 }
 
 /**
@@ -679,6 +696,7 @@ async function handleClaudeTmuxTask(
       model,
       onDialog: makeTmuxDialogHandler(workdir, chatId, messageId),
       onStuckPane: makeStuckPaneHandler(chatId),
+      onTabSwitched: makeTabSwitchedHandler(chatId),
     })
     if (reply) {
       for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
