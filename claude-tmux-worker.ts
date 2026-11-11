@@ -391,6 +391,52 @@ export class TmuxClaudeManager {
     return r.ok ? r.stdout : ''
   }
 
+  /**
+   * Captures the pane repeatedly until two consecutive captures come back
+   * identical (the redraw has settled), instead of a single fixed delay —
+   * found live that a fixed 300ms wasn't enough for a tab whose content
+   * loads asynchronously (e.g. /status's Usage tab briefly shows "Loading
+   * your Claude Code stats…"), so the tab-switch screenshot captured that
+   * loading placeholder instead of the real content.
+   *
+   * `baseline`, when given, must also change before a match counts — without
+   * it, if the redraw hasn't even started by the first poll (tmux hasn't
+   * processed the keypress yet), two early identical captures of the
+   * *pre-switch* content would look "stable" and get accepted instantly,
+   * returning a stale screenshot instead of waiting for the real one. Pass
+   * `undefined` when no visible change is actually expected (e.g. re-picking
+   * the tab already showing) so this doesn't wait out the full maxWaitMs for
+   * nothing.
+   *
+   * Gives up and returns whatever the last capture was after maxWaitMs,
+   * rather than waiting forever for a tab that never finishes loading.
+   *
+   * Requires `requiredStableReads` consecutive matches, not just one pair —
+   * a single coincidental match (e.g. two frames of an async loading
+   * animation that happen to render identically) would otherwise risk
+   * accepting a still-in-flight redraw as settled, the same class of bug
+   * this whole function exists to avoid.
+   */
+  private async captureStablePane(
+    name: string, baseline?: string, pollMs = 250, maxWaitMs = 4_000, requiredStableReads = 2,
+  ): Promise<string> {
+    const deadline = Date.now() + maxWaitMs
+    let previous = await this.capturePane(name)
+    let stableStreak = 0
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, pollMs))
+      const current = await this.capturePane(name)
+      if (current === previous && (baseline === undefined || current !== baseline)) {
+        stableStreak++
+        if (stableStreak >= requiredStableReads) return current
+      } else {
+        stableStreak = 0
+      }
+      previous = current
+    }
+    return previous
+  }
+
   /** Send a bare Escape keypress — dismisses whatever modal/dialog is currently showing (a `/status`-style panel, a stuck confirmation, etc.), same as a person pressing Esc at the terminal. No-op if there's no live session. */
   async sendEscape(workdir: string): Promise<void> {
     const name = sessionNameFor(workdir)
@@ -682,6 +728,13 @@ export class TmuxClaudeManager {
             // second switch is relative to the real last click instead of
             // re-assuming leftmost every time.
             const rightPresses = rightPressesToReach(currentDialog.currentNumber ?? '1', option.number, currentDialog.options.length)
+            // Captured before sending any keys, so captureStablePane can
+            // tell "redraw hasn't started yet" (still equals this) apart
+            // from "redraw has finished" (stable AND different) — only
+            // meaningful when we're actually about to move (rightPresses >
+            // 0); re-picking the already-current tab is a legitimate no-op
+            // that should resolve as soon as the capture is merely stable.
+            const beforeSwitch = onTabSwitched && rightPresses > 0 ? await this.capturePane(name) : undefined
             let sessionGone = false
             for (let i = 0; i < rightPresses; i++) {
               if (!(await this.hasSession(name))) {
@@ -693,10 +746,7 @@ export class TmuxClaudeManager {
             }
             if (sessionGone) break
             if (onTabSwitched) {
-              // Give the pane a moment to redraw the newly-focused tab before
-              // capturing it — the Right keypresses above are fire-and-forget.
-              await new Promise(r => setTimeout(r, 300))
-              const rawPane = await this.capturePane(name)
+              const rawPane = await this.captureStablePane(name, beforeSwitch)
               try { await onTabSwitched(rawPane) } catch (e) { this.dbg(`tmux: onTabSwitched callback for ${workdir} threw: ${e}`) }
             }
             // Loop back around and offer the same tab choices again — the
