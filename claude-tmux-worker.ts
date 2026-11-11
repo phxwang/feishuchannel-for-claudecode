@@ -17,13 +17,19 @@
  * answered as a normal next turn, with no "untrusted external data" framing
  * — confirming the premise this whole mode exists for.
  *
+ * Turn completion is primarily a Stop hook: each spawned session is passed
+ * `--settings` with a one-off Stop hook that touches a signal file keyed by
+ * that session's --session-id (layered on top of, not replacing, the
+ * project's own settings — manually verified this fires reliably). The
+ * quiet-period heuristic on the JSONL transcript is kept only as a fallback
+ * for the case the hook doesn't fire (e.g. a tmux session that outlived a
+ * router restart, so we no longer know its session id to watch for).
+ *
  * Honest scope for this first cut:
- *   - Attachments are not forwarded in tmux mode (no MCP channel plugin is
- *     loaded, so there's no download_attachment tool for the CLI to use).
- *   - Turn completion is detected heuristically (quiet period on the JSONL
- *     transcript), not via a Stop hook signal — the hook-based design is
- *     documented but not wired up yet, see docs/multi-agent-router-design.md
- *     follow-up list (to be added alongside this).
+ *   - Attachments: router.ts downloads them itself (feishu-download.ts) and
+ *     embeds the local path in the message text, since there's no MCP
+ *     channel plugin loaded here for the CLI to call download_attachment
+ *     with — see handleClaudeTmuxTask in router.ts.
  *   - Permission dialogs that pop up inside the tmux session (not via the
  *     MCP channel's send_confirm_card path) are NOT handled — the CLI will
  *     sit there waiting for a keypress this code never sends. Only tool
@@ -36,12 +42,13 @@
  *     findLatestTranscript(), which can pick up an unrelated session's
  *     transcript if more than one `claude` process targets the same workdir.
  */
-import { existsSync, readFileSync, readdirSync, statSync } from 'fs'
-import { homedir } from 'os'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { createHash, randomUUID } from 'crypto'
 
 const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects')
+const STOP_SIGNAL_DIR = join(tmpdir(), 'feishu-claude-tmux-stop')
 
 /** Deterministic tmux session name for a workdir — stable across router restarts. */
 export function sessionNameFor(workdir: string): string {
@@ -107,6 +114,26 @@ function transcriptPathForSession(workdir: string, sessionId: string): string {
   return join(CLAUDE_PROJECTS_DIR, escapeWorkdirForTranscriptDir(workdir), `${sessionId}.jsonl`)
 }
 
+/** Where the per-session Stop hook (see buildSettingsOverride) touches a file when a turn ends. */
+export function stopSignalPathFor(sessionId: string): string {
+  return join(STOP_SIGNAL_DIR, `${sessionId}.stop`)
+}
+
+/**
+ * `--settings` JSON passed when spawning a session: a Stop hook that touches
+ * `stopSignalPathFor(sessionId)`. Layers on top of (doesn't replace) the
+ * project's own settings.json — Claude Code merges hooks across scopes
+ * rather than letting one scope's hooks shadow another's.
+ */
+export function buildSettingsOverride(sessionId: string): string {
+  const signalPath = stopSignalPathFor(sessionId)
+  return JSON.stringify({
+    hooks: {
+      Stop: [{ matcher: '', hooks: [{ type: 'command', command: `touch '${signalPath}'` }] }],
+    },
+  })
+}
+
 /**
  * Fallback only: used when we don't know the live session's id (e.g. a tmux
  * session that outlived a router restart, so our in-memory sessionIds map
@@ -140,6 +167,10 @@ export interface TmuxClaudeManagerOptions {
   quietMs?: number
   /** Hard cap on waiting for a reply, regardless of quiet period. */
   replyTimeoutMs?: number
+  /** After the Stop hook fires, how long to keep confirming the transcript has gone quiet before trusting it's really done. */
+  postStopQuietMs?: number
+  /** Hard cap on the post-Stop confirmation window. */
+  postStopMaxMs?: number
 }
 
 export class TmuxClaudeManager {
@@ -149,6 +180,8 @@ export class TmuxClaudeManager {
   private readonly startupTimeoutMs: number
   private readonly quietMs: number
   private readonly replyTimeoutMs: number
+  private readonly postStopQuietMs: number
+  private readonly postStopMaxMs: number
   /** Workdirs we've confirmed a live tmux session for, to skip a has-session round-trip on every message. */
   private knownAlive = new Set<string>()
   /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost on router restart. */
@@ -165,6 +198,8 @@ export class TmuxClaudeManager {
     this.startupTimeoutMs = opts.startupTimeoutMs ?? 20_000
     this.quietMs = opts.quietMs ?? 2_500
     this.replyTimeoutMs = opts.replyTimeoutMs ?? 10 * 60 * 1000
+    this.postStopQuietMs = opts.postStopQuietMs ?? 800
+    this.postStopMaxMs = opts.postStopMaxMs ?? 8_000
   }
 
   private async hasSession(name: string): Promise<boolean> {
@@ -183,29 +218,38 @@ export class TmuxClaudeManager {
     }
 
     this.dbg(`tmux: no live session for ${workdir}, spawning ${name}`)
+    mkdirSync(STOP_SIGNAL_DIR, { recursive: true })
     const spawnStartMs = Date.now()
     const sessionId = randomUUID()
     const spawn = await runTmux([
       'new-session', '-d', '-s', name, '-c', workdir, '-x', String(this.cols), '-y', String(this.rows),
-      'claude', '--session-id', sessionId,
+      'claude', '--session-id', sessionId, '--settings', buildSettingsOverride(sessionId),
     ])
     if (!spawn.ok) throw new Error(`tmux new-session failed: ${spawn.stderr || spawn.stdout}`)
     this.sessionIds.set(workdir, sessionId)
 
-    await this.waitForStartup(workdir, sessionId, spawnStartMs)
+    await this.waitForStartup(name, spawnStartMs)
     this.knownAlive.add(workdir)
     return name
   }
 
-  /** Best-effort wait for the CLI to finish booting (its transcript file shows up) before we type into it. */
-  private async waitForStartup(workdir: string, sessionId: string, spawnStartMs: number): Promise<void> {
-    const path = transcriptPathForSession(workdir, sessionId)
+  /**
+   * Wait for the CLI to finish booting before we type into it, by polling
+   * the pane for its input-box prompt character. NOT the transcript file:
+   * Claude Code doesn't create the session's .jsonl until the first message
+   * is actually sent, so waiting on it here would always burn the full
+   * timeout on every fresh session (found by testing this against a real
+   * CLI — the prompt shows up within ~500ms, well before any transcript
+   * file exists).
+   */
+  private async waitForStartup(name: string, spawnStartMs: number): Promise<void> {
     const deadline = spawnStartMs + this.startupTimeoutMs
     while (Date.now() < deadline) {
-      if (existsSync(path)) return
-      await new Promise(r => setTimeout(r, 300))
+      const r = await runTmux(['capture-pane', '-p', '-t', name])
+      if (r.ok && r.stdout.includes('❯')) return
+      await new Promise(res => setTimeout(res, 200))
     }
-    this.dbg(`tmux: startup wait timed out for ${workdir}, proceeding anyway`)
+    this.dbg(`tmux: startup wait timed out for session ${name}, proceeding anyway`)
   }
 
   /**
@@ -247,6 +291,11 @@ export class TmuxClaudeManager {
     const beforeSendMs = Date.now()
     const transcriptBefore = sessionId ? transcriptPathForSession(workdir, sessionId) : findLatestTranscript(workdir)
     const startOffset = transcriptBefore && existsSync(transcriptBefore) ? statSync(transcriptBefore).size : 0
+    // Primary completion signal (see buildSettingsOverride); falls back to the
+    // quiet-period heuristic below when we don't have a sessionId to watch
+    // (e.g. this tmux session outlived a router restart).
+    const signalPath = sessionId ? stopSignalPathFor(sessionId) : null
+    const baselineStopMs = signalPath && existsSync(signalPath) ? statSync(signalPath).mtimeMs : 0
 
     await this.sendKeys(name, text)
 
@@ -256,23 +305,43 @@ export class TmuxClaudeManager {
     let transcriptPath = transcriptBefore
     const collected: string[] = []
 
+    // Read as a Buffer and slice by byte offset, not by string index: lastSize/size
+    // come from statSync().size (bytes), but a JS string index counts UTF-16 code
+    // units — any multi-byte character before the offset (e.g. CJK text, which this
+    // very code sends when attachments are present) would desync the two and cut
+    // the new slice mid-character. Returns true if anything new was read.
+    const readGrowth = (): boolean => {
+      if (!transcriptPath) transcriptPath = sessionId ? transcriptPathForSession(workdir, sessionId) : findLatestTranscript(workdir, beforeSendMs)
+      if (!transcriptPath || !existsSync(transcriptPath)) return false
+      const buf = readFileSync(transcriptPath)
+      if (buf.length <= lastSize) return false
+      const newText = buf.subarray(lastSize).toString('utf8')
+      collected.push(...parseAssistantTextLines(newText.split('\n')))
+      lastSize = buf.length
+      lastChangeMs = Date.now()
+      return true
+    }
+
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 400))
-      if (!transcriptPath) transcriptPath = sessionId ? transcriptPathForSession(workdir, sessionId) : findLatestTranscript(workdir, beforeSendMs)
-      if (!transcriptPath || !existsSync(transcriptPath)) continue
-
-      // Read as a Buffer and slice by byte offset, not by string index: lastSize/size
-      // come from statSync().size (bytes), but a JS string index counts UTF-16 code
-      // units — any multi-byte character before the offset (e.g. CJK text, which this
-      // very code sends when attachments are present) would desync the two and cut
-      // the new slice mid-character.
-      const buf = readFileSync(transcriptPath)
-      if (buf.length > lastSize) {
-        const newText = buf.subarray(lastSize).toString('utf8')
-        collected.push(...parseAssistantTextLines(newText.split('\n')))
-        lastSize = buf.length
-        lastChangeMs = Date.now()
-        continue
+      if (readGrowth()) continue
+      const stopFired = !!signalPath && existsSync(signalPath) && statSync(signalPath).mtimeMs > baselineStopMs
+      if (stopFired) {
+        // The Stop hook can fire before the final transcript line(s) are
+        // flushed to disk — found by testing: with only a fixed grace delay
+        // here, the last assistant message sometimes showed up as "new
+        // growth" on the *next* call instead of this one, especially when
+        // other Stop hooks in the same chain are still running. So instead
+        // of trusting one delayed read, keep reading until growth itself
+        // goes quiet for a (short) beat, capped at POST_STOP_MAX_MS.
+        const postStopDeadline = Date.now() + this.postStopMaxMs
+        let lastGrowthMs = Date.now()
+        while (Date.now() < postStopDeadline) {
+          await new Promise(r => setTimeout(r, 300))
+          if (readGrowth()) { lastGrowthMs = Date.now(); continue }
+          if (isQuietDone(lastGrowthMs, Date.now(), this.postStopQuietMs)) break
+        }
+        break
       }
       if (collected.length > 0 && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) break
     }

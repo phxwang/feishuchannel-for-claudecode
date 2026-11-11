@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { escapeWorkdirForTranscriptDir, isQuietDone, parseAssistantTextLines, sessionNameFor } from './claude-tmux-worker'
+import {
+  buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone,
+  parseAssistantTextLines, sessionNameFor, stopSignalPathFor,
+} from './claude-tmux-worker'
 
 describe('sessionNameFor', () => {
   test('is deterministic for the same workdir', () => {
@@ -65,6 +68,22 @@ describe('parseAssistantTextLines', () => {
       JSON.stringify({ type: 'assistant', message: { content: 'second' } }),
     ]
     expect(parseAssistantTextLines(lines)).toEqual(['first', 'second'])
+  })
+})
+
+describe('stopSignalPathFor', () => {
+  test('is deterministic and keyed by session id', () => {
+    expect(stopSignalPathFor('abc')).toBe(stopSignalPathFor('abc'))
+    expect(stopSignalPathFor('abc')).not.toBe(stopSignalPathFor('def'))
+  })
+})
+
+describe('buildSettingsOverride', () => {
+  test('produces valid JSON with a Stop hook touching the session\'s signal path', () => {
+    const parsed = JSON.parse(buildSettingsOverride('session-123'))
+    const command: string = parsed.hooks.Stop[0].hooks[0].command
+    expect(command).toContain(stopSignalPathFor('session-123'))
+    expect(parsed.hooks.Stop[0].hooks[0].type).toBe('command')
   })
 })
 

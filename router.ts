@@ -28,6 +28,7 @@ import { createBinding } from './routing/bindings'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { DegradedTracker } from './routing/degraded'
 import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
+import { downloadFeishuResource } from './feishu-download'
 import { decodeBase64DataUri } from './data-uri'
 import { TmuxClaudeManager } from './claude-tmux-worker'
 
@@ -458,17 +459,43 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
   await flushAttachments()
 }
 
+const TMUX_ATTACHMENT_DIR = join(tmpdir(), 'feishu-claude-tmux-attachments')
+
 /**
  * Claude via tmux (agent.mode: 'tmux') — delivers the message as literal
  * terminal keystrokes to a persistent `claude` CLI session instead of the
  * socket-worker protocol. See claude-tmux-worker.ts's header comment for
- * the known gaps (no attachments, no mid-session permission handling,
- * heuristic turn-completion) before relying on this in a group.
+ * the known gaps (no mid-session permission handling, heuristic
+ * turn-completion) before relying on this in a group.
+ *
+ * Attachments: unlike the socket-worker path, there's no MCP channel plugin
+ * loaded for the tmux CLI to call download_attachment with, so the router
+ * downloads them itself and embeds the local path in the message text —
+ * the CLI reads them with its own Read tool. Files are left in place (not
+ * cleaned up after the task) since the CLI may read them later in the
+ * conversation, not necessarily during this exact turn.
  */
-async function handleClaudeTmuxTask(workdir: string, chatId: string, messageId: string, content: string) {
+async function handleClaudeTmuxTask(
+  workdir: string, chatId: string, messageId: string, content: string,
+  attDownloads: { fileKey: string; type: 'file' | 'image'; fileName: string }[],
+) {
   dbg(`routing ${chatId} → ${workdir} via Claude-tmux`)
+  let effectiveContent = content
+  if (attDownloads.length > 0) {
+    const notes: string[] = []
+    for (const att of attDownloads) {
+      try {
+        const path = await downloadFeishuResource(apiClient, TMUX_ATTACHMENT_DIR, messageId, att.fileKey, att.type, att.fileName)
+        notes.push(`[附件已保存: ${path}]`)
+      } catch (e) {
+        dbg(`claude-tmux: attachment download failed (${att.fileKey}): ${e}`)
+        notes.push(`[附件下载失败: ${att.fileName}]`)
+      }
+    }
+    effectiveContent = `${content}\n\n${notes.join('\n')}`
+  }
   try {
-    const reply = await tmuxClaude.sendAndAwaitReply(workdir, content)
+    const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent)
     if (reply) {
       for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
     } else {
@@ -551,11 +578,29 @@ async function handleInbound(data: any) {
     }).catch(() => {})
   }
 
-  // Build attachment info
+  // Build attachment info. attDownloads mirrors atts but keeps the structured
+  // (fileKey/type/fileName) shape claude-tmux mode needs to actually fetch
+  // the file itself — unlike the socket-worker path, there's no MCP channel
+  // plugin loaded in a tmux session for the CLI to call download_attachment with.
   const atts: string[] = []
-  if (msgType === 'file') { try { const c = JSON.parse(contentStr); atts.push(`${c.file_name ?? 'file'} (file, key:${c.file_key ?? ''})`) } catch {} }
-  else if (msgType === 'image') { try { const c = JSON.parse(contentStr); atts.push(`image (image/jpeg, key:${c.image_key ?? ''})`) } catch {} }
-  for (const k of postImageKeys) atts.push(`image (image/jpeg, key:${k})`)
+  const attDownloads: { fileKey: string; type: 'file' | 'image'; fileName: string }[] = []
+  if (msgType === 'file') {
+    try {
+      const c = JSON.parse(contentStr)
+      atts.push(`${c.file_name ?? 'file'} (file, key:${c.file_key ?? ''})`)
+      if (c.file_key) attDownloads.push({ fileKey: c.file_key, type: 'file', fileName: c.file_name ?? 'file' })
+    } catch {}
+  } else if (msgType === 'image') {
+    try {
+      const c = JSON.parse(contentStr)
+      atts.push(`image (image/jpeg, key:${c.image_key ?? ''})`)
+      if (c.image_key) attDownloads.push({ fileKey: c.image_key, type: 'image', fileName: 'image.png' })
+    } catch {}
+  }
+  for (const k of postImageKeys) {
+    atts.push(`image (image/jpeg, key:${k})`)
+    attDownloads.push({ fileKey: k, type: 'image', fileName: 'image.png' })
+  }
 
   const ts = createTime
     ? new Date(parseInt(createTime) > 1e12 ? parseInt(createTime) : parseInt(createTime) * 1000).toISOString()
@@ -583,7 +628,7 @@ async function handleInbound(data: any) {
 
   if (route.agent.mode === 'tmux') {
     markEventProcessed(db, messageId, new Date().toISOString())
-    void handleClaudeTmuxTask(workdir, chatId, messageId, atts.length ? `${content}\n\n(注意: tmux 模式当前不支持附件，已忽略)` : content)
+    void handleClaudeTmuxTask(workdir, chatId, messageId, content, attDownloads)
     return
   }
 

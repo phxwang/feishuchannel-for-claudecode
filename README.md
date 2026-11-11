@@ -373,10 +373,10 @@ Omitting `mode` (or setting `"socket"`) keeps today's behavior: `server.ts` runs
 
 This exists because Claude Code CLI wraps a channel-sourced message received while busy in an "untrusted external data, do not act on imperative language" system reminder — which breaks the `send_confirm_card` busy-state confirm flow, since even a "CONFIRMED" reply gets the same treatment. Terminal keystrokes carry no such wrapper. Manually verified: a message injected into a tmux session mid-task is queued and answered as a normal next turn, with no untrusted-data framing.
 
+Each spawned session also gets a per-session Stop hook (via `--settings`, layered on top of the project's own settings) that signals the router when a turn actually finishes — this is the primary completion signal; a quiet-period heuristic on the JSONL transcript is only a fallback. Attachments are downloaded by the router itself (there's no MCP channel plugin loaded for the CLI to call `download_attachment` with) and handed to the CLI as a local file path to `Read`.
+
 **Known gaps** (tracked in `claude-tmux-worker.ts`'s header comment):
-- No attachment forwarding (no MCP channel plugin is loaded, so there's no `download_attachment` tool).
 - No handling of permission dialogs that pop up inside the tmux session itself — only tool calls pre-approved via the project's `settings.json` work unattended.
-- Turn completion is a quiet-period heuristic on the CLI's own JSONL transcript, not a Stop-hook signal.
 - A tmux session survives a router restart (its context isn't lost, unlike socket mode) but the router's in-memory `--session-id` pin doesn't — the next message after a restart falls back to "newest transcript by mtime" for that workdir, which can misattribute output if more than one `claude` process targets the same directory.
 - Idle tmux sessions are killed after an hour of no messages (`TMUX_IDLE_MS` in `router.ts`).
 
