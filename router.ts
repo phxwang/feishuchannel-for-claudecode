@@ -493,6 +493,7 @@ function pruneOldTmuxAttachments() {
 async function handleClaudeTmuxTask(
   workdir: string, chatId: string, messageId: string, content: string,
   attDownloads: { fileKey: string; type: 'file' | 'image'; fileName: string }[],
+  model: string | undefined,
 ) {
   dbg(`routing ${chatId} → ${workdir} via Claude-tmux`)
   let effectiveContent = content
@@ -510,7 +511,7 @@ async function handleClaudeTmuxTask(
     effectiveContent = `${content}\n\n${notes.join('\n')}`
   }
   try {
-    const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent)
+    const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, model)
     if (reply) {
       for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
     } else {
@@ -643,7 +644,7 @@ async function handleInbound(data: any) {
 
   if (route.agent.mode === 'tmux') {
     markEventProcessed(db, messageId, new Date().toISOString())
-    void handleClaudeTmuxTask(workdir, chatId, messageId, content, attDownloads)
+    void handleClaudeTmuxTask(workdir, chatId, messageId, content, attDownloads, route.agent.model)
     return
   }
 

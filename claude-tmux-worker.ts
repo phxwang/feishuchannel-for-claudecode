@@ -207,8 +207,14 @@ export class TmuxClaudeManager {
     return r.ok
   }
 
-  /** Ensure a tmux session running `claude` exists for this workdir; spawns one if missing. Returns the session name. */
-  async ensureSession(workdir: string): Promise<string> {
+  /**
+   * Ensure a tmux session running `claude` exists for this workdir; spawns
+   * one if missing. Returns the session name. `model` (e.g. "fable", "opus",
+   * "sonnet", or a full model name) is only used on a fresh spawn — it has
+   * no effect on an already-running session, and an empty/undefined value
+   * just lets the CLI use its own default.
+   */
+  async ensureSession(workdir: string, model?: string): Promise<string> {
     const name = sessionNameFor(workdir)
     if (this.knownAlive.has(workdir) && await this.hasSession(name)) return name
 
@@ -217,13 +223,14 @@ export class TmuxClaudeManager {
       return name
     }
 
-    this.dbg(`tmux: no live session for ${workdir}, spawning ${name}`)
+    this.dbg(`tmux: no live session for ${workdir}, spawning ${name}${model ? ` (model: ${model})` : ''}`)
     mkdirSync(STOP_SIGNAL_DIR, { recursive: true })
     const spawnStartMs = Date.now()
     const sessionId = randomUUID()
     const spawn = await runTmux([
       'new-session', '-d', '-s', name, '-c', workdir, '-x', String(this.cols), '-y', String(this.rows),
       'claude', '--session-id', sessionId, '--settings', buildSettingsOverride(sessionId),
+      ...(model ? ['--model', model] : []),
     ])
     if (!spawn.ok) throw new Error(`tmux new-session failed: ${spawn.stderr || spawn.stdout}`)
     this.sessionIds.set(workdir, sessionId)
@@ -277,16 +284,16 @@ export class TmuxClaudeManager {
    * the transcript goes quiet for `quietMs` (or `replyTimeoutMs` elapses).
    * Calls for the same workdir are serialized — see `queues`.
    */
-  async sendAndAwaitReply(workdir: string, text: string): Promise<string> {
+  async sendAndAwaitReply(workdir: string, text: string, model?: string): Promise<string> {
     const previous = this.queues.get(workdir) ?? Promise.resolve()
-    const task = previous.catch(() => {}).then(() => this.doSendAndAwaitReply(workdir, text))
+    const task = previous.catch(() => {}).then(() => this.doSendAndAwaitReply(workdir, text, model))
     this.queues.set(workdir, task)
     return task
   }
 
-  private async doSendAndAwaitReply(workdir: string, text: string): Promise<string> {
+  private async doSendAndAwaitReply(workdir: string, text: string, model?: string): Promise<string> {
     this.lastUsedAt.set(workdir, Date.now())
-    const name = await this.ensureSession(workdir)
+    const name = await this.ensureSession(workdir, model)
     const sessionId = this.sessionIds.get(workdir)
     const beforeSendMs = Date.now()
     const transcriptBefore = sessionId ? transcriptPathForSession(workdir, sessionId) : findLatestTranscript(workdir)

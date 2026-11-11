@@ -17,6 +17,13 @@ export interface AgentPolicy {
    * primary is 'opencode'.
    */
   mode?: 'socket' | 'tmux'
+  /**
+   * Model to pass as `--model` when spawning a tmux-mode session (e.g.
+   * "fable", "opus", "sonnet", or a full model name). Empty/undefined uses
+   * the CLI's own default. Only read at spawn time — changing it has no
+   * effect on an already-running tmux session; ignored outside mode:'tmux'.
+   */
+  model?: string
 }
 
 export interface ProjectConfig {
