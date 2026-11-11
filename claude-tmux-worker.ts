@@ -310,14 +310,23 @@ export class TmuxClaudeManager {
     // units — any multi-byte character before the offset (e.g. CJK text, which this
     // very code sends when attachments are present) would desync the two and cut
     // the new slice mid-character. Returns true if anything new was read.
+    //
+    // Only consumes up to the last newline in the new bytes, not the whole
+    // chunk: a poll can land mid-write of the CLI's trailing JSONL line, and
+    // advancing lastSize past that partial line would permanently lose it —
+    // the next poll's "new bytes" would start after it instead of including
+    // its now-completed remainder.
     const readGrowth = (): boolean => {
       if (!transcriptPath) transcriptPath = sessionId ? transcriptPathForSession(workdir, sessionId) : findLatestTranscript(workdir, beforeSendMs)
       if (!transcriptPath || !existsSync(transcriptPath)) return false
       const buf = readFileSync(transcriptPath)
       if (buf.length <= lastSize) return false
-      const newText = buf.subarray(lastSize).toString('utf8')
-      collected.push(...parseAssistantTextLines(newText.split('\n')))
-      lastSize = buf.length
+      const newBytes = buf.subarray(lastSize)
+      const lastNewline = newBytes.lastIndexOf(0x0a)
+      if (lastNewline === -1) return false
+      const completeChunk = newBytes.subarray(0, lastNewline + 1)
+      collected.push(...parseAssistantTextLines(completeChunk.toString('utf8').split('\n')))
+      lastSize += completeChunk.length
       lastChangeMs = Date.now()
       return true
     }
@@ -343,7 +352,14 @@ export class TmuxClaudeManager {
         }
         break
       }
-      if (collected.length > 0 && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) break
+      // Quiet-period fallback is for when we have no Stop-hook signal to
+      // watch at all (signalPath === null, e.g. a tmux session that outlived
+      // a router restart) — not a general "give up early" escape hatch.
+      // Gating it behind signalPath matters: otherwise a turn with a short
+      // text preamble followed by a long-running tool call (quiet for more
+      // than quietMs before the tool produces output) would get cut off
+      // after just the preamble, well before the real Stop hook fires.
+      if (!signalPath && collected.length > 0 && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) break
     }
 
     return collected.join('\n\n')

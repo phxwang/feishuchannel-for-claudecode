@@ -12,7 +12,7 @@
 import * as lark from '@larksuiteoapi/node-sdk'
 import { createServer, type Socket } from 'net'
 import {
-  readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync,
+  readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync, readdirSync, statSync,
 } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
@@ -460,6 +460,21 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
 }
 
 const TMUX_ATTACHMENT_DIR = join(tmpdir(), 'feishu-claude-tmux-attachments')
+const TMUX_ATTACHMENT_RETENTION_MS = 24 * 3600 * 1000
+
+/** Downloaded attachments are kept (the CLI may Read one well after the task that received it finishes), so without this they'd accumulate here forever. */
+function pruneOldTmuxAttachments() {
+  if (!existsSync(TMUX_ATTACHMENT_DIR)) return
+  const cutoffMs = Date.now() - TMUX_ATTACHMENT_RETENTION_MS
+  let pruned = 0
+  for (const name of readdirSync(TMUX_ATTACHMENT_DIR)) {
+    const path = join(TMUX_ATTACHMENT_DIR, name)
+    try {
+      if (statSync(path).mtimeMs < cutoffMs) { unlinkSync(path); pruned++ }
+    } catch (e) { dbg(`claude-tmux: failed to prune attachment ${path}: ${e}`) }
+  }
+  if (pruned) dbg(`claude-tmux: pruned ${pruned} old attachment file(s)`)
+}
 
 /**
  * Claude via tmux (agent.mode: 'tmux') — delivers the message as literal
@@ -853,6 +868,7 @@ setInterval(() => {
 const TMUX_IDLE_MS = 60 * 60 * 1000
 const TMUX_IDLE_SWEEP_MS = 10 * 60 * 1000
 setInterval(() => { void tmuxClaude.killIdleSessions(TMUX_IDLE_MS) }, TMUX_IDLE_SWEEP_MS)
+setInterval(pruneOldTmuxAttachments, TMUX_IDLE_SWEEP_MS)
 
 // Keep alive
 await new Promise(() => {})
