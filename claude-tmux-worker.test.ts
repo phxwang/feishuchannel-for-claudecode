@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone,
-  parseAssistantTextLines, parseDialogOptions, sessionNameFor, stopSignalPathFor, stripAnsi,
+  parseAssistantTextLines, parseDialogOptions, parseTabBar, sessionNameFor, stopSignalPathFor, stripAnsi,
 } from './claude-tmux-worker'
 
 describe('sessionNameFor', () => {
@@ -186,6 +186,49 @@ describe('parseDialogOptions', () => {
   test('falls back to a generic question when no non-divider line precedes the options', () => {
     const text = ['1. Yes', '2. No', ''].join('\n')
     expect(parseDialogOptions(text)!.question).toBe('Claude 需要你的输入')
+  })
+})
+
+describe('parseTabBar', () => {
+  // Shape captured verbatim (2026-11-11) from a real /status panel.
+  const realStatusPanel = [
+    '❯ /status',
+    '',
+    '────────────────────',
+    '  Settings  Status   Config   Usage   Stats',
+    '',
+    '  Version:                2.1.322',
+    '  Session ID:             aaaaaaaa',
+    '',
+    '  Esc to cancel',
+  ].join('\n')
+
+  test('extracts tab labels and offers them as options, 1-indexed', () => {
+    const dialog = parseTabBar(realStatusPanel)
+    expect(dialog).not.toBeNull()
+    expect(dialog!.kind).toBe('tabs')
+    expect(dialog!.options).toEqual([
+      { number: '1', label: 'Settings' },
+      { number: '2', label: 'Status' },
+      { number: '3', label: 'Config' },
+      { number: '4', label: 'Usage' },
+      { number: '5', label: 'Stats' },
+    ])
+  })
+
+  test('requires the pane to end with "Esc to cancel"', () => {
+    const noEscLine = realStatusPanel.split('\n').slice(0, -1).join('\n')
+    expect(parseTabBar(noEscLine)).toBeNull()
+  })
+
+  test('returns null when there is no tab-bar-shaped line', () => {
+    const text = ['❯ hello', '', '⏺ hi there', '', 'Esc to cancel'].join('\n')
+    expect(parseTabBar(text)).toBeNull()
+  })
+
+  test('does not mistake a single capitalized word for a tab bar', () => {
+    const text = ['Settings', '', 'Esc to cancel'].join('\n')
+    expect(parseTabBar(text)).toBeNull()
   })
 })
 

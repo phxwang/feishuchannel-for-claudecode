@@ -122,7 +122,12 @@ export function isQuietDone(lastChangeAtMs: number, nowMs: number, quietMs: numb
 }
 
 export interface DialogOption { number: string; label: string }
-export interface Dialog { question: string; options: DialogOption[] }
+export interface Dialog {
+  /** 'numbered': a real choice menu, option N is selected by typing N + Enter. 'tabs': a tab bar with no numbered jump target — option N is reached by (N-1) Right presses from an assumed starting position of the leftmost tab (see parseTabBar's doc comment for why that's only an assumption, not a measured fact). */
+  kind: 'numbered' | 'tabs'
+  question: string
+  options: DialogOption[]
+}
 /**
  * Given the parsed dialog, resolve with the chosen option's number (as sent
  * back to the pane), or `DIALOG_ESCAPE_CHOICE` for a caller-side "just press
@@ -194,7 +199,48 @@ export function parseDialogOptions(paneText: string): Dialog | null {
     question = lines[i].trim()
     break
   }
-  return { question: question || 'Claude 需要你的输入', options }
+  return { kind: 'numbered', question: question || 'Claude 需要你的输入', options }
+}
+
+const TAB_BAR_RE = /^\s*[A-Z][\w-]*(?:\s{2,}[A-Z][\w-]*){1,}\s*$/
+const ESC_TO_CANCEL_RE = /^\s*Esc to cancel\s*$/
+
+/**
+ * Detect a plain tab bar (e.g. `/status`'s "Settings  Status   Config   Usage   Stats")
+ * with no numbered jump target. Since which tab is actually focused is
+ * conveyed only by color/style — invisible to this plain-text capture, and
+ * not something parseDialogOptions-style parsing can recover — navigation
+ * here is necessarily an *assumption*, not a measured fact: option N is
+ * reached by (N-1) Right presses from an assumed starting position of the
+ * leftmost tab. If that assumption is wrong (the panel didn't actually open
+ * on the leftmost tab), the result lands on the wrong tab; the user can
+ * just ask again (a fresh screenshot/card) rather than this code trying to
+ * track real state it fundamentally can't observe.
+ *
+ * Only fires when the pane's last non-blank line is literally "Esc to
+ * cancel" — the same "last thing on screen" guard as parseDialogOptions,
+ * adapted to this panel's own bottom marker (it has no numbered options to
+ * anchor on instead).
+ */
+export function parseTabBar(paneText: string): Dialog | null {
+  const lines = paneText.split('\n')
+  let lastNonBlank = -1
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() !== '') { lastNonBlank = i; break }
+  }
+  if (lastNonBlank === -1 || !ESC_TO_CANCEL_RE.test(lines[lastNonBlank])) return null
+
+  for (const line of lines) {
+    if (!TAB_BAR_RE.test(line)) continue
+    const tabs = line.trim().split(/\s{2,}/)
+    if (tabs.length < 2) continue
+    return {
+      kind: 'tabs',
+      question: `切换到哪个标签页？（假设当前在第 1 个「${tabs[0]}」，可能不准）`,
+      options: tabs.map((label, i) => ({ number: String(i + 1), label })),
+    }
+  }
+  return null
 }
 
 async function runTmux(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
@@ -541,7 +587,8 @@ export class TmuxClaudeManager {
         lastDialogCheckMs = Date.now()
         const name = sessionNameFor(workdir)
         const rawPane = await this.capturePane(name)
-        const dialog = onDialog ? parseDialogOptions(stripAnsi(rawPane)) : null
+        const plainPane = stripAnsi(rawPane)
+        const dialog = onDialog ? (parseDialogOptions(plainPane) ?? parseTabBar(plainPane)) : null
         if (dialog && onDialog) {
           this.dbg(`tmux: ${workdir} is showing a dialog ("${dialog.question}"), asking caller for a choice`)
           // Keep this workdir looking "in use" for the whole wait — it's
@@ -578,7 +625,25 @@ export class TmuxClaudeManager {
             this.dbg(`tmux: ${workdir}'s session is gone by the time a dialog choice came back — not sending a keystroke`)
             break
           }
-          await this.selectDialogOption(name, option)
+          if (dialog.kind === 'tabs') {
+            // No numbered jump target exists — approximate by assuming we
+            // started on the leftmost tab (see parseTabBar) and pressing
+            // Right (option.number - 1) times to reach the chosen one.
+            // Re-checks hasSession between presses, not just once before the
+            // loop: several presses go out over several ticks, enough for a
+            // concurrent /restart to kill this session (or respawn a new,
+            // unrelated one under the same name) partway through otherwise.
+            const rightPresses = Number(option.number) - 1
+            for (let i = 0; i < rightPresses; i++) {
+              if (!(await this.hasSession(name))) {
+                this.dbg(`tmux: ${workdir}'s session disappeared mid tab-navigation — stopping`)
+                break
+              }
+              await runTmux(['send-keys', '-t', name, 'Right'])
+            }
+          } else {
+            await this.selectDialogOption(name, option)
+          }
           // The user's click can take any amount of time — don't let that
           // count against the reply deadline, and give the chosen action a
           // fresh window to actually run and produce output.
