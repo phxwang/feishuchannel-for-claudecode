@@ -52,6 +52,12 @@ function dbg(msg: string) {
   try { appendFileSync(DEBUG_LOG, line) } catch {}
 }
 
+/** Axios (used by the Feishu SDK) hides the actual API error body behind `e.message`, which is just "Request failed with status code 400". Surfaces `e.response.data` too so a failed Feishu API call is debuggable from the log instead of needing to be reproduced by hand. */
+function describeApiError(e: unknown): string {
+  const data = (e as any)?.response?.data
+  return data ? `${e} — ${JSON.stringify(data)}` : String(e)
+}
+
 // Load .env
 try {
   chmodSync(ENV_FILE, 0o600)
@@ -501,27 +507,32 @@ function buildTmuxDialogCard(dialog: Dialog, code: string): string {
       elements: [
         { tag: 'markdown', content: dialog.question },
         { tag: 'hr' },
-        {
-          tag: 'action',
-          // A fixed "just press Escape instead" button alongside the real
-          // options, since this is a best-effort scrape of a terminal UI —
-          // always leave a safe way out even if none of the parsed options
-          // are actually what the user wants.
-          actions: [
-            ...dialog.options.map(o => ({
+        // Schema 2.0 dropped the old `tag: 'action'` button-row wrapper
+        // (confirmed live: Feishu returns a 400 "unsupported tag action" for
+        // it) — each button is now its own full-width column_set row, which
+        // also stacks cleanly regardless of how many options there are.
+        //
+        // A fixed "just press Escape instead" row follows the real options,
+        // since this is a best-effort scrape of a terminal UI — always leave
+        // a safe way out even if none of the parsed options are what the
+        // user wants.
+        ...[...dialog.options.map(o => ({
+          number: o.number, label: `${o.number}. ${o.label}`, type: o.number === '1' ? 'primary' : 'default',
+        })), { number: String(DIALOG_ESCAPE_CHOICE), label: '🚪 Esc', type: 'danger' }].map(({ number, label, type }) => ({
+          tag: 'column_set',
+          columns: [{
+            tag: 'column',
+            width: 'weighted',
+            weight: 1,
+            elements: [{
               tag: 'button',
-              text: { tag: 'plain_text', content: `${o.number}. ${o.label}` },
-              type: o.number === '1' ? 'primary' : 'default',
-              value: { code, action: 'tmux_dialog_choice', number: o.number },
-            })),
-            {
-              tag: 'button',
-              text: { tag: 'plain_text', content: '🚪 Esc' },
-              type: 'danger',
-              value: { code, action: 'tmux_dialog_choice', number: String(DIALOG_ESCAPE_CHOICE) },
-            },
-          ],
-        },
+              text: { tag: 'plain_text', content: label },
+              type,
+              value: { code, action: 'tmux_dialog_choice', number },
+              width: 'fill',
+            }],
+          }],
+        })),
       ],
     },
   })
@@ -548,7 +559,7 @@ function makeTmuxDialogHandler(workdir: string, chatId: string, messageId: strin
         params: { receive_id_type: 'chat_id' },
         data: { receive_id: chatId, msg_type: 'interactive', content: buildTmuxDialogCard(dialog, code) },
       })
-    } catch (e) { dbg(`claude-tmux: dialog card send failed: ${e}`) }
+    } catch (e) { dbg(`claude-tmux: dialog card send failed: ${describeApiError(e)}`) }
     return new Promise<number>(resolve => {
       const timer = setTimeout(() => {
         if (!TMUX_PENDING_DIALOGS.delete(code)) return  // already resolved by a real click
