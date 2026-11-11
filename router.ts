@@ -516,9 +516,15 @@ function buildTmuxDialogCard(dialog: Dialog, code: string): string {
         // since this is a best-effort scrape of a terminal UI — always leave
         // a safe way out even if none of the parsed options are what the
         // user wants.
-        ...[...dialog.options.map(o => ({
-          number: o.number, label: `${o.number}. ${o.label}`, type: o.number === '1' ? 'primary' : 'default',
-        })), { number: String(DIALOG_ESCAPE_CHOICE), label: '🚪 Esc', type: 'danger' }].map(({ number, label, type }) => ({
+        // For a 'tabs' dialog, dialog.currentNumber marks the tab believed
+        // to be focused right now (see claude-tmux-worker.ts) — highlight
+        // that one instead of always the first option, and label it so the
+        // card itself shows which tab a repeat click will start switching
+        // from.
+        ...[...dialog.options.map(o => {
+          const isCurrent = dialog.kind === 'tabs' ? o.number === dialog.currentNumber : o.number === '1'
+          return { number: o.number, label: `${o.number}. ${o.label}${isCurrent ? ' 📍当前' : ''}`, type: isCurrent ? 'primary' : 'default' }
+        }), { number: String(DIALOG_ESCAPE_CHOICE), label: '🚪 Esc', type: 'danger' }].map(({ number, label, type }) => ({
           tag: 'column_set',
           columns: [{
             tag: 'column',

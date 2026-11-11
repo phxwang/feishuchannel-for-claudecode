@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone,
-  parseAssistantTextLines, parseDialogOptions, parseTabBar, sessionNameFor, stopSignalPathFor, stripAnsi,
+  parseAssistantTextLines, parseDialogOptions, parseTabBar, rightPressesToReach, sessionNameFor, stopSignalPathFor, stripAnsi,
 } from './claude-tmux-worker'
 
 describe('sessionNameFor', () => {
@@ -229,6 +229,29 @@ describe('parseTabBar', () => {
   test('does not mistake a single capitalized word for a tab bar', () => {
     const text = ['Settings', '', 'Esc to cancel'].join('\n')
     expect(parseTabBar(text)).toBeNull()
+  })
+
+  test('marks the leftmost tab as currentNumber on first detection', () => {
+    expect(parseTabBar(realStatusPanel)!.currentNumber).toBe('1')
+  })
+})
+
+describe('rightPressesToReach', () => {
+  test('matches the original "from leftmost" assumption when from is 1', () => {
+    expect(rightPressesToReach('1', '3', 5)).toBe(2)
+  })
+  test('is 0 when already on the target tab', () => {
+    expect(rightPressesToReach('3', '3', 5)).toBe(0)
+  })
+  test('moves forward within range', () => {
+    expect(rightPressesToReach('3', '5', 5)).toBe(2)
+  })
+  test('wraps around past the last tab to reach an earlier one', () => {
+    // 3 -> 4 -> 5 -> 1, three Right presses, not "two Left presses" (there is no Left)
+    expect(rightPressesToReach('3', '1', 5)).toBe(3)
+  })
+  test('wraps around with a single press when already adjacent past the end', () => {
+    expect(rightPressesToReach('5', '1', 5)).toBe(1)
   })
 })
 

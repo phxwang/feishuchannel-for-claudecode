@@ -123,10 +123,12 @@ export function isQuietDone(lastChangeAtMs: number, nowMs: number, quietMs: numb
 
 export interface DialogOption { number: string; label: string }
 export interface Dialog {
-  /** 'numbered': a real choice menu, option N is selected by typing N + Enter. 'tabs': a tab bar with no numbered jump target — option N is reached by (N-1) Right presses from an assumed starting position of the leftmost tab (see parseTabBar's doc comment for why that's only an assumption, not a measured fact). */
+  /** 'numbered': a real choice menu, option N is selected by typing N + Enter. 'tabs': a tab bar with no numbered jump target — option N is reached by (N - currentNumber) Right presses (wrapping circularly) from the known current tab. */
   kind: 'numbered' | 'tabs'
   question: string
   options: DialogOption[]
+  /** `kind: 'tabs'` only: the tab believed to currently be focused — `'1'` (leftmost) on first detection, since the CLI gives no plain-text signal of which tab is actually open; updated to whichever tab was last switched to for every subsequent card in the same switching session (see collectReply), so repeated switches are relative to the real last click instead of re-assuming leftmost each time. */
+  currentNumber?: string
 }
 /**
  * Given the parsed dialog, resolve with the chosen option's number (as sent
@@ -241,9 +243,16 @@ export function parseTabBar(paneText: string): Dialog | null {
       kind: 'tabs',
       question: `切换到哪个标签页？（假设当前在第 1 个「${tabs[0]}」，可能不准）`,
       options: tabs.map((label, i) => ({ number: String(i + 1), label })),
+      currentNumber: '1',
     }
   }
   return null
+}
+
+/** How many Right presses (there's no Left here) get from tab `from` to tab `to`, wrapping circularly through `numTabs` tabs — e.g. from '5' to '1' with 5 tabs is a single wrapping press, not 4 backward ones. */
+export function rightPressesToReach(from: string, to: string, numTabs: number): number {
+  const delta = (Number(to) - Number(from)) % numTabs
+  return (delta + numTabs) % numTabs
 }
 
 async function runTmux(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
@@ -647,14 +656,14 @@ export class TmuxClaudeManager {
               await this.selectDialogOption(name, option)
               break
             }
-            // No numbered jump target exists — approximate by assuming we
-            // started on the leftmost tab (see parseTabBar) and pressing
-            // Right (option.number - 1) times to reach the chosen one.
-            // Re-checks hasSession between presses, not just once before the
-            // loop: several presses go out over several ticks, enough for a
-            // concurrent /restart to kill this session (or respawn a new,
-            // unrelated one under the same name) partway through otherwise.
-            const rightPresses = Number(option.number) - 1
+            // No numbered jump target exists — reach the chosen tab by
+            // pressing Right from the known current tab (wrapping circularly
+            // if the target is "behind" it, since there's no Left here).
+            // currentNumber starts at '1' (parseTabBar's leftmost assumption)
+            // but is updated below to wherever we actually switched to, so a
+            // second switch is relative to the real last click instead of
+            // re-assuming leftmost every time.
+            const rightPresses = rightPressesToReach(currentDialog.currentNumber ?? '1', option.number, currentDialog.options.length)
             let sessionGone = false
             for (let i = 0; i < rightPresses; i++) {
               if (!(await this.hasSession(name))) {
@@ -674,7 +683,14 @@ export class TmuxClaudeManager {
             }
             // Loop back around and offer the same tab choices again — the
             // caller (router.ts) sends a fresh card and waits for another
-            // click, same as the first time.
+            // click, same as the first time, but now marking the tab we
+            // just switched to as current instead of the original leftmost
+            // assumption.
+            currentDialog = {
+              ...currentDialog,
+              question: `切换到哪个标签页？（当前在第 ${option.number} 个「${option.label}」）`,
+              currentNumber: option.number,
+            }
           }
           // The user's click(s) can take any amount of time — don't let that
           // count against the reply deadline, and give the chosen action a
