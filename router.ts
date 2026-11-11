@@ -30,6 +30,7 @@ import { chunkText, MAX_CHUNK } from './chunk-text'
 import { DegradedTracker } from './routing/degraded'
 import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
 import { downloadFeishuResource } from './feishu-download'
+import { renderPaneScreenshot } from './pane-screenshot'
 import { decodeBase64DataUri } from './data-uri'
 import { TmuxClaudeManager, DIALOG_ESCAPE_CHOICE, type Dialog } from './claude-tmux-worker'
 
@@ -564,6 +565,31 @@ function makeTmuxDialogHandler(workdir: string, chatId: string, messageId: strin
 }
 
 /**
+ * Builds the onStuckPane callback: renders the ANSI pane capture to a PNG
+ * (pane-screenshot.ts) and sends it as an image — for a stuck state
+ * parseDialogOptions can't turn into a card (a `/status`-style tab panel,
+ * for instance, whose "currently selected" state is color-only and whose
+ * tabs cycle circularly with no numbered jump target, so there's no way to
+ * compute "click this button to land on that tab" from plain text alone).
+ * Silently does nothing if no cached Chromium build is available on this
+ * machine (see renderPaneScreenshot) — this is a nice-to-have, not core
+ * functionality worth erroring the whole task over.
+ */
+function makeStuckPaneHandler(chatId: string) {
+  return async (paneAnsiText: string): Promise<void> => {
+    const png = await renderPaneScreenshot(paneAnsiText)
+    if (!png) { dbg(`claude-tmux: stuck-pane screenshot unavailable (no cached Chromium build)`); return }
+    const pngPath = join(tmpdir(), `claude-tmux-pane-${Date.now()}-${Math.random().toString(36).slice(2)}.png`)
+    try {
+      writeFileSync(pngPath, png)
+      await sendFeishuFile(apiClient, chatId, pngPath, 'claude-session.png')
+    } finally {
+      try { unlinkSync(pngPath) } catch (e) { dbg(`claude-tmux: failed to clean up pane screenshot ${pngPath}: ${e}`) }
+    }
+  }
+}
+
+/**
  * Claude via tmux (agent.mode: 'tmux') — delivers the message as literal
  * terminal keystrokes to a persistent `claude` CLI session instead of the
  * socket-worker protocol. See claude-tmux-worker.ts's header comment for
@@ -638,7 +664,11 @@ async function handleClaudeTmuxTask(
     effectiveContent = `${content}\n\n${notes.join('\n')}`
   }
   try {
-    const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, model, makeTmuxDialogHandler(workdir, chatId, messageId))
+    const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, {
+      model,
+      onDialog: makeTmuxDialogHandler(workdir, chatId, messageId),
+      onStuckPane: makeStuckPaneHandler(chatId),
+    })
     if (reply) {
       for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
     } else {

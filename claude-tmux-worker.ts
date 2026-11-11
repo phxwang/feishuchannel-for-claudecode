@@ -133,9 +133,22 @@ export interface Dialog { question: string; options: DialogOption[] }
  */
 export type DialogHandler = (dialog: Dialog) => Promise<number>
 export const DIALOG_ESCAPE_CHOICE = 0
+/** Called (at most once per stuck episode) with the raw ANSI pane text when the session is blocked on something that isn't a parseable dialog — e.g. a `/status`-style panel. Purely informational: the caller decides what to do with it (render+send a screenshot, etc.); this code takes no further action afterward. */
+export type StuckPaneHandler = (paneAnsiText: string) => Promise<void>
+export interface SendAndAwaitReplyOptions {
+  model?: string
+  onDialog?: DialogHandler
+  onStuckPane?: StuckPaneHandler
+}
 
 const OPTION_LINE_RE = /^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$/
 const DIVIDER_LINE_RE = /^[\s─╌│]*$/
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*m/g
+
+/** Strip SGR color/style escape codes so layout-based parsing (parseDialogOptions) sees plain text. */
+export function stripAnsi(text: string): string {
+  return text.replace(ANSI_ESCAPE_RE, '')
+}
 
 /**
  * Detect a Claude Code interactive choice menu (permission prompts, etc.)
@@ -258,6 +271,17 @@ export interface TmuxClaudeManagerOptions {
   postStopMaxMs?: number
   /** How long with no transcript growth before checking the pane for a pending interactive dialog (permission prompt, etc.) — shorter than quietMs since this is just "is the CLI blocked on input", not "is the turn over". */
   dialogCheckMs?: number
+  /**
+   * How long with no transcript growth before treating the pane as "stuck"
+   * for onStuckPane purposes — deliberately much longer than dialogCheckMs.
+   * dialogCheckMs only governs how often we bother looking at the pane at
+   * all (cheap, and needs to be short so a real permission prompt is caught
+   * promptly); this is the actual "is anything actually wrong" threshold.
+   * A normal tool call routinely takes several seconds to tens of seconds
+   * with zero transcript growth in between — using dialogCheckMs for this
+   * too would screenshot the chat on nearly every ordinary reply.
+   */
+  stuckPaneCheckMs?: number
 }
 
 export class TmuxClaudeManager {
@@ -270,6 +294,7 @@ export class TmuxClaudeManager {
   private readonly postStopQuietMs: number
   private readonly postStopMaxMs: number
   private readonly dialogCheckMs: number
+  private readonly stuckPaneCheckMs: number
   /** Workdirs we've confirmed a live tmux session for, to skip a has-session round-trip on every message. */
   private knownAlive = new Set<string>()
   /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost on router restart. */
@@ -289,6 +314,7 @@ export class TmuxClaudeManager {
     this.postStopQuietMs = opts.postStopQuietMs ?? 800
     this.postStopMaxMs = opts.postStopMaxMs ?? 8_000
     this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
+    this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 20_000
   }
 
   private async hasSession(name: string): Promise<boolean> {
@@ -296,8 +322,9 @@ export class TmuxClaudeManager {
     return r.ok
   }
 
+  /** `-e` keeps SGR color/style escape codes — needed for onStuckPane's screenshot; parseDialogOptions strips them back out via stripAnsi() before its own layout-based parsing. */
   private async capturePane(name: string): Promise<string> {
-    const r = await runTmux(['capture-pane', '-p', '-t', name])
+    const r = await runTmux(['capture-pane', '-e', '-p', '-t', name])
     return r.ok ? r.stdout : ''
   }
 
@@ -397,14 +424,15 @@ export class TmuxClaudeManager {
    * the transcript goes quiet for `quietMs` (or `replyTimeoutMs` elapses).
    * Calls for the same workdir are serialized — see `queues`.
    */
-  async sendAndAwaitReply(workdir: string, text: string, model?: string, onDialog?: DialogHandler): Promise<string> {
+  async sendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions = {}): Promise<string> {
     const previous = this.queues.get(workdir) ?? Promise.resolve()
-    const task = previous.catch(() => {}).then(() => this.doSendAndAwaitReply(workdir, text, model, onDialog))
+    const task = previous.catch(() => {}).then(() => this.doSendAndAwaitReply(workdir, text, opts))
     this.queues.set(workdir, task)
     return task
   }
 
-  private async doSendAndAwaitReply(workdir: string, text: string, model?: string, onDialog?: DialogHandler): Promise<string> {
+  private async doSendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions): Promise<string> {
+    const { model, onDialog, onStuckPane } = opts
     this.lastUsedAt.set(workdir, Date.now())
     const name = await this.ensureSession(workdir, model)
     const sessionId = this.sessionIds.get(workdir)
@@ -427,7 +455,7 @@ export class TmuxClaudeManager {
     // unexpected failure while waiting for the reply is swallowed and
     // whatever text was collected so far (possibly none) is returned instead.
     try {
-      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog)
+      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane)
     } catch (e) {
       this.dbg(`tmux: error while waiting for ${workdir}'s reply (message was already delivered, not retryable): ${e}`)
       return ''
@@ -437,11 +465,12 @@ export class TmuxClaudeManager {
   private async collectReply(
     workdir: string, sessionId: string | undefined, beforeSendMs: number,
     transcriptBefore: string | null, startOffset: number, signalPath: string | null, baselineStopMs: number,
-    onDialog?: DialogHandler,
+    onDialog?: DialogHandler, onStuckPane?: StuckPaneHandler,
   ): Promise<string> {
     let deadline = beforeSendMs + this.replyTimeoutMs
     let lastChangeMs = Date.now()
     let lastDialogCheckMs = Date.now()
+    let stuckPaneNotified = false
     let lastSize = startOffset
     let transcriptPath = transcriptBefore
     const collected: string[] = []
@@ -469,6 +498,7 @@ export class TmuxClaudeManager {
       collected.push(...parseAssistantTextLines(completeChunk.toString('utf8').split('\n')))
       lastSize += completeChunk.length
       lastChangeMs = Date.now()
+      stuckPaneNotified = false  // real progress — any earlier "stuck" episode is over
       return true
     }
 
@@ -507,11 +537,12 @@ export class TmuxClaudeManager {
       // waiting for a keypress this code never sends. dialogCheckMs is much
       // shorter than quietMs/replyTimeoutMs specifically to catch the latter
       // promptly instead of burning the whole reply-timeout on it.
-      if (onDialog && isQuietDone(lastDialogCheckMs, Date.now(), this.dialogCheckMs)) {
+      if ((onDialog || onStuckPane) && isQuietDone(lastDialogCheckMs, Date.now(), this.dialogCheckMs)) {
         lastDialogCheckMs = Date.now()
         const name = sessionNameFor(workdir)
-        const dialog = parseDialogOptions(await this.capturePane(name))
-        if (dialog) {
+        const rawPane = await this.capturePane(name)
+        const dialog = onDialog ? parseDialogOptions(stripAnsi(rawPane)) : null
+        if (dialog && onDialog) {
           this.dbg(`tmux: ${workdir} is showing a dialog ("${dialog.question}"), asking caller for a choice`)
           // Keep this workdir looking "in use" for the whole wait — it's
           // paced by a human clicking a Feishu card, not by anything this
@@ -553,6 +584,14 @@ export class TmuxClaudeManager {
           // fresh window to actually run and produce output.
           deadline = Date.now() + this.replyTimeoutMs
           lastChangeMs = Date.now()
+        } else if (onStuckPane && !stuckPaneNotified && isQuietDone(lastChangeMs, Date.now(), this.stuckPaneCheckMs)) {
+          // Not a dialog we know how to act on (or no onDialog configured at
+          // all) — just hand the raw pane to the caller once per stuck
+          // episode. Purely informational: this code doesn't wait for or
+          // act on anything afterward, so it can't deadlock the way an
+          // unanswered dialog could.
+          stuckPaneNotified = true
+          try { await onStuckPane(rawPane) } catch (e) { this.dbg(`tmux: onStuckPane failed for ${workdir}: ${e}`) }
         }
       }
     }

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone,
-  parseAssistantTextLines, parseDialogOptions, sessionNameFor, stopSignalPathFor,
+  parseAssistantTextLines, parseDialogOptions, sessionNameFor, stopSignalPathFor, stripAnsi,
 } from './claude-tmux-worker'
 
 describe('sessionNameFor', () => {
@@ -84,6 +84,25 @@ describe('buildSettingsOverride', () => {
     const command: string = parsed.hooks.Stop[0].hooks[0].command
     expect(command).toContain(stopSignalPathFor('session-123'))
     expect(parsed.hooks.Stop[0].hooks[0].type).toBe('command')
+  })
+})
+
+describe('stripAnsi', () => {
+  test('removes SGR color/style codes', () => {
+    expect(stripAnsi('\x1b[1m\x1b[36mhello\x1b[0m')).toBe('hello')
+  })
+  test('leaves plain text untouched', () => {
+    expect(stripAnsi('plain text, no codes')).toBe('plain text, no codes')
+  })
+  test('lets parseDialogOptions see through color codes applied to a real menu', () => {
+    const colored = [
+      '\x1b[36mDo you want to allow Claude to fetch this content?\x1b[0m',
+      '\x1b[32m❯ 1. Yes\x1b[0m',
+      '  2. No',
+    ].join('\n')
+    const dialog = parseDialogOptions(stripAnsi(colored))
+    expect(dialog).not.toBeNull()
+    expect(dialog!.question).toBe('Do you want to allow Claude to fetch this content?')
   })
 })
 

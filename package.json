@@ -13,8 +13,10 @@
     "postinstall": "mkdir -p ~/.local/bin && ln -sf \"$(pwd)/bin/claude-feishu\" ~/.local/bin/claude-feishu"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
     "@larksuiteoapi/node-sdk": "^1.5.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ansi-to-html": "^0.7.2",
+    "playwright-core": "^1.65.0",
     "zod": "^3.22.0"
   }
 }
