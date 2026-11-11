@@ -29,6 +29,7 @@ import { chunkText, MAX_CHUNK } from './chunk-text'
 import { DegradedTracker } from './routing/degraded'
 import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
 import { decodeBase64DataUri } from './data-uri'
+import { TmuxClaudeManager } from './claude-tmux-worker'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -89,6 +90,8 @@ const openCodeAdapter = openCodeCfg
       onWarn: dbg,
     })
   : null
+
+const tmuxClaude = new TmuxClaudeManager({ dbg })
 
 // ── Access control ──────────────────────────────────────────────────────────
 
@@ -455,6 +458,28 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
   await flushAttachments()
 }
 
+/**
+ * Claude via tmux (agent.mode: 'tmux') — delivers the message as literal
+ * terminal keystrokes to a persistent `claude` CLI session instead of the
+ * socket-worker protocol. See claude-tmux-worker.ts's header comment for
+ * the known gaps (no attachments, no mid-session permission handling,
+ * heuristic turn-completion) before relying on this in a group.
+ */
+async function handleClaudeTmuxTask(workdir: string, chatId: string, messageId: string, content: string) {
+  dbg(`routing ${chatId} → ${workdir} via Claude-tmux`)
+  try {
+    const reply = await tmuxClaude.sendAndAwaitReply(workdir, content)
+    if (reply) {
+      for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
+    } else {
+      dbg(`claude-tmux: ${workdir} produced no text reply for ${messageId}`)
+    }
+  } catch (e) {
+    dbg(`claude-tmux: task for ${workdir} failed: ${e}`)
+    void replyText(chatId, messageId, `⚠️ Claude (tmux) 执行失败：${e}`)
+  }
+}
+
 async function handleInbound(data: any) {
   const ev = data.event ?? data
   const sender = ev.sender, message = ev.message
@@ -553,6 +578,12 @@ async function handleInbound(data: any) {
     // OpenCode task before the first one completed.
     markEventProcessed(db, messageId, new Date().toISOString())
     void handleOpenCodeTask(route, chatId, messageId, chatKind, ocContent)
+    return
+  }
+
+  if (route.agent.mode === 'tmux') {
+    markEventProcessed(db, messageId, new Date().toISOString())
+    void handleClaudeTmuxTask(workdir, chatId, messageId, atts.length ? `${content}\n\n(注意: tmux 模式当前不支持附件，已忽略)` : content)
     return
   }
 
