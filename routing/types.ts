@@ -9,6 +9,14 @@ export interface AgentPolicy {
   primary: AgentKind
   fallback: AgentKind | null
   policy?: 'pre_execution_only'
+  /**
+   * How a `primary: 'claude'` task is delivered. 'socket' (default) is the
+   * existing Unix-socket worker protocol (worker-link.ts / server.ts running
+   * as an MCP plugin). 'tmux' drives a real interactive `claude` CLI in a
+   * detached tmux session instead — see claude-tmux-worker.ts. Ignored when
+   * primary is 'opencode'.
+   */
+  mode?: 'socket' | 'tmux'
 }
 
 export interface ProjectConfig {

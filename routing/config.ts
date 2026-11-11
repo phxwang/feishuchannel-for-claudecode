@@ -20,6 +20,7 @@ const agentPolicySchema = z.object({
   primary: z.enum(['claude', 'opencode']),
   fallback: z.enum(['claude', 'opencode']).nullable().default(null),
   policy: z.literal('pre_execution_only').optional(),
+  mode: z.enum(['socket', 'tmux']).optional(),
 }).refine(p => p.fallback === null || p.fallback !== p.primary, {
   message: 'agent.fallback must differ from agent.primary',
 })

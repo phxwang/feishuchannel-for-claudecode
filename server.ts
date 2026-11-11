@@ -17,12 +17,13 @@ import {
   statSync, renameSync, realpathSync, chmodSync, createReadStream, existsSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join, sep, extname } from 'path'
+import { join, sep } from 'path'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { clearWorkerSockIfCurrent, DEFAULT_DEGRADED_MS, registerCallback, sendDegraded, setWorkerSock, WORKER_CAPABILITIES, WORKER_ID, WORKER_PROTOCOL_VERSION } from './worker-link'
 import { parseRateLimitResetTime } from './rate-limit-reset'
 import { nextReconnectDelay, RECONNECT_BASE_DELAY_MS } from './reconnect-backoff'
 import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
+import { downloadFeishuResource } from './feishu-download'
 
 /** Walk up the process tree to find the Claude ancestor with --channels feishu.
  *  Returns its PID (or 0 if not found). */
@@ -300,24 +301,7 @@ function checkApprovals() {
 if (!STATIC && CHANNEL_MODE) setInterval(checkApprovals, 5000).unref()
 
 async function downloadResource(messageId: string, fileKey: string, type: 'file' | 'image', fileName: string): Promise<string> {
-  const ext = type === 'image' ? '.png' : extname(fileName) || '.bin'
-  const base = fileName.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.[^.]*$/, '').slice(0, 60)
-  const outPath = join(INBOX_DIR, `${Date.now()}-${base}${ext}`)
-  mkdirSync(INBOX_DIR, { recursive: true })
-  const raw = await (apiClient as any).im.messageResource.get({ path: { message_id: messageId, file_key: fileKey }, params: { type } })
-  let buf: Buffer
-  const data = raw?.data ?? raw
-  if (Buffer.isBuffer(data)) buf = data
-  else if (data instanceof ArrayBuffer) buf = Buffer.from(data)
-  else if (data && typeof data.arrayBuffer === 'function') buf = Buffer.from(await data.arrayBuffer())
-  else if (data && typeof data.pipe === 'function') buf = await new Promise<Buffer>((res, rej) => { const c: Buffer[] = []; data.on('data', (d: Buffer) => c.push(d)); data.on('end', () => res(Buffer.concat(c))); data.on('error', rej) })
-  else if (data && typeof data.getReadableStream === 'function') {
-    const stream = await data.getReadableStream()
-    buf = await new Promise<Buffer>((res, rej) => { const c: Buffer[] = []; stream.on('data', (d: Buffer) => c.push(d)); stream.on('end', () => res(Buffer.concat(c))); stream.on('error', rej) })
-  }
-  else throw new Error(`unexpected download response type: ${typeof raw}, keys: ${raw ? Object.keys(raw).join(',') : 'null'}`)
-  writeFileSync(outPath, buf)
-  return outPath
+  return downloadFeishuResource(apiClient, INBOX_DIR, messageId, fileKey, type, fileName)
 }
 
 const mcp = new Server(
