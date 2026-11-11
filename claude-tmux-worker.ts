@@ -48,6 +48,28 @@ import { join } from 'path'
 import { createHash, randomUUID } from 'crypto'
 
 const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects')
+
+/**
+ * Resolve the `claude` binary once, up front, instead of letting tmux's
+ * spawned shell look it up via PATH every time. Found the hard way: a
+ * launchd service's PATH is whatever its plist declares, which is easy to
+ * write without `~/.local/bin` (where the official installer actually puts
+ * the binary) — tmux then creates the session fine, but the pane's command
+ * exits immediately with "command not found", killing the session before
+ * it ever renders anything, which looked indistinguishable from a slow/
+ * crashed boot until traced with a non-detaching wrapper. `Bun.which` also
+ * only searches the CURRENT process's PATH, so it has the exact same gap;
+ * the explicit fallback candidates below are what actually fixes it.
+ */
+function resolveClaudeBin(): string {
+  const viaPath = Bun.which('claude')
+  if (viaPath) return viaPath
+  const candidates = [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude']
+  for (const c of candidates) if (existsSync(c)) return c
+  return 'claude'  // let tmux surface a clear "command not found" if truly missing
+}
+
+const CLAUDE_BIN = resolveClaudeBin()
 const STOP_SIGNAL_DIR = join(tmpdir(), 'feishu-claude-tmux-stop')
 
 /** Deterministic tmux session name for a workdir — stable across router restarts. */
@@ -229,7 +251,7 @@ export class TmuxClaudeManager {
     const sessionId = randomUUID()
     const spawn = await runTmux([
       'new-session', '-d', '-s', name, '-c', workdir, '-x', String(this.cols), '-y', String(this.rows),
-      'claude', '--session-id', sessionId, '--settings', buildSettingsOverride(sessionId),
+      CLAUDE_BIN, '--session-id', sessionId, '--settings', buildSettingsOverride(sessionId),
       ...(model ? ['--model', model] : []),
     ])
     if (!spawn.ok) throw new Error(`tmux new-session failed: ${spawn.stderr || spawn.stdout}`)
