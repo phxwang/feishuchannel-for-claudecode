@@ -378,12 +378,28 @@ Omitting `mode` (or setting `"socket"`) keeps today's behavior: `server.ts` runs
 
 This exists because Claude Code CLI wraps a channel-sourced message received while busy in an "untrusted external data, do not act on imperative language" system reminder — which breaks the `send_confirm_card` busy-state confirm flow, since even a "CONFIRMED" reply gets the same treatment. Terminal keystrokes carry no such wrapper. Manually verified: a message injected into a tmux session mid-task is queued and answered as a normal next turn, with no untrusted-data framing.
 
-Each spawned session also gets a per-session Stop hook (via `--settings`, layered on top of the project's own settings) that signals the router when a turn actually finishes — this is the primary completion signal; a quiet-period heuristic on the JSONL transcript is only a fallback. Attachments are downloaded by the router itself (there's no MCP channel plugin loaded for the CLI to call `download_attachment` with) and handed to the CLI as a local file path to `Read`.
+Each spawned session also gets a per-session Stop hook (via `--settings`, layered on top of the project's own settings) that signals the router when a turn actually finishes — this is the primary completion signal; a quiet-period heuristic on the JSONL transcript is only a fallback. Attachments are downloaded by the router itself (there's no MCP channel plugin loaded for the CLI to call `download_attachment` with) and handed to the CLI as a local file path to `Read`. `agent.fallback: "opencode"` works here too, under the same pre-execution-only guarantee as the socket path — `sendAndAwaitReply` throwing is, by contract, always a failure *before* the message reached the CLI, so it's provably safe to hand the task to OpenCode instead.
 
-**Known gaps** (tracked in `claude-tmux-worker.ts`'s header comment):
-- No handling of permission dialogs that pop up inside the tmux session itself — only tool calls pre-approved via the project's `settings.json` work unattended.
+### Interactive dialogs (permission prompts, `/status`-style panels)
+
+A session blocked on an interactive menu (nothing being written to its transcript, no Stop signal) gets its pane scraped for a numbered choice menu. If one is found — e.g. a tool permission prompt:
+```
+Do you want to allow Claude to fetch this content?
+❯ 1. Yes
+  2. Yes, and don't ask again for example.com
+  3. No, and tell Claude what to do differently (esc)
+```
+the router sends a Feishu card with one button per option plus a fixed 🚪 Esc button, every time, as a safe way out even if none of the parsed options turn out to be what you actually want. Clicking a numbered option types that number into the pane and presses Enter; clicking Esc just presses Escape. Detection is deliberately conservative (consecutive options starting at 1, and the menu must be the last thing on screen) specifically so a numbered list inside Claude's own *finished* reply text is never mistaken for a pending menu. An unanswered card times out after 30 minutes (cancelled automatically, with a notice) rather than blocking that workdir's queue forever.
+
+`/restart` and `/esc` both cancel any dialog this workdir is still waiting on before acting — otherwise a click arriving after a `/restart` would hit a brand-new, unrelated session under the same name.
+
+This doesn't catch every possible interactive state — a full-screen panel with no numbered menu (`/status` itself, which is tabs you'd otherwise arrow through) still just sits there with nothing to turn into a card. For that, send `/esc` as a chat message to the group/DM — the router sends a bare Escape keypress straight to the session, dismissing whatever's open. `/restart` kills and respawns the session (a fresh `claude` process, new conversation from the CLI's point of view) if a session gets stuck in a way even Escape can't fix.
+
+**Known gaps:**
+- `/status`-style full-panel UIs (no numbered menu to turn into a card) aren't handled automatically — use `/esc`.
 - A tmux session survives a router restart (its context isn't lost, unlike socket mode) but the router's in-memory `--session-id` pin doesn't — the next message after a restart falls back to "newest transcript by mtime" for that workdir, which can misattribute output if more than one `claude` process targets the same directory.
 - Idle tmux sessions are killed after an hour of no messages (`TMUX_IDLE_MS` in `router.ts`).
+- The `claude` binary is resolved once at startup (`Bun.which`, then `~/.local/bin/claude` and a couple of other common install paths) rather than trusting PATH inside the spawned tmux pane — found the hard way when a launchd service's stripped PATH didn't include it, see `claude-tmux-worker.ts`'s `resolveClaudeBin`.
 
 ## Access Management
 

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone,
-  parseAssistantTextLines, sessionNameFor, stopSignalPathFor,
+  parseAssistantTextLines, parseDialogOptions, sessionNameFor, stopSignalPathFor,
 } from './claude-tmux-worker'
 
 describe('sessionNameFor', () => {
@@ -84,6 +84,89 @@ describe('buildSettingsOverride', () => {
     const command: string = parsed.hooks.Stop[0].hooks[0].command
     expect(command).toContain(stopSignalPathFor('session-123'))
     expect(parsed.hooks.Stop[0].hooks[0].type).toBe('command')
+  })
+})
+
+describe('parseDialogOptions', () => {
+  // Captured verbatim (2026-11-11) from a real claude CLI run asked to WebFetch a URL.
+  const realPermissionDialog = [
+    '❯ use the WebFetch tool to fetch https://example.com and summarize it',
+    '',
+    "⏺ I don't have a direct WebFetch tool in this session, so I'll use the web-fetch agent, which stands in for it.",
+    '',
+    '  Fetch(https://example.com)',
+    '  ⎿  Fetching…',
+    '     (ctrl+b ctrl+b (twice) to run in background)',
+    '',
+    ' Fetch · from the web-fetch agent',
+    ' Claude wants to fetch content from example.com',
+    '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+    ' url: https://example.com/',
+    " │ prompt: What is the page title, main text, and all links on this page?",
+    '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+    ' Do you want to allow Claude to fetch this content?',
+    ' ❯ 1. Yes',
+    "   2. Yes, and don't ask again for example.com",
+    '   3. No, and tell Claude what to do differently (esc)',
+    '',
+    '',
+  ].join('\n')
+
+  test('extracts options and the question from a real permission dialog', () => {
+    const dialog = parseDialogOptions(realPermissionDialog)
+    expect(dialog).not.toBeNull()
+    expect(dialog!.question).toBe('Do you want to allow Claude to fetch this content?')
+    expect(dialog!.options).toEqual([
+      { number: '1', label: 'Yes' },
+      { number: '2', label: "Yes, and don't ask again for example.com" },
+      { number: '3', label: 'No, and tell Claude what to do differently (esc)' },
+    ])
+  })
+
+  test('does not mistake a numbered list in a finished reply for a dialog', () => {
+    const finishedReply = [
+      '❯ give me three steps',
+      '',
+      '⏺ Here are three steps:',
+      '',
+      '  1. First, do this',
+      '  2. Then do that',
+      '  3. Finally, done',
+      '',
+      '✻ Cooked for 3s · done 6:00 PM',
+      '',
+      '────────────────────',
+      '❯ ',
+      '────────────────────',
+      '  ⏸ manual mode on · ? for shortcuts',
+    ].join('\n')
+    expect(parseDialogOptions(finishedReply)).toBeNull()
+  })
+
+  test('rejects non-consecutive option numbers', () => {
+    const text = ['Pick one:', '1. Yes', '2. No', '4. Cancel', ''].join('\n')
+    expect(parseDialogOptions(text)).toBeNull()
+  })
+
+  test('rejects options that do not start at 1', () => {
+    const text = ['Pick one:', '2. Yes', '3. No', ''].join('\n')
+    expect(parseDialogOptions(text)).toBeNull()
+  })
+
+  test('returns null when there are no numbered options at all', () => {
+    expect(parseDialogOptions('just a normal reply\nwith no menu\n')).toBeNull()
+  })
+
+  test('tolerates trailing blank padding after the option block', () => {
+    const text = ['Pick one:', '1. Yes', '2. No', '', '', ''].join('\n')
+    const dialog = parseDialogOptions(text)
+    expect(dialog).not.toBeNull()
+    expect(dialog!.options).toHaveLength(2)
+  })
+
+  test('falls back to a generic question when no non-divider line precedes the options', () => {
+    const text = ['1. Yes', '2. No', ''].join('\n')
+    expect(parseDialogOptions(text)!.question).toBe('Claude 需要你的输入')
   })
 })
 

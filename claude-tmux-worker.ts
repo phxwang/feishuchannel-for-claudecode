@@ -121,6 +121,69 @@ export function isQuietDone(lastChangeAtMs: number, nowMs: number, quietMs: numb
   return nowMs - lastChangeAtMs >= quietMs
 }
 
+export interface DialogOption { number: string; label: string }
+export interface Dialog { question: string; options: DialogOption[] }
+/**
+ * Given the parsed dialog, resolve with the chosen option's number (as sent
+ * back to the pane), or `DIALOG_ESCAPE_CHOICE` for a caller-side "just press
+ * Escape instead" button (e.g. router.ts adds one to every card so there's
+ * always a safe way out, including for dialogs this code can detect but
+ * can't map to a clean single keystroke). Any other value that doesn't
+ * match a real option is treated as cancelled — see collectReply.
+ */
+export type DialogHandler = (dialog: Dialog) => Promise<number>
+export const DIALOG_ESCAPE_CHOICE = 0
+
+const OPTION_LINE_RE = /^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$/
+const DIVIDER_LINE_RE = /^[\s─╌│]*$/
+
+/**
+ * Detect a Claude Code interactive choice menu (permission prompts, etc.)
+ * in a captured tmux pane, e.g.:
+ *   Do you want to allow Claude to fetch this content?
+ *   ❯ 1. Yes
+ *     2. Yes, and don't ask again for example.com
+ *     3. No, and tell Claude what to do differently (esc)
+ *
+ * Deliberately conservative to avoid mistaking a numbered list inside
+ * Claude's own *finished* reply text for a pending menu:
+ *   - options must be numbered 1..N, consecutive, starting at 1 (a prose
+ *     list numbered e.g. 1/2/4 or starting mid-sequence doesn't count)
+ *   - the option block must be the last non-blank content in the pane —
+ *     a real menu replaces the normal input box/status bar while it's
+ *     showing; a finished reply is always followed by both.
+ * Returns null if no such menu is found.
+ */
+export function parseDialogOptions(paneText: string): Dialog | null {
+  const lines = paneText.split('\n')
+  const options: DialogOption[] = []
+  let firstOptionIdx = -1
+  let lastOptionIdx = -1
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(OPTION_LINE_RE)
+    if (m) {
+      if (firstOptionIdx === -1) firstOptionIdx = i
+      lastOptionIdx = i
+      options.push({ number: m[1], label: m[2].trim() })
+    } else if (firstOptionIdx !== -1) {
+      break  // option block ended
+    }
+  }
+  if (options.length === 0) return null
+  if (!options.every((o, idx) => o.number === String(idx + 1))) return null
+  for (let i = lastOptionIdx + 1; i < lines.length; i++) {
+    if (lines[i].trim() !== '') return null  // something else follows — not the bottom of the screen
+  }
+
+  let question = ''
+  for (let i = firstOptionIdx - 1; i >= 0; i--) {
+    if (lines[i].trim() === '' || DIVIDER_LINE_RE.test(lines[i])) continue
+    question = lines[i].trim()
+    break
+  }
+  return { question: question || 'Claude 需要你的输入', options }
+}
+
 async function runTmux(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   const proc = Bun.spawn(['tmux', ...args], { stdout: 'pipe', stderr: 'pipe' })
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -193,6 +256,8 @@ export interface TmuxClaudeManagerOptions {
   postStopQuietMs?: number
   /** Hard cap on the post-Stop confirmation window. */
   postStopMaxMs?: number
+  /** How long with no transcript growth before checking the pane for a pending interactive dialog (permission prompt, etc.) — shorter than quietMs since this is just "is the CLI blocked on input", not "is the turn over". */
+  dialogCheckMs?: number
 }
 
 export class TmuxClaudeManager {
@@ -204,6 +269,7 @@ export class TmuxClaudeManager {
   private readonly replyTimeoutMs: number
   private readonly postStopQuietMs: number
   private readonly postStopMaxMs: number
+  private readonly dialogCheckMs: number
   /** Workdirs we've confirmed a live tmux session for, to skip a has-session round-trip on every message. */
   private knownAlive = new Set<string>()
   /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost on router restart. */
@@ -222,11 +288,36 @@ export class TmuxClaudeManager {
     this.replyTimeoutMs = opts.replyTimeoutMs ?? 10 * 60 * 1000
     this.postStopQuietMs = opts.postStopQuietMs ?? 800
     this.postStopMaxMs = opts.postStopMaxMs ?? 8_000
+    this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
   }
 
   private async hasSession(name: string): Promise<boolean> {
     const r = await runTmux(['has-session', '-t', name])
     return r.ok
+  }
+
+  private async capturePane(name: string): Promise<string> {
+    const r = await runTmux(['capture-pane', '-p', '-t', name])
+    return r.ok ? r.stdout : ''
+  }
+
+  /** Send a bare Escape keypress — dismisses whatever modal/dialog is currently showing (a `/status`-style panel, a stuck confirmation, etc.), same as a person pressing Esc at the terminal. No-op if there's no live session. */
+  async sendEscape(workdir: string): Promise<void> {
+    const name = sessionNameFor(workdir)
+    if (!(await this.hasSession(name))) return
+    await runTmux(['send-keys', '-t', name, 'Escape'])
+  }
+
+  /** Kill and respawn the session for this workdir — a fresh `claude` process with a new session id (and conversation history, from the CLI's own perspective). */
+  async restartSession(workdir: string, model?: string): Promise<string> {
+    await this.killSession(workdir)
+    return this.ensureSession(workdir, model)
+  }
+
+  /** Select option `number` from a currently-showing dialog (see parseDialogOptions) by typing the digit and pressing Enter — same as a person navigating the menu and confirming. */
+  private async selectDialogOption(name: string, option: DialogOption): Promise<void> {
+    await runTmux(['send-keys', '-t', name, '-l', option.number])
+    await runTmux(['send-keys', '-t', name, 'Enter'])
   }
 
   /**
@@ -306,14 +397,14 @@ export class TmuxClaudeManager {
    * the transcript goes quiet for `quietMs` (or `replyTimeoutMs` elapses).
    * Calls for the same workdir are serialized — see `queues`.
    */
-  async sendAndAwaitReply(workdir: string, text: string, model?: string): Promise<string> {
+  async sendAndAwaitReply(workdir: string, text: string, model?: string, onDialog?: DialogHandler): Promise<string> {
     const previous = this.queues.get(workdir) ?? Promise.resolve()
-    const task = previous.catch(() => {}).then(() => this.doSendAndAwaitReply(workdir, text, model))
+    const task = previous.catch(() => {}).then(() => this.doSendAndAwaitReply(workdir, text, model, onDialog))
     this.queues.set(workdir, task)
     return task
   }
 
-  private async doSendAndAwaitReply(workdir: string, text: string, model?: string): Promise<string> {
+  private async doSendAndAwaitReply(workdir: string, text: string, model?: string, onDialog?: DialogHandler): Promise<string> {
     this.lastUsedAt.set(workdir, Date.now())
     const name = await this.ensureSession(workdir, model)
     const sessionId = this.sessionIds.get(workdir)
@@ -336,7 +427,7 @@ export class TmuxClaudeManager {
     // unexpected failure while waiting for the reply is swallowed and
     // whatever text was collected so far (possibly none) is returned instead.
     try {
-      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs)
+      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog)
     } catch (e) {
       this.dbg(`tmux: error while waiting for ${workdir}'s reply (message was already delivered, not retryable): ${e}`)
       return ''
@@ -346,9 +437,11 @@ export class TmuxClaudeManager {
   private async collectReply(
     workdir: string, sessionId: string | undefined, beforeSendMs: number,
     transcriptBefore: string | null, startOffset: number, signalPath: string | null, baselineStopMs: number,
+    onDialog?: DialogHandler,
   ): Promise<string> {
-    const deadline = beforeSendMs + this.replyTimeoutMs
+    let deadline = beforeSendMs + this.replyTimeoutMs
     let lastChangeMs = Date.now()
+    let lastDialogCheckMs = Date.now()
     let lastSize = startOffset
     let transcriptPath = transcriptBefore
     const collected: string[] = []
@@ -408,6 +501,60 @@ export class TmuxClaudeManager {
       // than quietMs before the tool produces output) would get cut off
       // after just the preamble, well before the real Stop hook fires.
       if (!signalPath && collected.length > 0 && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) break
+
+      // No growth and no Stop — the CLI might just be mid-tool-call with
+      // nothing to write yet, OR it might be blocked on a permission prompt
+      // waiting for a keypress this code never sends. dialogCheckMs is much
+      // shorter than quietMs/replyTimeoutMs specifically to catch the latter
+      // promptly instead of burning the whole reply-timeout on it.
+      if (onDialog && isQuietDone(lastDialogCheckMs, Date.now(), this.dialogCheckMs)) {
+        lastDialogCheckMs = Date.now()
+        const name = sessionNameFor(workdir)
+        const dialog = parseDialogOptions(await this.capturePane(name))
+        if (dialog) {
+          this.dbg(`tmux: ${workdir} is showing a dialog ("${dialog.question}"), asking caller for a choice`)
+          // Keep this workdir looking "in use" for the whole wait — it's
+          // paced by a human clicking a Feishu card, not by anything this
+          // loop controls, so killIdleSessions must not reap the session
+          // out from under an answer that's about to arrive.
+          this.lastUsedAt.set(workdir, Date.now())
+          const chosenNumber = await onDialog(dialog)
+          this.lastUsedAt.set(workdir, Date.now())
+          if (chosenNumber === DIALOG_ESCAPE_CHOICE) {
+            if (await this.hasSession(name)) await runTmux(['send-keys', '-t', name, 'Escape'])
+            deadline = Date.now() + this.replyTimeoutMs
+            lastChangeMs = Date.now()
+            continue
+          }
+          const option = dialog.options.find(o => Number(o.number) === chosenNumber)
+          if (!option) {
+            // No match — either the caller explicitly cancelled (e.g. /restart
+            // or /esc invalidating a stale dialog, see router.ts) or something
+            // genuinely unexpected happened. Either way, guessing an option
+            // (the previous behavior defaulted to options[0], effectively
+            // auto-picking "Yes" on an unanswered permission prompt) is worse
+            // than just giving up on this reply.
+            this.dbg(`tmux: dialog choice for ${workdir} didn't resolve to a real option (cancelled or invalid) — not sending a keystroke`)
+            break
+          }
+          if (!(await this.hasSession(name))) {
+            // The session this dialog belonged to is gone (e.g. restarted
+            // while the card was still pending) — sending the chosen digit
+            // now would hit a different, unrelated session under the same
+            // name. router.ts is expected to have already cancelled this
+            // dialog in that case, but check directly too rather than rely
+            // solely on that.
+            this.dbg(`tmux: ${workdir}'s session is gone by the time a dialog choice came back — not sending a keystroke`)
+            break
+          }
+          await this.selectDialogOption(name, option)
+          // The user's click can take any amount of time — don't let that
+          // count against the reply deadline, and give the chosen action a
+          // fresh window to actually run and produce output.
+          deadline = Date.now() + this.replyTimeoutMs
+          lastChangeMs = Date.now()
+        }
+      }
     }
 
     return collected.join('\n\n')

@@ -11,6 +11,7 @@
  */
 import * as lark from '@larksuiteoapi/node-sdk'
 import { createServer, type Socket } from 'net'
+import { randomBytes } from 'crypto'
 import {
   readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, unlinkSync, existsSync, readdirSync, statSync,
 } from 'fs'
@@ -30,7 +31,7 @@ import { DegradedTracker } from './routing/degraded'
 import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
 import { downloadFeishuResource } from './feishu-download'
 import { decodeBase64DataUri } from './data-uri'
-import { TmuxClaudeManager } from './claude-tmux-worker'
+import { TmuxClaudeManager, DIALOG_ESCAPE_CHOICE, type Dialog } from './claude-tmux-worker'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -476,12 +477,98 @@ function pruneOldTmuxAttachments() {
   if (pruned) dbg(`claude-tmux: pruned ${pruned} old attachment file(s)`)
 }
 
+/** `number: -1` is the "no real choice" sentinel: cancelled (see cancelPendingTmuxDialogs), or timed out waiting for a click. claude-tmux-worker.ts treats any number that doesn't match a real option the same way — give up without sending a keystroke, never guess. */
+const TMUX_DIALOG_CANCELLED = -1
+const TMUX_DIALOG_TIMEOUT_MS = 30 * 60 * 1000
+const TMUX_PENDING_DIALOGS = new Map<string, { workdir: string; resolve: (choice: number) => void }>()
+
+/** Cancel any dialog(s) still awaiting a Feishu click for this workdir — e.g. before `/restart` kills the session the eventual click would otherwise hit, or `/esc` dismisses the CLI's own menu directly instead. Without this, the stale sendAndAwaitReply call for the old dialog would sit in its per-workdir queue forever, blocking every later message to this workdir. */
+function cancelPendingTmuxDialogs(workdir: string) {
+  for (const [code, entry] of TMUX_PENDING_DIALOGS) {
+    if (entry.workdir !== workdir) continue
+    TMUX_PENDING_DIALOGS.delete(code)
+    entry.resolve(TMUX_DIALOG_CANCELLED)
+  }
+}
+
+function buildTmuxDialogCard(dialog: Dialog, code: string): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: '❓ Claude 需要你选择' }, template: 'orange' },
+    body: {
+      elements: [
+        { tag: 'markdown', content: dialog.question },
+        { tag: 'hr' },
+        {
+          tag: 'action',
+          // A fixed "just press Escape instead" button alongside the real
+          // options, since this is a best-effort scrape of a terminal UI —
+          // always leave a safe way out even if none of the parsed options
+          // are actually what the user wants.
+          actions: [
+            ...dialog.options.map(o => ({
+              tag: 'button',
+              text: { tag: 'plain_text', content: `${o.number}. ${o.label}` },
+              type: o.number === '1' ? 'primary' : 'default',
+              value: { code, action: 'tmux_dialog_choice', number: o.number },
+            })),
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '🚪 Esc' },
+              type: 'danger',
+              value: { code, action: 'tmux_dialog_choice', number: String(DIALOG_ESCAPE_CHOICE) },
+            },
+          ],
+        },
+      ],
+    },
+  })
+}
+
+/**
+ * Builds the onDialog callback TmuxClaudeManager calls when a session is
+ * stuck on an interactive menu (permission prompt, etc.) — sends a Feishu
+ * card with one button per option and resolves once handleCardAction routes
+ * a click back here via TMUX_PENDING_DIALOGS. The resulting keypress is sent
+ * by claude-tmux-worker.ts itself; this only has to supply the choice.
+ *
+ * Bounded by TMUX_DIALOG_TIMEOUT_MS: an unanswered card would otherwise
+ * leave sendAndAwaitReply's per-workdir queue stuck forever (every later
+ * message to this workdir piles up behind it) and leak this Map entry for
+ * the life of the process.
+ */
+function makeTmuxDialogHandler(workdir: string, chatId: string, messageId: string) {
+  return async (dialog: Dialog): Promise<number> => {
+    const code = randomBytes(5).toString('hex')
+    dbg(`claude-tmux: dialog detected ("${dialog.question}"), sending choice card ${code}`)
+    try {
+      await (apiClient as any).im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'interactive', content: buildTmuxDialogCard(dialog, code) },
+      })
+    } catch (e) { dbg(`claude-tmux: dialog card send failed: ${e}`) }
+    return new Promise<number>(resolve => {
+      const timer = setTimeout(() => {
+        if (!TMUX_PENDING_DIALOGS.delete(code)) return  // already resolved by a real click
+        dbg(`claude-tmux: dialog ${code} for ${workdir} timed out waiting for a Feishu click`)
+        void replyText(chatId, messageId, '⚠️ 等待选择超时，已取消本次操作，可以重新发送消息。')
+        resolve(TMUX_DIALOG_CANCELLED)
+      }, TMUX_DIALOG_TIMEOUT_MS)
+      TMUX_PENDING_DIALOGS.set(code, {
+        workdir,
+        resolve: (choice) => { clearTimeout(timer); resolve(choice) },
+      })
+    })
+  }
+}
+
 /**
  * Claude via tmux (agent.mode: 'tmux') — delivers the message as literal
  * terminal keystrokes to a persistent `claude` CLI session instead of the
  * socket-worker protocol. See claude-tmux-worker.ts's header comment for
- * the known gaps (no mid-session permission handling, heuristic
- * turn-completion) before relying on this in a group.
+ * the known gaps (heuristic turn-completion, etc.) before relying on this
+ * in a group.
  *
  * Attachments: unlike the socket-worker path, there's no MCP channel plugin
  * loaded for the tmux CLI to call download_attachment with, so the router
@@ -489,8 +576,11 @@ function pruneOldTmuxAttachments() {
  * the CLI reads them with its own Read tool. Files are left in place (not
  * cleaned up after the task) since the CLI may read them later in the
  * conversation, not necessarily during this exact turn.
- */
-/**
+ *
+ * `/esc` and `/restart` are intercepted here as session-management
+ * commands rather than sent into the CLI as chat text — see their own
+ * comments below.
+ *
  * `tmuxClaude.sendAndAwaitReply` throwing is, by contract (see its own
  * doc comment in claude-tmux-worker.ts), always a *pre-delivery* failure —
  * the message never reached the CLI (tmux new-session or send-keys/
@@ -508,6 +598,31 @@ async function handleClaudeTmuxTask(
   const workdir = route.workdir
   const model = route.agent.model
   dbg(`routing ${chatId} → ${workdir} via Claude-tmux`)
+
+  const trimmed = content.trim()
+  if (trimmed === '/esc' || trimmed === '/restart') {
+    // Cancel any dialog this workdir is still awaiting a Feishu click for
+    // *before* acting — otherwise a click that arrives after /restart hits
+    // a brand-new, unrelated session under the same name (sessionNameFor is
+    // deterministic), and after /esc the old sendAndAwaitReply call would
+    // sit forever waiting for a click answering a menu that bare Escape
+    // just dismissed directly, blocking every later message to this workdir.
+    cancelPendingTmuxDialogs(workdir)
+  }
+  if (trimmed === '/esc') {
+    // Manual recovery: a session stuck on a modal (e.g. /status, or any
+    // dialog this code failed to detect) ignores all normal input, so this
+    // bypasses sendAndAwaitReply entirely and sends a bare Escape directly.
+    await tmuxClaude.sendEscape(workdir)
+    void replyText(chatId, messageId, '✅ 已发送 Esc')
+    return
+  }
+  if (trimmed === '/restart') {
+    await tmuxClaude.restartSession(workdir, model)
+    void replyText(chatId, messageId, '✅ Claude Code (tmux) 已重启')
+    return
+  }
+
   let effectiveContent = content
   if (attDownloads.length > 0) {
     const notes: string[] = []
@@ -523,7 +638,7 @@ async function handleClaudeTmuxTask(
     effectiveContent = `${content}\n\n${notes.join('\n')}`
   }
   try {
-    const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, model)
+    const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, model, makeTmuxDialogHandler(workdir, chatId, messageId))
     if (reply) {
       for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
     } else {
@@ -715,6 +830,28 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   const code = value.code as string | undefined
   const action = value.action as string | undefined
   if (!code || !action) return {}
+
+  if (action === 'tmux_dialog_choice') {
+    const entry = TMUX_PENDING_DIALOGS.get(code)
+    const number = Number(value.number)
+    if (!entry || !Number.isFinite(number)) {
+      return { toast: { type: 'warning', content: '⚠️ 该选择已失效或已处理' } }
+    }
+    TMUX_PENDING_DIALOGS.delete(code)
+    entry.resolve(number)
+    const label = number === DIALOG_ESCAPE_CHOICE ? '已发送 Esc' : `已选择第 ${value.number} 项`
+    return {
+      toast: { type: 'success', content: label },
+      card: {
+        type: 'raw',
+        data: {
+          schema: '2.0', config: { wide_screen_mode: true },
+          header: { title: { tag: 'plain_text', content: `❓ Claude 需要你选择 — ${label}` }, template: 'green' },
+          body: { elements: [{ tag: 'hr' }, { tag: 'markdown', content: `**${label}**` }] },
+        },
+      },
+    }
+  }
 
   // Route precisely by the code the issuing worker registered (routing/storage.ts
   // PermissionRegistry). chat_id lookup is a defensive fallback only for the rare
