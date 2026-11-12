@@ -37,6 +37,11 @@ export function openDb(path: string): Database {
       event_id     TEXT PRIMARY KEY,
       processed_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS tmux_sessions (
+      workdir    TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `)
   return db
 }
@@ -147,4 +152,25 @@ export function markEventProcessed(db: Database, eventId: string, now: string): 
 /** Sweep rows older than the cutoff so the table doesn't grow unbounded on a long-running router. Returns rows deleted. */
 export function pruneProcessedEvents(db: Database, olderThanIso: string): number {
   return db.query('DELETE FROM processed_events WHERE processed_at < ?').run(olderThanIso).changes
+}
+
+// ── tmux session-id persistence ──────────────────────────────────────────
+// Lets a router restart reattach to an already-running tmux Claude session's
+// exact transcript file instead of guessing by transcript mtime — see
+// router.ts's tmuxSessionStore for why this matters.
+
+export function getTmuxSessionId(db: Database, workdir: string): string | undefined {
+  const row = db.query('SELECT session_id FROM tmux_sessions WHERE workdir = ?').get(workdir) as any
+  return row?.session_id
+}
+
+export function setTmuxSessionId(db: Database, workdir: string, sessionId: string, now: string): void {
+  db.query(`
+    INSERT INTO tmux_sessions (workdir, session_id, updated_at) VALUES ($workdir, $sessionId, $now)
+    ON CONFLICT(workdir) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at
+  `).run({ $workdir: workdir, $sessionId: sessionId, $now: now })
+}
+
+export function deleteTmuxSessionId(db: Database, workdir: string): void {
+  db.query('DELETE FROM tmux_sessions WHERE workdir = ?').run(workdir)
 }

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone,
-  parseAssistantTextLines, parseDialogOptions, parseTabBar, rightPressesToReach, sessionNameFor, stopSignalPathFor, stripAnsi,
+  parseAssistantTextLines, parseDialogOptions, parseProgressLines, parseTabBar, rightPressesToReach, sessionNameFor, stopSignalPathFor, stripAnsi,
 } from './claude-tmux-worker'
 
 describe('sessionNameFor', () => {
@@ -13,6 +13,57 @@ describe('sessionNameFor', () => {
   })
   test('is a valid tmux session name (no slashes/spaces)', () => {
     expect(sessionNameFor('/Users/x/Projects/foo')).toMatch(/^feishu-claude-[a-f0-9]{10}$/)
+  })
+})
+
+describe('parseProgressLines', () => {
+  test('extracts tool name and a short input summary', () => {
+    const lines = [JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls -la' } }] },
+    })]
+    expect(parseProgressLines(lines)).toEqual([{ tool: 'Bash', summary: 'ls -la' }])
+  })
+
+  test('tries fields in priority order and falls back to empty summary', () => {
+    const withPath = parseProgressLines([JSON.stringify({
+      type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/a.ts' } }] },
+    })])
+    expect(withPath).toEqual([{ tool: 'Read', summary: '/a.ts' }])
+
+    const noMatchingField = parseProgressLines([JSON.stringify({
+      type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Mystery', input: { foo: 'bar' } }] },
+    })])
+    expect(noMatchingField).toEqual([{ tool: 'Mystery', summary: '' }])
+  })
+
+  test('truncates a long summary field', () => {
+    const long = 'x'.repeat(200)
+    const out = parseProgressLines([JSON.stringify({
+      type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: long } }] },
+    })])
+    expect(out[0].summary.length).toBe(81) // 80 chars + the truncation ellipsis
+    expect(out[0].summary.endsWith('…')).toBe(true)
+  })
+
+  test('collects multiple tool_use blocks from the same turn', () => {
+    const lines = [JSON.stringify({
+      type: 'assistant',
+      message: { content: [
+        { type: 'text', text: 'checking files' },
+        { type: 'tool_use', name: 'Read', input: { file_path: '/a.ts' } },
+        { type: 'tool_use', name: 'Read', input: { file_path: '/b.ts' } },
+      ] },
+    })]
+    expect(parseProgressLines(lines)).toEqual([
+      { tool: 'Read', summary: '/a.ts' },
+      { tool: 'Read', summary: '/b.ts' },
+    ])
+  })
+
+  test('ignores non-assistant lines and malformed JSON without throwing', () => {
+    const lines = ['{not json', JSON.stringify({ type: 'user', message: { content: 'hi' } })]
+    expect(parseProgressLines(lines)).toEqual([])
   })
 })
 
@@ -286,6 +337,39 @@ describe('parseDialogOptions', () => {
       '  ⏸ manual mode on · ? for shortcuts',
     ].join('\n')
     expect(parseDialogOptions(finishedReply)).toBeNull()
+  })
+
+  // Captured verbatim (2026-11-12) from a real multi-question
+  // AskUserQuestion dialog — reported live as "no card" because each
+  // option's wrapped description line broke the scan right after option 1.
+  const realAskUserQuestionDialog = [
+    '⏺ Wheel 的标的池是外部文件，每次触发重新读取。summary',
+    '────────────────────────────────────────────────────────────',
+    '←  ☒ 打分截面  ☐ 移出标的池  ✔ Submit  →',
+    '',
+    '标的池文件里删掉某只股票后，账户里已持有的这只股票怎么处理？',
+    '',
+    '❯ 1. 下次调仓卖出 (Recommended)',
+    '     移出标的池的持仓在下一次周度调仓时目标权重归零并卖出，账户里只保留标的池内的股票。',
+    '  2. 不加仓，按原规则持有',
+    '     移出后不再买入，但只要模型排名仍在保留区间内就继续持有，跌出保留区间才卖。',
+    '  3. Type something.',
+    '────────────────────────────────────────────────────────────',
+    '  4. Chat about this',
+    '',
+    'Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
+  ].join('\n')
+
+  test('tolerates a multi-question AskUserQuestion dialog with wrapped option descriptions', () => {
+    const dialog = parseDialogOptions(realAskUserQuestionDialog)
+    expect(dialog).not.toBeNull()
+    expect(dialog!.question).toBe('标的池文件里删掉某只股票后，账户里已持有的这只股票怎么处理？')
+    expect(dialog!.options).toEqual([
+      { number: '1', label: '下次调仓卖出 (Recommended)' },
+      { number: '2', label: '不加仓，按原规则持有' },
+      { number: '3', label: 'Type something.' },
+      { number: '4', label: 'Chat about this' },
+    ])
   })
 })
 
