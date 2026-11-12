@@ -391,6 +391,16 @@ export interface TmuxClaudeManagerOptions {
    * too would screenshot the chat on nearly every ordinary reply.
    */
   stuckPaneCheckMs?: number
+  /**
+   * Minimum gap between successive onStuckPane screenshots within the same
+   * sendAndAwaitReply call. Without this, a task that legitimately runs for
+   * many minutes (several tool calls, each separated by a quiet gap over
+   * stuckPaneCheckMs) would get a screenshot every single time — reported
+   * live as "too frequent" for long-running tasks. The cooldown is tracked
+   * independently of transcript growth, so it still caps the rate even
+   * across multiple distinct stuck episodes in one long reply.
+   */
+  stuckPaneCooldownMs?: number
 }
 
 export class TmuxClaudeManager {
@@ -404,6 +414,7 @@ export class TmuxClaudeManager {
   private readonly postStopMaxMs: number
   private readonly dialogCheckMs: number
   private readonly stuckPaneCheckMs: number
+  private readonly stuckPaneCooldownMs: number
   /** Workdirs we've confirmed a live tmux session for, to skip a has-session round-trip on every message. */
   private knownAlive = new Set<string>()
   /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost on router restart. */
@@ -423,7 +434,8 @@ export class TmuxClaudeManager {
     this.postStopQuietMs = opts.postStopQuietMs ?? 800
     this.postStopMaxMs = opts.postStopMaxMs ?? 8_000
     this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
-    this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 20_000
+    this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 90_000
+    this.stuckPaneCooldownMs = opts.stuckPaneCooldownMs ?? 5 * 60_000
   }
 
   private async hasSession(name: string): Promise<boolean> {
@@ -625,7 +637,9 @@ export class TmuxClaudeManager {
     let deadline = beforeSendMs + this.replyTimeoutMs
     let lastChangeMs = Date.now()
     let lastDialogCheckMs = Date.now()
-    let stuckPaneNotified = false
+    // 0, not Date.now(), so the very first stuck episode of this call is
+    // never suppressed by the cooldown (Date.now() - 0 is always >= it).
+    let lastStuckNotifyMs = 0
     let lastSize = startOffset
     let transcriptPath = transcriptBefore
     const collected: string[] = []
@@ -653,7 +667,6 @@ export class TmuxClaudeManager {
       collected.push(...parseAssistantTextLines(completeChunk.toString('utf8').split('\n')))
       lastSize += completeChunk.length
       lastChangeMs = Date.now()
-      stuckPaneNotified = false  // real progress — any earlier "stuck" episode is over
       return true
     }
 
@@ -811,13 +824,19 @@ export class TmuxClaudeManager {
           // fresh window to actually run and produce output.
           deadline = Date.now() + this.replyTimeoutMs
           lastChangeMs = Date.now()
-        } else if (onStuckPane && !stuckPaneNotified && isQuietDone(lastChangeMs, Date.now(), this.stuckPaneCheckMs)) {
+        } else if (
+          onStuckPane &&
+          isQuietDone(lastChangeMs, Date.now(), this.stuckPaneCheckMs) &&
+          isQuietDone(lastStuckNotifyMs, Date.now(), this.stuckPaneCooldownMs)
+        ) {
           // Not a dialog we know how to act on (or no onDialog configured at
-          // all) — just hand the raw pane to the caller once per stuck
-          // episode. Purely informational: this code doesn't wait for or
-          // act on anything afterward, so it can't deadlock the way an
-          // unanswered dialog could.
-          stuckPaneNotified = true
+          // all) — just hand the raw pane to the caller, rate-limited by
+          // stuckPaneCooldownMs so a long task with several genuine stuck
+          // episodes doesn't get a screenshot for every single one.
+          // Purely informational: this code doesn't wait for or act on
+          // anything afterward, so it can't deadlock the way an unanswered
+          // dialog could.
+          lastStuckNotifyMs = Date.now()
           try { await onStuckPane(rawPane) } catch (e) { this.dbg(`tmux: onStuckPane failed for ${workdir}: ${e}`) }
         }
       }
