@@ -242,6 +242,14 @@ export interface SendAndAwaitReplyOptions {
   onStuckPane?: StuckPaneHandler
   onTabSwitched?: TabSwitchedHandler
   onProgress?: ProgressHandler
+  /**
+   * Called synchronously, before delivery, if this call is being absorbed
+   * into an already-in-flight turn for the same workdir instead of starting
+   * its own — see `sendAndAwaitReply`. The caller can use this to finalize
+   * its own status card without a duplicate reply, since the in-flight
+   * call's eventual result already answers this message too.
+   */
+  onAbsorbed?: () => void
 }
 
 const OPTION_LINE_RE = /^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$/
@@ -479,8 +487,8 @@ export class TmuxClaudeManager {
   private knownAlive = new Set<string>()
   /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost from memory on router restart, but recovered from `persistence` (if configured) the next time ensureSession reattaches to an already-live session. */
   private sessionIds = new Map<string, string>()
-  /** workdir -> tail of the in-flight sendAndAwaitReply call, so a second message for the same workdir queues instead of racing the first one on the same tmux pane/transcript. */
-  private queues = new Map<string, Promise<unknown>>()
+  /** workdir -> the in-flight sendAndAwaitReply call, if any, so a second message for the same workdir gets absorbed into it instead of racing it with a second collectReply loop on the same tmux pane/transcript. Deleted once the call settles. */
+  private queues = new Map<string, Promise<string>>()
   /** workdir -> last time a message was sent to it, for killIdleSessions(). */
   private lastUsedAt = new Map<string, number>()
 
@@ -662,12 +670,28 @@ export class TmuxClaudeManager {
    * Deliver a message to the workdir's Claude session and wait for its reply.
    * Returns the concatenation of every assistant text turn produced before
    * the transcript goes quiet for `quietMs` (or `replyTimeoutMs` elapses).
-   * Calls for the same workdir are serialized — see `queues`.
+   *
+   * A message for a workdir that already has a reply in flight is NOT
+   * queued to start its own turn after the first one finishes. Verified by
+   * testing: Claude Code's own CLI absorbs a message typed while it's still
+   * working into the *current* turn (surfaced to the model as a "user sent
+   * a new message while you were working" system-reminder, same mechanism
+   * a real interactive user typing mid-stream gets), rather than queuing it
+   * as a separate next turn — so queuing it ourselves and sending it only
+   * after the first turn ends would just delay delivery for no benefit.
+   * Instead, send it straight into the pane now and resolve to the in-flight
+   * call's eventual result, which already covers this message too.
    */
   async sendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions = {}): Promise<string> {
-    const previous = this.queues.get(workdir) ?? Promise.resolve()
-    const task = previous.catch(() => {}).then(() => this.doSendAndAwaitReply(workdir, text, opts))
+    const inFlight = this.queues.get(workdir)
+    if (inFlight) {
+      opts.onAbsorbed?.()
+      await this.sendKeys(sessionNameFor(workdir), text)
+      return inFlight
+    }
+    const task = this.doSendAndAwaitReply(workdir, text, opts)
     this.queues.set(workdir, task)
+    task.finally(() => { if (this.queues.get(workdir) === task) this.queues.delete(workdir) })
     return task
   }
 

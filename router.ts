@@ -822,6 +822,7 @@ async function handleClaudeTmuxTask(
     effectiveContent = `${content}\n\n${notes.join('\n')}`
   }
   const statusCard = makeStatusCardController(chatId, workdir)
+  let absorbed = false
   try {
     const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, {
       model,
@@ -829,7 +830,17 @@ async function handleClaudeTmuxTask(
       onStuckPane: makeStuckPaneHandler(chatId),
       onTabSwitched: makeTabSwitchedHandler(chatId),
       onProgress: statusCard.onProgress,
+      // This message arrived while a reply for the same workdir was still
+      // in flight — Claude Code absorbs it into that turn itself (see
+      // sendAndAwaitReply's doc comment), so the in-flight call's result
+      // already answers this message too; don't send it again as a
+      // separate reply here.
+      onAbsorbed: () => { absorbed = true },
     })
+    if (absorbed) {
+      await statusCard.finalize('↪️ 已并入上一条消息的回复')
+      return
+    }
     if (reply) {
       await statusCard.finalize('✅ 已回复')
       for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
