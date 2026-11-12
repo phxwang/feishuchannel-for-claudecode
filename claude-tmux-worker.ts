@@ -424,8 +424,6 @@ export interface TmuxClaudeManagerOptions {
   replyTimeoutMs?: number
   /** After the Stop hook fires, how long to keep confirming the transcript has gone quiet before trusting it's really done. */
   postStopQuietMs?: number
-  /** Hard cap on the post-Stop confirmation window. */
-  postStopMaxMs?: number
   /** How long with no transcript growth before checking the pane for a pending interactive dialog (permission prompt, etc.) — shorter than quietMs since this is just "is the CLI blocked on input", not "is the turn over". */
   dialogCheckMs?: number
   /**
@@ -473,7 +471,6 @@ export class TmuxClaudeManager {
   private readonly quietMs: number
   private readonly replyTimeoutMs: number
   private readonly postStopQuietMs: number
-  private readonly postStopMaxMs: number
   private readonly dialogCheckMs: number
   private readonly stuckPaneCheckMs: number
   private readonly stuckPaneCooldownMs: number
@@ -495,7 +492,6 @@ export class TmuxClaudeManager {
     this.quietMs = opts.quietMs ?? 2_500
     this.replyTimeoutMs = opts.replyTimeoutMs ?? 10 * 60 * 1000
     this.postStopQuietMs = opts.postStopQuietMs ?? 800
-    this.postStopMaxMs = opts.postStopMaxMs ?? 8_000
     this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
     this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 90_000
     this.stuckPaneCooldownMs = opts.stuckPaneCooldownMs ?? 5 * 60_000
@@ -763,10 +759,14 @@ export class TmuxClaudeManager {
         // growth" on the *next* call instead of this one, especially when
         // other Stop hooks in the same chain are still running. So instead
         // of trusting one delayed read, keep reading until growth itself
-        // goes quiet for a (short) beat, capped at POST_STOP_MAX_MS.
-        const postStopDeadline = Date.now() + this.postStopMaxMs
+        // goes quiet for a (short) beat. Deliberately uncapped beyond that
+        // (other than the outer replyTimeoutMs via `deadline`): a turn can
+        // keep writing to the transcript well past its own Stop hook (a
+        // lingering background bash task, a subagent still finishing up),
+        // and a short fixed cap here would stop forwarding that activity to
+        // onProgress/the status card even though the CLI is still working.
         let lastGrowthMs = Date.now()
-        while (Date.now() < postStopDeadline) {
+        while (Date.now() < deadline) {
           await new Promise(r => setTimeout(r, 300))
           if (readGrowth()) { lastGrowthMs = Date.now(); continue }
           if (isQuietDone(lastGrowthMs, Date.now(), this.postStopQuietMs)) break
