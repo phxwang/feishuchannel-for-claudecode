@@ -872,17 +872,18 @@ async function handleClaudeTmuxTask(
     return statusCard
   }
   let absorbed = false
-  // One card per background-continuation round, not one card updated in
-  // place across all of them: each round that produces new text closes its
-  // own card and, if there's still more to wait for, opens a fresh one for
-  // the next round — see onBackgroundFollowup below. null between rounds
-  // (including before the first one starts).
-  let followupCard: ReturnType<typeof makeStatusCardController> | null = null
-  // Serializes the async work each onBackgroundFollowup call does (closing
-  // the previous round's card, sending its text, opening the next card) so
-  // two calls can't interleave their Feishu calls out of order if a round
-  // ever resolves unusually fast.
-  let followupChain: Promise<void> = Promise.resolve()
+  // True once at least one chunk has gone out via onTextChunk, so the final
+  // "nothing came of this" warning (below) isn't shown for a message that
+  // actually did produce text — just not through the no-longer-used `reply`
+  // return value, since every chunk is now sent live as it's written
+  // instead of being batched until the whole call finishes.
+  let anyTextSent = false
+  // Serializes the replyText calls onTextChunk makes so two chunks arriving
+  // close together can't have their Feishu sends race and land out of
+  // order (each is awaited individually inside an async call, so without
+  // this a slower chunk-N request completing after a faster chunk-N+1 one
+  // would reorder them in the chat).
+  let sendChain: Promise<void> = Promise.resolve()
   try {
     const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, {
       model,
@@ -896,29 +897,27 @@ async function handleClaudeTmuxTask(
       // already answers this message too; don't send it again as a
       // separate reply here.
       onAbsorbed: () => { absorbed = true },
-      onBackgroundFollowup: (update) => {
-        followupChain = followupChain.then(async () => {
-          // Close out whatever round the previous card represented before
-          // doing anything else, so chat order always matches round order.
-          if (followupCard) {
-            const closingLine = update.done
-              ? (update.giveUp ? '⚠️ 超过等待上限，不再跟踪（后台任务可能仍在运行）' : '✅ 全部完成')
-              : update.extraText ? '↪️ 本轮已产出新回复' : '⏳ 本轮没有新文本，继续等待'
-            await followupCard.finalize(closingLine)
-          }
-          if (update.extraText) for (const chunk of chunkText(update.extraText, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
-          followupCard = update.done ? null : makeStatusCardController(chatId, workdir)
-          followupCard?.onProgress([{ tool: '⏳ 后台任务', summary: `还有 ${update.runningShells} 个在跑` }])
+      // Forwarded the moment it's written to the transcript, independent of
+      // Stop/turn boundaries — see TextChunkHandler's doc comment. Not
+      // gated on `absorbed`: an absorbed message's text is the same ongoing
+      // conversation's text, so it still belongs in the chat.
+      onTextChunk: (text) => {
+        anyTextSent = true
+        sendChain = sendChain.then(async () => {
+          for (const chunk of chunkText(text, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
         }).catch(e => {
-          // Not rethrown/propagated: this chain is fire-and-forget from
-          // handleClaudeTmuxTask's perspective (never awaited), so letting a
-          // rejection escape here would be a silent unhandled rejection
-          // instead of the dbg-logged failure every other path in this
-          // function gets.
-          dbg(`claude-tmux: background-followup card update for ${workdir} failed: ${e}`)
+          // Fire-and-forget from this function's perspective (sendChain is
+          // never awaited below) — logged here instead of becoming a
+          // silent unhandled rejection.
+          dbg(`claude-tmux: text-chunk send for ${workdir} failed: ${e}`)
         })
       },
     })
+    // sendAndAwaitReply resolving only means collectReply itself is done —
+    // onTextChunk's own sends onto sendChain are scheduled, not awaited, so
+    // without this the status card could finalize (or this function could
+    // return) while the last chunk(s) are still in flight.
+    await sendChain
     if (absorbed) {
       if (statusCard) await statusCard.finalize('↪️ 已并入上一条消息的回复')
       else void replyText(chatId, messageId, '↪️ 已并入上一条消息的回复')
@@ -931,14 +930,17 @@ async function handleClaudeTmuxTask(
     // card created here goes straight to its final state with no ticks to
     // show for it.
     statusCard = ensureStatusCard()
-    if (reply) {
+    if (anyTextSent || reply) {
       await statusCard.finalize('✅ 已回复')
-      for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
     } else {
       await statusCard.finalize('⚠️ 未产生文本回复')
       dbg(`claude-tmux: ${workdir} produced no text reply for ${messageId}`)
     }
   } catch (e) {
+    // Same as the try block above — any chunk sent before the failure
+    // should land before whatever this catch sends next. sendChain's own
+    // internal .catch means awaiting it here never throws.
+    await sendChain
     // This message was absorbed into the in-flight call (onAbsorbed already
     // fired above) and that same call is what just threw — the primary
     // message's own catch handles the failure (error reply, OpenCode
