@@ -280,6 +280,17 @@ export function stripAnsi(text: string): string {
  *   - the option block must be the last non-blank content in the pane —
  *     a real menu replaces the normal input box/status bar while it's
  *     showing; a finished reply is always followed by both.
+ * Tolerates a wrapped description line under an option (indented prose,
+ * no leading digit), a divider, or a blank separator between options —
+ * found live on Claude's own multi-question AskUserQuestion dialogs,
+ * which interleave these between numbered options instead of keeping
+ * them in one tight block; without this the scan stopped at the first
+ * option's description and the whole dialog went unrecognized (no Feishu
+ * card at all). Only tolerated when a further option continuing the
+ * sequence actually follows, though — otherwise this is just ordinary
+ * content trailing a *finished* numbered list (quoted text, a nested
+ * bullet, a code block), which still has to clear the "last content in
+ * the pane" check below like before.
  * Returns null if no such menu is found.
  */
 export function parseDialogOptions(paneText: string): Dialog | null {
@@ -293,9 +304,20 @@ export function parseDialogOptions(paneText: string): Dialog | null {
       if (firstOptionIdx === -1) firstOptionIdx = i
       lastOptionIdx = i
       options.push({ number: m[1], label: m[2].trim() })
-    } else if (firstOptionIdx !== -1) {
-      break  // option block ended
+      continue
     }
+    if (firstOptionIdx === -1) continue  // option block hasn't started yet
+    // Tolerate this filler line only if the *nearest* upcoming option-shaped
+    // line (not just any later line) continues the sequence — bounded to
+    // "the next thing that looks like an option" rather than scanning
+    // arbitrarily far into the rest of the pane, which could otherwise
+    // match unrelated later content (e.g. a numbered sentence in prose
+    // after the dialog has already closed) and wrongly swallow real
+    // trailing content as if it were still part of this block.
+    const nextNumber = String(options.length + 1)
+    const nextOptionLine = lines.slice(i + 1).find(l => OPTION_LINE_RE.test(l))
+    if (nextOptionLine && nextOptionLine.match(OPTION_LINE_RE)![1] === nextNumber) continue
+    break  // option block ended
   }
   if (options.length === 0) return null
   if (!options.every((o, idx) => o.number === String(idx + 1))) return null
@@ -568,6 +590,23 @@ export class TmuxClaudeManager {
     const name = sessionNameFor(workdir)
     if (!(await this.hasSession(name))) return
     await runTmux(['send-keys', '-t', name, 'Escape'])
+  }
+
+  /**
+   * Manual fallback for `/select <n>`: type the digit and press Enter,
+   * same as clicking option `n` on a Feishu dialog card — for when a
+   * pending dialog's layout isn't one `parseDialogOptions`/`parseTabBar`
+   * recognizes yet, so no card ever got sent, but the dialog is still
+   * genuinely there and a plain numbered selection is enough to answer it.
+   * Returns false (without sending anything) if there's no live session,
+   * so the caller can tell the user it didn't actually do anything instead
+   * of reporting a false success.
+   */
+  async selectOption(workdir: string, number: string): Promise<boolean> {
+    const name = sessionNameFor(workdir)
+    if (!(await this.hasSession(name))) return false
+    await this.selectDialogOption(name, { number, label: '' })
+    return true
   }
 
   /** Kill and respawn the session for this workdir — a fresh `claude` process with a new session id (and conversation history, from the CLI's own perspective). */

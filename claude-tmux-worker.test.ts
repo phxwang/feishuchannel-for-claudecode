@@ -338,6 +338,39 @@ describe('parseDialogOptions', () => {
     ].join('\n')
     expect(parseDialogOptions(finishedReply)).toBeNull()
   })
+
+  // Captured verbatim (2026-11-12) from a real multi-question
+  // AskUserQuestion dialog — reported live as "no card" because each
+  // option's wrapped description line broke the scan right after option 1.
+  const realAskUserQuestionDialog = [
+    '⏺ Wheel 的标的池是外部文件，每次触发重新读取。summary',
+    '────────────────────────────────────────────────────────────',
+    '←  ☒ 打分截面  ☐ 移出标的池  ✔ Submit  →',
+    '',
+    '标的池文件里删掉某只股票后，账户里已持有的这只股票怎么处理？',
+    '',
+    '❯ 1. 下次调仓卖出 (Recommended)',
+    '     移出标的池的持仓在下一次周度调仓时目标权重归零并卖出，账户里只保留标的池内的股票。',
+    '  2. 不加仓，按原规则持有',
+    '     移出后不再买入，但只要模型排名仍在保留区间内就继续持有，跌出保留区间才卖。',
+    '  3. Type something.',
+    '────────────────────────────────────────────────────────────',
+    '  4. Chat about this',
+    '',
+    'Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
+  ].join('\n')
+
+  test('tolerates a multi-question AskUserQuestion dialog with wrapped option descriptions', () => {
+    const dialog = parseDialogOptions(realAskUserQuestionDialog)
+    expect(dialog).not.toBeNull()
+    expect(dialog!.question).toBe('标的池文件里删掉某只股票后，账户里已持有的这只股票怎么处理？')
+    expect(dialog!.options).toEqual([
+      { number: '1', label: '下次调仓卖出 (Recommended)' },
+      { number: '2', label: '不加仓，按原规则持有' },
+      { number: '3', label: 'Type something.' },
+      { number: '4', label: 'Chat about this' },
+    ])
+  })
 })
 
 describe('parseTabBar', () => {

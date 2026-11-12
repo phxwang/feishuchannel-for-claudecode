@@ -784,13 +784,15 @@ async function handleClaudeTmuxTask(
   dbg(`routing ${chatId} → ${workdir} via Claude-tmux`)
 
   const trimmed = content.trim()
-  if (trimmed === '/esc' || trimmed === '/restart') {
+  const selectMatch = trimmed.match(/^\/select\s+(\d+)$/)
+  if (trimmed === '/esc' || trimmed === '/restart' || selectMatch) {
     // Cancel any dialog this workdir is still awaiting a Feishu click for
     // *before* acting — otherwise a click that arrives after /restart hits
     // a brand-new, unrelated session under the same name (sessionNameFor is
-    // deterministic), and after /esc the old sendAndAwaitReply call would
-    // sit forever waiting for a click answering a menu that bare Escape
-    // just dismissed directly, blocking every later message to this workdir.
+    // deterministic), and after /esc or /select the old sendAndAwaitReply
+    // call would sit forever waiting for a click answering a menu that's
+    // already been dismissed/answered directly, blocking every later
+    // message to this workdir.
     cancelPendingTmuxDialogs(workdir)
   }
   if (trimmed === '/esc') {
@@ -804,6 +806,15 @@ async function handleClaudeTmuxTask(
   if (trimmed === '/restart') {
     await tmuxClaude.restartSession(workdir, model)
     void replyText(chatId, messageId, '✅ Claude Code (tmux) 已重启')
+    return
+  }
+  if (selectMatch) {
+    // Manual fallback for a dialog whose layout parseDialogOptions/
+    // parseTabBar doesn't recognize yet, so no Feishu card ever got sent —
+    // types the option number and presses Enter directly, same as clicking
+    // option N on a card would have.
+    const sent = await tmuxClaude.selectOption(workdir, selectMatch[1])
+    void replyText(chatId, messageId, sent ? `✅ 已选择选项 ${selectMatch[1]}` : '⚠️ 没有存活的会话，未发送')
     return
   }
 
