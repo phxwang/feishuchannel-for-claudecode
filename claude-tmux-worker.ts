@@ -117,7 +117,7 @@ function extractLocalCommandOutput(value: unknown): string | null {
  * model is already set just prints "Kept model as X") — found live that
  * this never produces a real assistant turn or a Stop-hook signal at all,
  * so without this, sendAndAwaitReply would sit polling for the full
- * replyTimeoutMs (60 minutes by default) even though the CLI already
+ * replyTimeoutMs (8 hours by default) even though the CLI already
  * answered on screen. This is recorded in the transcript as either a
  * `type: 'system', subtype: 'local_command'` line (content at the top
  * level) or, in an older/different CLI build, a `type: 'user'` line
@@ -557,12 +557,12 @@ export class TmuxClaudeManager {
     this.rows = opts.rows ?? 50
     this.startupTimeoutMs = opts.startupTimeoutMs ?? 20_000
     this.quietMs = opts.quietMs ?? 2_500
-    // Raised from 10 to 60 minutes (2026-11-12): a single long-running tool
+    // Raised 10min -> 60min -> 8h (2026-11-12): a single long-running tool
     // call, or a chain of self-continued turns watched by
-    // watchBackgroundContinuation, can legitimately take much longer than 10
-    // minutes — this is now a last-resort ceiling against a genuinely stuck
-    // session, not the expected wait time for an ordinary reply.
-    this.replyTimeoutMs = opts.replyTimeoutMs ?? 60 * 60 * 1000
+    // watchBackgroundContinuation, can legitimately run for hours — this is
+    // a last-resort ceiling against a genuinely stuck session, not the
+    // expected wait time for an ordinary reply.
+    this.replyTimeoutMs = opts.replyTimeoutMs ?? 8 * 60 * 60 * 1000
     this.postStopQuietMs = opts.postStopQuietMs ?? 800
     this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
     this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 90_000
