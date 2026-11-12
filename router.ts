@@ -32,7 +32,7 @@ import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
 import { downloadFeishuResource } from './feishu-download'
 import { renderPaneScreenshot } from './pane-screenshot'
 import { decodeBase64DataUri } from './data-uri'
-import { TmuxClaudeManager, DIALOG_ESCAPE_CHOICE, DIALOG_TIMED_OUT_CHOICE, type Dialog } from './claude-tmux-worker'
+import { TmuxClaudeManager, DIALOG_ESCAPE_CHOICE, DIALOG_TIMED_OUT_CHOICE, type Dialog, type ProgressEvent } from './claude-tmux-worker'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -505,6 +505,14 @@ function cancelPendingTmuxDialogs(workdir: string) {
   }
 }
 
+/** True while a permission/tab-switch dialog card is still awaiting a click for this workdir — the "thinking…" status card must not patch itself while one of those is up, both because the CLI isn't actually making progress (it's blocked on the user) and to avoid two unrelated cards fighting for the chat's attention at once. */
+function hasPendingDialogFor(workdir: string): boolean {
+  for (const entry of TMUX_PENDING_DIALOGS.values()) {
+    if (entry.workdir === workdir) return true
+  }
+  return false
+}
+
 function buildTmuxDialogCard(dialog: Dialog, code: string): string {
   return JSON.stringify({
     schema: '2.0',
@@ -630,6 +638,96 @@ function makeTabSwitchedHandler(chatId: string) {
   return (paneAnsiText: string) => sendPaneScreenshot(chatId, paneAnsiText, 'claude-tmux: tab-switched')
 }
 
+/** Must carry `config.update_multi: true` — without it, `im.message.patch` below rejects the update entirely (that flag is the opt-in that allows a card already delivered to a chat to be edited in place at all). */
+function buildStatusCard(line: string): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true },
+    header: { title: { tag: 'plain_text', content: 'Claude' }, template: 'blue' },
+    body: { elements: [{ tag: 'markdown', content: line }] },
+  })
+}
+
+async function patchStatusCard(messageId: string, line: string, dbgTag: string): Promise<void> {
+  try {
+    await (apiClient as any).im.message.patch({
+      path: { message_id: messageId },
+      data: { content: buildStatusCard(line) },
+    })
+  } catch (e) { dbg(`${dbgTag}: status card patch failed: ${describeApiError(e)}`) }
+}
+
+const STATUS_CARD_PATCH_COOLDOWN_MS = 1_500
+
+/**
+ * Creates a "🤔 思考中…" card for one claude-tmux task and returns a
+ * controller claude-tmux-worker.ts's `onProgress` feeds tool_use events
+ * into, plus `finalize()` to call once the task is done.
+ *
+ * Patches are throttled to at most one every STATUS_CARD_PATCH_COOLDOWN_MS:
+ * onProgress can fire on every ~400ms transcript poll, far more often than
+ * Feishu needs to see (patch is rate-limited server-side too) — each patch
+ * always carries the *latest* known line, never a queued backlog, since
+ * only the current state is worth showing.
+ *
+ * Paused entirely while a permission/tab-switch dialog card is pending for
+ * this workdir (see hasPendingDialogFor): the CLI isn't making progress
+ * then, it's blocked on the user, and that dialog card is already the
+ * thing asking for their attention — two unrelated cards fighting for the
+ * same chat's focus would be worse than just staying quiet.
+ */
+function makeStatusCardController(chatId: string, workdir: string) {
+  let messageId: string | null = null
+  let latestLine = '🤔 思考中…'
+  let lastPatchMs = 0
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null
+  let finalized = false
+
+  const ready: Promise<string | null> = (async () => {
+    try {
+      const r = await (apiClient as any).im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'interactive', content: buildStatusCard(latestLine) },
+      })
+      return r?.data?.message_id ?? r?.message_id ?? null
+    } catch (e) {
+      dbg(`claude-tmux: status card create failed: ${describeApiError(e)}`)
+      return null
+    }
+  })().then(id => { messageId = id; return id })
+
+  async function flush() {
+    if (finalized) return
+    await ready
+    if (!messageId || hasPendingDialogFor(workdir)) return
+    lastPatchMs = Date.now()
+    await patchStatusCard(messageId, latestLine, 'claude-tmux: status card')
+  }
+
+  function scheduleFlush() {
+    if (pendingTimer || finalized) return
+    const wait = Math.max(0, lastPatchMs + STATUS_CARD_PATCH_COOLDOWN_MS - Date.now())
+    pendingTimer = setTimeout(() => { pendingTimer = null; void flush() }, wait)
+  }
+
+  return {
+    onProgress(events: ProgressEvent[]) {
+      if (finalized || !events.length || hasPendingDialogFor(workdir)) return
+      const last = events[events.length - 1]
+      latestLine = last.summary ? `🔧 ${last.tool}: ${last.summary}` : `🔧 ${last.tool}`
+      if (Date.now() - lastPatchMs >= STATUS_CARD_PATCH_COOLDOWN_MS) void flush()
+      else scheduleFlush()
+    },
+    async finalize(line: string) {
+      finalized = true
+      if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null }
+      const id = await ready
+      if (!id) return
+      await patchStatusCard(id, line, 'claude-tmux: status card')
+    },
+  }
+}
+
 /**
  * Claude via tmux (agent.mode: 'tmux') — delivers the message as literal
  * terminal keystrokes to a persistent `claude` CLI session instead of the
@@ -704,25 +802,34 @@ async function handleClaudeTmuxTask(
     }
     effectiveContent = `${content}\n\n${notes.join('\n')}`
   }
+  const statusCard = makeStatusCardController(chatId, workdir)
   try {
     const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, {
       model,
       onDialog: makeTmuxDialogHandler(workdir, chatId, messageId),
       onStuckPane: makeStuckPaneHandler(chatId),
       onTabSwitched: makeTabSwitchedHandler(chatId),
+      onProgress: statusCard.onProgress,
     })
     if (reply) {
+      await statusCard.finalize('✅ 已回复')
       for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
     } else {
+      await statusCard.finalize('⚠️ 未产生文本回复')
       dbg(`claude-tmux: ${workdir} produced no text reply for ${messageId}`)
     }
   } catch (e) {
     if (route.agent.fallback === 'opencode' && infraConfig?.fallback.enabled && openCodeAdapter) {
+      // Don't finalize as "failed" here — OpenCode is about to take over and
+      // may well deliver a working reply right after, which would otherwise
+      // leave a contradictory "执行失败" card sitting next to a real answer.
+      await statusCard.finalize('⚠️ 已切换到 OpenCode 处理')
       dbg(`claude-tmux: ${workdir} unavailable (${e}), falling back to OpenCode (pre-delivery, no side effect)`)
       void replyText(chatId, messageId, '⚠️ Claude Code (tmux) 当前不可用，已切换到 OpenCode 处理本次任务。')
       void handleOpenCodeTask(route, chatId, messageId, chatType, ocContent)
       return
     }
+    await statusCard.finalize('⚠️ 执行失败')
     dbg(`claude-tmux: task for ${workdir} failed: ${e}`)
     void replyText(chatId, messageId, `⚠️ Claude (tmux) 执行失败：${e}`)
   }

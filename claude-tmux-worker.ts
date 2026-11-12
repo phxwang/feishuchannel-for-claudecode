@@ -156,6 +156,51 @@ export function parseAssistantTextLines(lines: string[]): string[] {
   return out
 }
 
+export interface ProgressEvent { tool: string; summary: string }
+
+/** Tool-input fields worth surfacing as a one-line progress summary, tried in this order; the first string value found wins. Deliberately short-circuits on common built-in-tool shapes rather than trying to be exhaustive. */
+const PROGRESS_SUMMARY_FIELDS = ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'description']
+const PROGRESS_SUMMARY_MAX_LEN = 80
+
+function summarizeToolInput(input: unknown): string {
+  if (!input || typeof input !== 'object') return ''
+  const obj = input as Record<string, unknown>
+  for (const key of PROGRESS_SUMMARY_FIELDS) {
+    const v = obj[key]
+    if (typeof v === 'string' && v) {
+      return v.length > PROGRESS_SUMMARY_MAX_LEN ? v.slice(0, PROGRESS_SUMMARY_MAX_LEN) + '…' : v
+    }
+  }
+  return ''
+}
+
+/**
+ * Pulls tool_use blocks out of raw JSONL transcript lines — the only
+ * "something is happening" signal available before a turn finishes, since
+ * Claude Code writes whole content blocks, not token-level deltas, to the
+ * transcript. Used to drive a live "thinking…" status card; deliberately
+ * only surfaces the tool name plus a short, truncated summary of one input
+ * field, never the raw input object, so a large file write or command
+ * doesn't get dumped onto a status card visible to the whole chat.
+ */
+export function parseProgressLines(lines: string[]): ProgressEvent[] {
+  const out: ProgressEvent[] = []
+  for (const line of lines) {
+    if (!line.trim()) continue
+    let parsed: TranscriptLine
+    try { parsed = JSON.parse(line) } catch { continue }
+    if (parsed.type !== 'assistant') continue
+    const content = parsed.message?.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (block && typeof block === 'object' && (block as any).type === 'tool_use' && typeof (block as any).name === 'string') {
+        out.push({ tool: (block as any).name, summary: summarizeToolInput((block as any).input) })
+      }
+    }
+  }
+  return out
+}
+
 /** True once `quietMs` have passed since the transcript last grew — our proxy for "turn finished". */
 export function isQuietDone(lastChangeAtMs: number, nowMs: number, quietMs: number): boolean {
   return nowMs - lastChangeAtMs >= quietMs
@@ -189,11 +234,14 @@ export const DIALOG_TIMED_OUT_CHOICE = -1
 export type StuckPaneHandler = (paneAnsiText: string) => Promise<void>
 /** Called with the raw ANSI pane text right after a `kind: 'tabs'` choice's Right-key presses land — since the chosen tab can't be confirmed from plain-text parsing (see parseTabBar's "assumed leftmost tab" caveat), the caller is expected to render and send a screenshot so the user can see which tab was actually reached. Purely informational, like StuckPaneHandler; the next dialog card (offering the same tab choices again) is sent automatically afterward once the still-visible tab bar is re-detected on the next poll. */
 export type TabSwitchedHandler = (paneAnsiText: string) => Promise<void>
+/** Called synchronously with newly-seen tool_use events as soon as they're parsed off the transcript — fire-and-forget, so this must not throw or block; the caller is expected to just update its own in-memory state and let its own throttle/timer decide when (and whether) to actually act on it (e.g. patching a status card), not do network I/O here on every single call. */
+export type ProgressHandler = (events: ProgressEvent[]) => void
 export interface SendAndAwaitReplyOptions {
   model?: string
   onDialog?: DialogHandler
   onStuckPane?: StuckPaneHandler
   onTabSwitched?: TabSwitchedHandler
+  onProgress?: ProgressHandler
 }
 
 const OPTION_LINE_RE = /^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$/
@@ -599,7 +647,7 @@ export class TmuxClaudeManager {
   }
 
   private async doSendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions): Promise<string> {
-    const { model, onDialog, onStuckPane, onTabSwitched } = opts
+    const { model, onDialog, onStuckPane, onTabSwitched, onProgress } = opts
     this.lastUsedAt.set(workdir, Date.now())
     const name = await this.ensureSession(workdir, model)
     const sessionId = this.sessionIds.get(workdir)
@@ -622,7 +670,7 @@ export class TmuxClaudeManager {
     // unexpected failure while waiting for the reply is swallowed and
     // whatever text was collected so far (possibly none) is returned instead.
     try {
-      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane, onTabSwitched)
+      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane, onTabSwitched, onProgress)
     } catch (e) {
       this.dbg(`tmux: error while waiting for ${workdir}'s reply (message was already delivered, not retryable): ${e}`)
       return ''
@@ -632,7 +680,7 @@ export class TmuxClaudeManager {
   private async collectReply(
     workdir: string, sessionId: string | undefined, beforeSendMs: number,
     transcriptBefore: string | null, startOffset: number, signalPath: string | null, baselineStopMs: number,
-    onDialog?: DialogHandler, onStuckPane?: StuckPaneHandler, onTabSwitched?: TabSwitchedHandler,
+    onDialog?: DialogHandler, onStuckPane?: StuckPaneHandler, onTabSwitched?: TabSwitchedHandler, onProgress?: ProgressHandler,
   ): Promise<string> {
     let deadline = beforeSendMs + this.replyTimeoutMs
     let lastChangeMs = Date.now()
@@ -664,7 +712,12 @@ export class TmuxClaudeManager {
       const lastNewline = newBytes.lastIndexOf(0x0a)
       if (lastNewline === -1) return false
       const completeChunk = newBytes.subarray(0, lastNewline + 1)
-      collected.push(...parseAssistantTextLines(completeChunk.toString('utf8').split('\n')))
+      const newLines = completeChunk.toString('utf8').split('\n')
+      collected.push(...parseAssistantTextLines(newLines))
+      if (onProgress) {
+        const events = parseProgressLines(newLines)
+        if (events.length) { try { onProgress(events) } catch (e) { this.dbg(`tmux: onProgress callback for ${workdir} threw: ${e}`) } }
+      }
       lastSize += completeChunk.length
       lastChangeMs = Date.now()
       return true

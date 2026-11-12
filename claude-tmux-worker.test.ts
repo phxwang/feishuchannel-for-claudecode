@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone,
-  parseAssistantTextLines, parseDialogOptions, parseTabBar, rightPressesToReach, sessionNameFor, stopSignalPathFor, stripAnsi,
+  parseAssistantTextLines, parseDialogOptions, parseProgressLines, parseTabBar, rightPressesToReach, sessionNameFor, stopSignalPathFor, stripAnsi,
 } from './claude-tmux-worker'
 
 describe('sessionNameFor', () => {
@@ -13,6 +13,57 @@ describe('sessionNameFor', () => {
   })
   test('is a valid tmux session name (no slashes/spaces)', () => {
     expect(sessionNameFor('/Users/x/Projects/foo')).toMatch(/^feishu-claude-[a-f0-9]{10}$/)
+  })
+})
+
+describe('parseProgressLines', () => {
+  test('extracts tool name and a short input summary', () => {
+    const lines = [JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls -la' } }] },
+    })]
+    expect(parseProgressLines(lines)).toEqual([{ tool: 'Bash', summary: 'ls -la' }])
+  })
+
+  test('tries fields in priority order and falls back to empty summary', () => {
+    const withPath = parseProgressLines([JSON.stringify({
+      type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/a.ts' } }] },
+    })])
+    expect(withPath).toEqual([{ tool: 'Read', summary: '/a.ts' }])
+
+    const noMatchingField = parseProgressLines([JSON.stringify({
+      type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Mystery', input: { foo: 'bar' } }] },
+    })])
+    expect(noMatchingField).toEqual([{ tool: 'Mystery', summary: '' }])
+  })
+
+  test('truncates a long summary field', () => {
+    const long = 'x'.repeat(200)
+    const out = parseProgressLines([JSON.stringify({
+      type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: long } }] },
+    })])
+    expect(out[0].summary.length).toBe(81) // 80 chars + the truncation ellipsis
+    expect(out[0].summary.endsWith('…')).toBe(true)
+  })
+
+  test('collects multiple tool_use blocks from the same turn', () => {
+    const lines = [JSON.stringify({
+      type: 'assistant',
+      message: { content: [
+        { type: 'text', text: 'checking files' },
+        { type: 'tool_use', name: 'Read', input: { file_path: '/a.ts' } },
+        { type: 'tool_use', name: 'Read', input: { file_path: '/b.ts' } },
+      ] },
+    })]
+    expect(parseProgressLines(lines)).toEqual([
+      { tool: 'Read', summary: '/a.ts' },
+      { tool: 'Read', summary: '/b.ts' },
+    ])
+  })
+
+  test('ignores non-assistant lines and malformed JSON without throwing', () => {
+    const lines = ['{not json', JSON.stringify({ type: 'user', message: { content: 'hi' } })]
+    expect(parseProgressLines(lines)).toEqual([])
   })
 })
 
