@@ -856,7 +856,21 @@ async function handleClaudeTmuxTask(
     }
     effectiveContent = `${content}\n\n${notes.join('\n')}`
   }
-  const statusCard = makeStatusCardController(chatId, workdir)
+  // A message that's about to be absorbed into an already-in-flight reply
+  // (see sendAndAwaitReply's doc comment) doesn't get its own "thinking"
+  // card at all — that card would just flash up and immediately flip to
+  // "已并入", a second card the chat didn't need. isBusy() is advisory (the
+  // in-flight call can settle in the gap before sendAndAwaitReply's own
+  // check), so the rare race still gets a real card below once we learn the
+  // call wasn't actually absorbed after all.
+  let statusCard = tmuxClaude.isBusy(workdir) ? null : makeStatusCardController(chatId, workdir)
+  // Lazily backfills statusCard for the rare isBusy() miss — called from
+  // both the "turned out not absorbed" and the catch branch below, since
+  // either can be the first to discover the call was never absorbed.
+  function ensureStatusCard() {
+    if (!statusCard) statusCard = makeStatusCardController(chatId, workdir)
+    return statusCard
+  }
   let absorbed = false
   try {
     const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, {
@@ -864,7 +878,7 @@ async function handleClaudeTmuxTask(
       onDialog: makeTmuxDialogHandler(workdir, chatId, messageId),
       onStuckPane: makeStuckPaneHandler(chatId),
       onTabSwitched: makeTabSwitchedHandler(chatId),
-      onProgress: statusCard.onProgress,
+      onProgress: (events) => statusCard?.onProgress(events),
       // This message arrived while a reply for the same workdir was still
       // in flight — Claude Code absorbs it into that turn itself (see
       // sendAndAwaitReply's doc comment), so the in-flight call's result
@@ -873,9 +887,17 @@ async function handleClaudeTmuxTask(
       onAbsorbed: () => { absorbed = true },
     })
     if (absorbed) {
-      await statusCard.finalize('↪️ 已并入上一条消息的回复')
+      if (statusCard) await statusCard.finalize('↪️ 已并入上一条消息的回复')
+      else void replyText(chatId, messageId, '↪️ 已并入上一条消息的回复')
       return
     }
+    // isBusy() guessed this would absorb but it didn't (the in-flight call
+    // settled first) — there's no card yet for what turned out to be a real
+    // standalone turn. Every progress tick during the call above was
+    // silently dropped (onProgress found statusCard still null), so the
+    // card created here goes straight to its final state with no ticks to
+    // show for it.
+    statusCard = ensureStatusCard()
     if (reply) {
       await statusCard.finalize('✅ 已回复')
       for (const chunk of chunkText(reply, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
@@ -884,6 +906,17 @@ async function handleClaudeTmuxTask(
       dbg(`claude-tmux: ${workdir} produced no text reply for ${messageId}`)
     }
   } catch (e) {
+    // This message was absorbed into the in-flight call (onAbsorbed already
+    // fired above) and that same call is what just threw — the primary
+    // message's own catch handles the failure (error reply, OpenCode
+    // fallback, etc). Without this check we'd duplicate all of that here
+    // too, for a message that was never its own turn.
+    if (absorbed) {
+      if (statusCard) await statusCard.finalize('↪️ 已并入上一条消息的回复')
+      else void replyText(chatId, messageId, '↪️ 已并入上一条消息的回复')
+      return
+    }
+    statusCard = ensureStatusCard()
     if (route.agent.fallback === 'opencode' && infraConfig?.fallback.enabled && openCodeAdapter) {
       // Don't finalize as "failed" here — OpenCode is about to take over and
       // may well deliver a working reply right after, which would otherwise

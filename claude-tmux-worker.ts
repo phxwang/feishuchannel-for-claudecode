@@ -721,6 +721,20 @@ export class TmuxClaudeManager {
    * Instead, send it straight into the pane now and resolve to the in-flight
    * call's eventual result, which already covers this message too.
    */
+  /**
+   * True if a `sendAndAwaitReply` call for this workdir is currently in
+   * flight, i.e. a call made right now would be absorbed into it instead of
+   * starting its own turn. Callers can use this to skip setting up per-call
+   * UI (like a fresh "thinking" status card) for a message they can already
+   * tell is about to be merged into the in-flight one — see router.ts's
+   * handleClaudeTmuxTask. Advisory only: `sendAndAwaitReply` re-checks for
+   * itself and is the source of truth, since the in-flight call can settle
+   * in the gap between this check and that one.
+   */
+  isBusy(workdir: string): boolean {
+    return this.queues.has(workdir)
+  }
+
   async sendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions = {}): Promise<string> {
     const inFlight = this.queues.get(workdir)
     if (inFlight) {
