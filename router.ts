@@ -872,6 +872,17 @@ async function handleClaudeTmuxTask(
     return statusCard
   }
   let absorbed = false
+  // One card per background-continuation round, not one card updated in
+  // place across all of them: each round that produces new text closes its
+  // own card and, if there's still more to wait for, opens a fresh one for
+  // the next round — see onBackgroundFollowup below. null between rounds
+  // (including before the first one starts).
+  let followupCard: ReturnType<typeof makeStatusCardController> | null = null
+  // Serializes the async work each onBackgroundFollowup call does (closing
+  // the previous round's card, sending its text, opening the next card) so
+  // two calls can't interleave their Feishu calls out of order if a round
+  // ever resolves unusually fast.
+  let followupChain: Promise<void> = Promise.resolve()
   try {
     const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, {
       model,
@@ -885,6 +896,28 @@ async function handleClaudeTmuxTask(
       // already answers this message too; don't send it again as a
       // separate reply here.
       onAbsorbed: () => { absorbed = true },
+      onBackgroundFollowup: (update) => {
+        followupChain = followupChain.then(async () => {
+          // Close out whatever round the previous card represented before
+          // doing anything else, so chat order always matches round order.
+          if (followupCard) {
+            const closingLine = update.done
+              ? (update.giveUp ? '⚠️ 超过等待上限，不再跟踪（后台任务可能仍在运行）' : '✅ 全部完成')
+              : update.extraText ? '↪️ 本轮已产出新回复' : '⏳ 本轮没有新文本，继续等待'
+            await followupCard.finalize(closingLine)
+          }
+          if (update.extraText) for (const chunk of chunkText(update.extraText, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
+          followupCard = update.done ? null : makeStatusCardController(chatId, workdir)
+          followupCard?.onProgress([{ tool: '⏳ 后台任务', summary: `还有 ${update.runningShells} 个在跑` }])
+        }).catch(e => {
+          // Not rethrown/propagated: this chain is fire-and-forget from
+          // handleClaudeTmuxTask's perspective (never awaited), so letting a
+          // rejection escape here would be a silent unhandled rejection
+          // instead of the dbg-logged failure every other path in this
+          // function gets.
+          dbg(`claude-tmux: background-followup card update for ${workdir} failed: ${e}`)
+        })
+      },
     })
     if (absorbed) {
       if (statusCard) await statusCard.finalize('↪️ 已并入上一条消息的回复')

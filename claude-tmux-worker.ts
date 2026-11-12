@@ -117,7 +117,7 @@ function extractLocalCommandOutput(value: unknown): string | null {
  * model is already set just prints "Kept model as X") — found live that
  * this never produces a real assistant turn or a Stop-hook signal at all,
  * so without this, sendAndAwaitReply would sit polling for the full
- * replyTimeoutMs (10 minutes by default) even though the CLI already
+ * replyTimeoutMs (60 minutes by default) even though the CLI already
  * answered on screen. This is recorded in the transcript as either a
  * `type: 'system', subtype: 'local_command'` line (content at the top
  * level) or, in an older/different CLI build, a `type: 'user'` line
@@ -236,12 +236,25 @@ export type StuckPaneHandler = (paneAnsiText: string) => Promise<void>
 export type TabSwitchedHandler = (paneAnsiText: string) => Promise<void>
 /** Called synchronously with newly-seen tool_use events as soon as they're parsed off the transcript — fire-and-forget, so this must not throw or block; the caller is expected to just update its own in-memory state and let its own throttle/timer decide when (and whether) to actually act on it (e.g. patching a status card), not do network I/O here on every single call. */
 export type ProgressHandler = (events: ProgressEvent[]) => void
+export interface BackgroundFollowupUpdate {
+  /** How many background shells the CLI's own footer still reports running, as of this update. 0 only ever appears on the final, `done: true` update. */
+  runningShells: number
+  /** New assistant text collected since the primary reply (or the previous update, whichever was more recent) — empty when this update is reporting only a shell-count change with no new text yet. */
+  extraText: string
+  /** True once watching has ended, either because a later Stop fired with the CLI reporting zero shells left (the real end — see `giveUp`), or because watching was abandoned. */
+  done: boolean
+  /** Only meaningful when `done` is true. Unset/false: a Stop genuinely reported zero shells left. True: watching was abandoned instead — the overall ceiling (replyTimeoutMs) elapsed, or an unexpected error — while the CLI may still be working; callers should say so rather than reporting this as a real completion. */
+  giveUp?: boolean
+}
+/** See `doSendAndAwaitReply`'s watchBackgroundContinuation: called after the primary reply, for as long as the CLI keeps auto-continuing into further turns on its own (a background shell finishing). Fire-and-forget, like ProgressHandler — must not throw or block. */
+export type BackgroundFollowupHandler = (update: BackgroundFollowupUpdate) => void
 export interface SendAndAwaitReplyOptions {
   model?: string
   onDialog?: DialogHandler
   onStuckPane?: StuckPaneHandler
   onTabSwitched?: TabSwitchedHandler
   onProgress?: ProgressHandler
+  onBackgroundFollowup?: BackgroundFollowupHandler
   /**
    * Called synchronously, before delivery, if this call is being absorbed
    * into an already-in-flight turn for the same workdir instead of starting
@@ -334,6 +347,28 @@ export function parseDialogOptions(paneText: string): Dialog | null {
     break
   }
   return { kind: 'numbered', question: question || 'Claude 需要你的输入', options }
+}
+
+const RUNNING_SHELL_RE = /(\d+)\s+shells?\b/i
+
+/**
+ * Reads the CLI's own "N shell(s) [still running]" footer indicator off the
+ * last non-blank line of the pane — the same signal a human watching the
+ * terminal would use to tell a background bash task is still going after
+ * the turn's own Stop hook has already fired. Only checked on that last
+ * line (mirroring parseTabBar's lastNonBlank scan) so this can't match the
+ * phrase "shell" appearing incidentally in Claude's own finished reply text
+ * sitting higher up in the pane. Returns 0 (not found == none running) when
+ * the line doesn't match at all.
+ */
+export function parseRunningShellCount(paneText: string): number {
+  const lines = paneText.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() === '') continue
+    const m = lines[i].match(RUNNING_SHELL_RE)
+    return m ? parseInt(m[1], 10) : 0
+  }
+  return 0
 }
 
 const TAB_BAR_RE = /^\s*[A-Z][\w-]*(?:\s{2,}[A-Z][\w-]*){1,}\s*$/
@@ -509,8 +544,10 @@ export class TmuxClaudeManager {
   private knownAlive = new Set<string>()
   /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost from memory on router restart, but recovered from `persistence` (if configured) the next time ensureSession reattaches to an already-live session. */
   private sessionIds = new Map<string, string>()
-  /** workdir -> the in-flight sendAndAwaitReply call, if any, so a second message for the same workdir gets absorbed into it instead of racing it with a second collectReply loop on the same tmux pane/transcript. Deleted once the call settles. */
+  /** workdir -> the in-flight sendAndAwaitReply call, if any, so a second message for the same workdir gets absorbed into it instead of racing it with a second collectReply loop on the same tmux pane/transcript. Deleted once the call settles (i.e. once the *primary* reply is ready — see `watching` below for the extra window after that). */
   private queues = new Map<string, Promise<string>>()
+  /** workdirs currently in the post-primary-reply watchBackgroundContinuation window (see doSendAndAwaitReply) — the primary reply already went out and `queues` no longer holds this workdir, but a second collectReply loop started now would race the watcher's own tailing of the same pane/transcript. isBusy()/sendAndAwaitReply treat this the same as `queues`: absorb into the ongoing watch instead. */
+  private watching = new Set<string>()
   /** workdir -> last time a message was sent to it, for killIdleSessions(). */
   private lastUsedAt = new Map<string, number>()
 
@@ -520,7 +557,12 @@ export class TmuxClaudeManager {
     this.rows = opts.rows ?? 50
     this.startupTimeoutMs = opts.startupTimeoutMs ?? 20_000
     this.quietMs = opts.quietMs ?? 2_500
-    this.replyTimeoutMs = opts.replyTimeoutMs ?? 10 * 60 * 1000
+    // Raised from 10 to 60 minutes (2026-11-12): a single long-running tool
+    // call, or a chain of self-continued turns watched by
+    // watchBackgroundContinuation, can legitimately take much longer than 10
+    // minutes — this is now a last-resort ceiling against a genuinely stuck
+    // session, not the expected wait time for an ordinary reply.
+    this.replyTimeoutMs = opts.replyTimeoutMs ?? 60 * 60 * 1000
     this.postStopQuietMs = opts.postStopQuietMs ?? 800
     this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
     this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 90_000
@@ -732,7 +774,7 @@ export class TmuxClaudeManager {
    * in the gap between this check and that one.
    */
   isBusy(workdir: string): boolean {
-    return this.queues.has(workdir)
+    return this.queues.has(workdir) || this.watching.has(workdir)
   }
 
   async sendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions = {}): Promise<string> {
@@ -742,6 +784,19 @@ export class TmuxClaudeManager {
       await this.sendKeys(sessionNameFor(workdir), text)
       return inFlight
     }
+    if (this.watching.has(workdir)) {
+      // The primary reply for the call still watching this workdir already
+      // went out — this message arrived during its post-reply
+      // watchBackgroundContinuation window, so there's no live primary
+      // promise left to piggyback on. Absorb it into the same ongoing pane
+      // anyway (the CLI handles it exactly like any other mid-task message)
+      // rather than starting a second collectReply loop that would race the
+      // watcher's own tailing of the same pane/transcript. The resolved
+      // value is never read by a caller that checked onAbsorbed fired.
+      opts.onAbsorbed?.()
+      await this.sendKeys(sessionNameFor(workdir), text)
+      return ''
+    }
     const task = this.doSendAndAwaitReply(workdir, text, opts)
     this.queues.set(workdir, task)
     task.finally(() => { if (this.queues.get(workdir) === task) this.queues.delete(workdir) })
@@ -749,7 +804,7 @@ export class TmuxClaudeManager {
   }
 
   private async doSendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions): Promise<string> {
-    const { model, onDialog, onStuckPane, onTabSwitched, onProgress } = opts
+    const { model, onDialog, onStuckPane, onTabSwitched, onProgress, onBackgroundFollowup } = opts
     this.lastUsedAt.set(workdir, Date.now())
     const name = await this.ensureSession(workdir, model)
     const sessionId = this.sessionIds.get(workdir)
@@ -771,11 +826,105 @@ export class TmuxClaudeManager {
     // later error here would risk running the same task twice. Any
     // unexpected failure while waiting for the reply is swallowed and
     // whatever text was collected so far (possibly none) is returned instead.
+    let primary: string
     try {
-      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane, onTabSwitched, onProgress)
+      primary = await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane, onTabSwitched, onProgress)
     } catch (e) {
       this.dbg(`tmux: error while waiting for ${workdir}'s reply (message was already delivered, not retryable): ${e}`)
       return ''
+    }
+    // Deliver the primary reply now (this function's return) without waiting
+    // on the check below — onBackgroundFollowup exists precisely so the
+    // caller doesn't have to hold the whole message open until every
+    // self-continued round finishes (see router.ts's handleClaudeTmuxTask).
+    if (onBackgroundFollowup) {
+      // Same "never throw past primary delivery" rule as the collectReply
+      // call above — a capturePane failure here (e.g. the session just
+      // died) must not cost the caller the primary reply that's already
+      // sitting in hand.
+      try {
+        const runningShells = parseRunningShellCount(stripAnsi(await this.capturePane(sessionNameFor(workdir))))
+        if (runningShells > 0) {
+          // Report this first sighting right away — a whole watch round
+          // below can itself take a while, and the caller (router.ts) needs
+          // this notification promptly to put up a follow-up card instead
+          // of leaving the chat looking done until that round finishes.
+          try { onBackgroundFollowup({ runningShells, extraText: '', done: false }) }
+          catch (e) { this.dbg(`tmux: onBackgroundFollowup callback for ${workdir} threw: ${e}`) }
+          this.watching.add(workdir)
+          void this.watchBackgroundContinuation(workdir, sessionId, signalPath, onDialog, onStuckPane, onTabSwitched, onProgress, onBackgroundFollowup)
+            .finally(() => this.watching.delete(workdir))
+        }
+      } catch (e) {
+        this.dbg(`tmux: post-primary shell-count check for ${workdir} failed (primary reply unaffected): ${e}`)
+      }
+    }
+    return primary
+  }
+
+  /**
+   * Keeps watching after the primary reply already went out, for as long as
+   * the CLI's own footer still reports a background shell running — it can
+   * auto-continue into a fresh turn once one finishes (its own Stop, same
+   * mechanism as a human watching a background task complete), which
+   * `collectReply`'s single call already returned from and would otherwise
+   * never see. Each round is a fresh, self-contained `collectReply` call
+   * starting from the current transcript size/signal mtime rather than
+   * threading extra state through that function — reuses its existing
+   * dialog/stuck-pane/progress handling for free, since a background task
+   * can just as easily hit a permission prompt as the primary turn could.
+   * Fire-and-forget: reports each round via `onBackgroundFollowup` and never
+   * throws (logs and gives up quietly on error, same as doSendAndAwaitReply
+   * does for the primary call).
+   */
+  private async watchBackgroundContinuation(
+    workdir: string, sessionId: string | undefined, signalPath: string | null,
+    onDialog: DialogHandler | undefined, onStuckPane: StuckPaneHandler | undefined, onTabSwitched: TabSwitchedHandler | undefined,
+    onProgress: ProgressHandler | undefined, onBackgroundFollowup: BackgroundFollowupHandler,
+  ): Promise<void> {
+    // Caps the WHOLE watch (every round combined) at replyTimeoutMs from
+    // when watching started, not a fresh replyTimeoutMs re-armed on every
+    // round — otherwise a shell count that never reaches 0 (a genuinely
+    // hung background process, or parseRunningShellCount misreading the
+    // pane) would keep this loop going indefinitely, each round getting
+    // its own full hour, with nothing bounding the total. This is meant as
+    // a last-resort ceiling against that, same spirit as replyTimeoutMs
+    // itself for the primary call.
+    const overallDeadline = Date.now() + this.replyTimeoutMs
+    try {
+      const name = sessionNameFor(workdir)
+      while (true) {
+        if (Date.now() >= overallDeadline) {
+          this.dbg(`tmux: background-continuation watch for ${workdir} gave up — still reporting shells running after the full ${this.replyTimeoutMs}ms ceiling`)
+          try { onBackgroundFollowup({ runningShells: 0, extraText: '', done: true, giveUp: true }) }
+          catch (e) { this.dbg(`tmux: onBackgroundFollowup callback for ${workdir} threw: ${e}`) }
+          return
+        }
+        this.lastUsedAt.set(workdir, Date.now())
+        const transcriptPath = sessionId ? transcriptPathForSession(workdir, sessionId) : findLatestTranscript(workdir)
+        const startOffset = transcriptPath && existsSync(transcriptPath) ? statSync(transcriptPath).size : 0
+        const baselineStopMs = signalPath && existsSync(signalPath) ? statSync(signalPath).mtimeMs : 0
+        // Gives this round whatever's left of the overall ceiling rather
+        // than collectReply's usual fresh `this.replyTimeoutMs` — faking
+        // beforeSendMs is the only lever collectReply exposes for that,
+        // since it always computes its own deadline as beforeSendMs plus
+        // the full replyTimeoutMs.
+        const roundBeforeSendMs = overallDeadline - this.replyTimeoutMs
+        const extraText = await this.collectReply(workdir, sessionId, roundBeforeSendMs, transcriptPath, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane, onTabSwitched, onProgress)
+        const runningShells = parseRunningShellCount(stripAnsi(await this.capturePane(name)))
+        const done = runningShells === 0
+        try { onBackgroundFollowup({ runningShells, extraText, done }) }
+        catch (e) { this.dbg(`tmux: onBackgroundFollowup callback for ${workdir} threw: ${e}`) }
+        if (done) return
+      }
+    } catch (e) {
+      this.dbg(`tmux: background-continuation watch for ${workdir} failed: ${e}`)
+      // Without this, a card already opened by a prior round's
+      // onBackgroundFollowup call (see router.ts's handleClaudeTmuxTask)
+      // never gets its matching close — the Feishu card would sit open
+      // indefinitely with no one left to finalize it.
+      try { onBackgroundFollowup({ runningShells: 0, extraText: '', done: true, giveUp: true }) }
+      catch (e2) { this.dbg(`tmux: onBackgroundFollowup callback for ${workdir} threw: ${e2}`) }
     }
   }
 
@@ -827,6 +976,12 @@ export class TmuxClaudeManager {
 
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 400))
+      // Refreshed on every poll tick, not just at message-send time: with
+      // replyTimeoutMs now able to run up to an hour (and
+      // watchBackgroundContinuation able to chain several such waits back
+      // to back), a single long active wait could otherwise cross
+      // killIdleSessions' own idle threshold and get reaped mid-task.
+      this.lastUsedAt.set(workdir, Date.now())
       if (readGrowth()) continue
       const stopFired = !!signalPath && existsSync(signalPath) && statSync(signalPath).mtimeMs > baselineStopMs
       if (stopFired) {
