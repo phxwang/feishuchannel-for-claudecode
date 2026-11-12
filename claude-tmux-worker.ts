@@ -449,6 +449,20 @@ export interface TmuxClaudeManagerOptions {
    * across multiple distinct stuck episodes in one long reply.
    */
   stuckPaneCooldownMs?: number
+  /**
+   * Durable workdir -> tmux --session-id storage, so a router restart can
+   * reattach to an already-running session's exact transcript file instead
+   * of falling back to "most recently modified .jsonl in this workdir" —
+   * ambiguous if the user ever has another Claude Code session open in the
+   * same directory outside this tmux session. The tmux session itself is
+   * unaffected by a router restart (tmux is a separate daemon); only this
+   * manager's in-memory sessionIds map is lost, which this backs.
+   */
+  persistence?: {
+    get(workdir: string): string | undefined
+    set(workdir: string, sessionId: string): void
+    delete(workdir: string): void
+  }
 }
 
 export class TmuxClaudeManager {
@@ -463,9 +477,10 @@ export class TmuxClaudeManager {
   private readonly dialogCheckMs: number
   private readonly stuckPaneCheckMs: number
   private readonly stuckPaneCooldownMs: number
+  private readonly persistence: TmuxClaudeManagerOptions['persistence']
   /** Workdirs we've confirmed a live tmux session for, to skip a has-session round-trip on every message. */
   private knownAlive = new Set<string>()
-  /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost on router restart. */
+  /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost from memory on router restart, but recovered from `persistence` (if configured) the next time ensureSession reattaches to an already-live session. */
   private sessionIds = new Map<string, string>()
   /** workdir -> tail of the in-flight sendAndAwaitReply call, so a second message for the same workdir queues instead of racing the first one on the same tmux pane/transcript. */
   private queues = new Map<string, Promise<unknown>>()
@@ -484,6 +499,7 @@ export class TmuxClaudeManager {
     this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
     this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 90_000
     this.stuckPaneCooldownMs = opts.stuckPaneCooldownMs ?? 5 * 60_000
+    this.persistence = opts.persistence
   }
 
   private async hasSession(name: string): Promise<boolean> {
@@ -575,6 +591,18 @@ export class TmuxClaudeManager {
 
     if (await this.hasSession(name)) {
       this.knownAlive.add(workdir)
+      // Reattaching after a router restart: this manager's own sessionIds
+      // map was lost with the old process, but the tmux session (and the
+      // --session-id it was spawned with) is still the same one — recover
+      // it from persistence so transcript tailing targets the exact file
+      // instead of falling back to the mtime heuristic.
+      if (!this.sessionIds.has(workdir)) {
+        const persisted = this.persistence?.get(workdir)
+        if (persisted) {
+          this.dbg(`tmux: reattached to ${workdir}'s live session, recovered session-id ${persisted} from persistence`)
+          this.sessionIds.set(workdir, persisted)
+        }
+      }
       return name
     }
 
@@ -589,6 +617,7 @@ export class TmuxClaudeManager {
     ])
     if (!spawn.ok) throw new Error(`tmux new-session failed: ${spawn.stderr || spawn.stdout}`)
     this.sessionIds.set(workdir, sessionId)
+    this.persistence?.set(workdir, sessionId)
 
     await this.waitForStartup(name, spawnStartMs)
     this.knownAlive.add(workdir)
@@ -903,6 +932,7 @@ export class TmuxClaudeManager {
     this.knownAlive.delete(workdir)
     this.sessionIds.delete(workdir)
     this.lastUsedAt.delete(workdir)
+    this.persistence?.delete(workdir)
     await runTmux(['kill-session', '-t', name])
   }
 

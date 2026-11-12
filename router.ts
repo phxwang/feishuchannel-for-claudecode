@@ -18,7 +18,10 @@ import {
 import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { acquireRouterLock, releaseRouterLock } from './router-lock'
-import { markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, SqliteBindingStore, wasEventProcessed } from './routing/storage'
+import {
+  deleteTmuxSessionId, getTmuxSessionId, markEventProcessed, openDb, PermissionRegistry,
+  pruneProcessedEvents, setTmuxSessionId, SqliteBindingStore, wasEventProcessed,
+} from './routing/storage'
 import { loadRouterConfig, RouterConfigError } from './routing/config'
 import { resolveRoute } from './routing/resolver'
 import { conversationKey } from './routing/bindings'
@@ -100,7 +103,28 @@ const openCodeAdapter = openCodeCfg
     })
   : null
 
-const tmuxClaude = new TmuxClaudeManager({ dbg })
+// ── SQLite state (opened early: tmuxClaude below needs it for session-id persistence) ──
+mkdirSync(STATE_DIR, { recursive: true })
+const db = openDb(DB_PATH)
+const permissionRegistry = new PermissionRegistry(db)
+const openCodeBindings = new SqliteBindingStore(db)
+
+/**
+ * workdir -> tmux --session-id, persisted so a router restart can reattach
+ * to an already-running tmux session's exact transcript file instead of
+ * guessing by "most recently modified .jsonl in this workdir" (ambiguous if
+ * the user ever has another Claude Code session open in the same
+ * directory outside this tmux session). The tmux session itself survives a
+ * router restart untouched — tmux is a separate daemon — only this
+ * router-side bookkeeping is lost from memory, which is what this
+ * persists.
+ */
+const tmuxSessionStore = {
+  get: (workdir: string) => getTmuxSessionId(db, workdir),
+  set: (workdir: string, sessionId: string) => setTmuxSessionId(db, workdir, sessionId, new Date().toISOString()),
+  delete: (workdir: string) => deleteTmuxSessionId(db, workdir),
+}
+const tmuxClaude = new TmuxClaudeManager({ dbg, persistence: tmuxSessionStore })
 
 // ── Access control ──────────────────────────────────────────────────────────
 
@@ -175,11 +199,6 @@ function checkMention(mentions: any[], text: string, patterns?: string[]): boole
 }
 
 // ── Worker registry (Unix socket) ───────────────────────────────────────────
-
-mkdirSync(STATE_DIR, { recursive: true })
-const db = openDb(DB_PATH)
-const permissionRegistry = new PermissionRegistry(db)
-const openCodeBindings = new SqliteBindingStore(db)
 
 type Worker = {
   socket: Socket
