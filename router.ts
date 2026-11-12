@@ -679,6 +679,22 @@ async function patchStatusCard(messageId: string, line: string, dbgTag: string):
 const STATUS_CARD_PATCH_COOLDOWN_MS = 1_500
 
 /**
+ * How often the status card re-patches itself with an elapsed-time tick even
+ * when no new tool_use event has arrived. A single long-running tool call
+ * (a multi-minute bash/pytest run, say) produces exactly one progress event
+ * at its start and nothing else until it finishes — without this, the card
+ * would sit on that one line, unchanged, for the whole duration, which reads
+ * as "stuck" even though the CLI is still working.
+ */
+const STATUS_CARD_HEARTBEAT_MS = 15_000
+
+function formatElapsed(startMs: number): string {
+  const s = Math.floor((Date.now() - startMs) / 1000)
+  if (s < 60) return `${s}秒`
+  return `${Math.floor(s / 60)}分${s % 60}秒`
+}
+
+/**
  * Creates a "🤔 思考中…" card for one claude-tmux task and returns a
  * controller claude-tmux-worker.ts's `onProgress` feeds tool_use events
  * into, plus `finalize()` to call once the task is done.
@@ -701,6 +717,7 @@ function makeStatusCardController(chatId: string, workdir: string) {
   let lastPatchMs = 0
   let pendingTimer: ReturnType<typeof setTimeout> | null = null
   let finalized = false
+  const startMs = Date.now()
 
   const ready: Promise<string | null> = (async () => {
     try {
@@ -720,7 +737,7 @@ function makeStatusCardController(chatId: string, workdir: string) {
     await ready
     if (!messageId || hasPendingDialogFor(workdir)) return
     lastPatchMs = Date.now()
-    await patchStatusCard(messageId, latestLine, 'claude-tmux: status card')
+    await patchStatusCard(messageId, `${latestLine} ⏱ ${formatElapsed(startMs)}`, 'claude-tmux: status card')
   }
 
   function scheduleFlush() {
@@ -728,6 +745,12 @@ function makeStatusCardController(chatId: string, workdir: string) {
     const wait = Math.max(0, lastPatchMs + STATUS_CARD_PATCH_COOLDOWN_MS - Date.now())
     pendingTimer = setTimeout(() => { pendingTimer = null; void flush() }, wait)
   }
+
+  // Ticks the card even without any new progress event — see
+  // STATUS_CARD_HEARTBEAT_MS's doc comment. Cleared in finalize(), so a
+  // short-lived task (well under one heartbeat interval) never triggers an
+  // extra patch at all.
+  const heartbeatTimer: ReturnType<typeof setInterval> = setInterval(() => void flush(), STATUS_CARD_HEARTBEAT_MS)
 
   return {
     onProgress(events: ProgressEvent[]) {
@@ -740,6 +763,7 @@ function makeStatusCardController(chatId: string, workdir: string) {
     async finalize(line: string) {
       finalized = true
       if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null }
+      clearInterval(heartbeatTimer)
       const id = await ready
       if (!id) return
       await patchStatusCard(id, line, 'claude-tmux: status card')
