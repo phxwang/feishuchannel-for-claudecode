@@ -1,7 +1,7 @@
 {
   "name": "feishuchannel-for-claudecode",
   "version": "0.3.5",
-  "description": "Feishu (Lark) channel plugin for Claude Code — route multiple groups to isolated Claude instances via a single bot",
+  "description": "Feishu (Lark) channel plugin for Claude Code \u2014 route multiple groups to isolated Claude instances via a single bot",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -10,7 +10,9 @@
   "scripts": {
     "start": "bun install --no-summary && bun server.ts",
     "router": "bun install --no-summary && bun router.ts",
-    "postinstall": "mkdir -p ~/.local/bin && ln -sf \"$(pwd)/bin/claude-feishu\" ~/.local/bin/claude-feishu"
+    "postinstall": "mkdir -p ~/.local/bin && ln -sf \"$(pwd)/bin/claude-feishu\" ~/.local/bin/claude-feishu",
+    "test": "bun test",
+    "check:opencode": "tsc --noEmit -p tsconfig.opencode.json"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.5.0",
@@ -18,5 +20,9 @@
     "ansi-to-html": "^0.7.2",
     "playwright-core": "^1.65.0",
     "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^5.9.3"
   }
 }

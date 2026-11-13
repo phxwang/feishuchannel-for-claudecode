@@ -37,3 +37,9 @@ describe('SSEBuffer', () => {
     expect(b.push(': keepalive\n\n')).toEqual([])
   })
 })
+
+ test('SSE handles CRLF and bounds an unterminated record', () => {
+  const buffer = new SSEBuffer(50)
+  expect(buffer.push('x'.repeat(60))).toEqual([])
+  expect(buffer.push('data: {"ok":true}\r\n\r\n')).toEqual([{ok: true}])
+})

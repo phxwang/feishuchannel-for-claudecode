@@ -6,10 +6,14 @@
  */
 export class SSEBuffer {
   private buf = ''
+  constructor(private readonly maxBufferChars = 1024 * 1024) {}
 
   /** Feed a raw chunk of decoded text; returns any complete JSON events found in it. */
   push(chunk: string): unknown[] {
-    this.buf += chunk
+    this.buf = (this.buf + chunk).replace(/\r\n/g, '\n')
+    // Malformed/unterminated upstream records must not retain unbounded text.
+    // Authoritative polling recovers any skipped progress record.
+    if (this.buf.length > this.maxBufferChars) { this.buf = ''; return [] }
     const events: unknown[] = []
     let idx: number
     while ((idx = this.buf.indexOf('\n\n')) !== -1) {

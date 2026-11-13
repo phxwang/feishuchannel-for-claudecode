@@ -47,6 +47,10 @@ export interface OpenCodeAgentConfig {
   /** Absolute cap regardless of progress (seconds). Defaults to 8 hours. */
   taskHardCapSeconds?: number
   maxConcurrency: number
+  /** Native v2 admission/coordinator; opt-in, never migrates legacy bindings. */
+  nativeV2?: boolean
+  progressCards?: boolean
+  streamText?: boolean
 }
 
 export type AgentBackendConfig = ClaudeAgentConfig | OpenCodeAgentConfig
