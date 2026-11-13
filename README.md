@@ -58,6 +58,8 @@ Map Feishu groups to project directories in `~/.claude/channels/feishu/access.js
 - **Auto-managed router** — Router spawns on first launch, shuts down when all workers disconnect
 - **OpenCode backend (opt-in per group/DM)** — Route specific chats to [OpenCode](https://opencode.ai) instead of Claude Code, with sessions persisted in SQLite across router restarts
 - **Claude → OpenCode fallback (opt-in)** — If no Claude Code worker is connected, or Claude Code just hit its usage rate limit, hand that message to OpenCode instead of dropping it (pre-execution cases only, see [Fallback to OpenCode](#fallback-to-opencode))
+- **Long OpenCode turns that don't get cut off** — Turns run asynchronously and are observed by polling, so a multi-minute/multi-step turn isn't killed by an HTTP transport timeout (see [OpenCode Backend](#opencode-backend))
+- **Claude via tmux (experimental)** — Keystroke-based delivery mode with live progress cards, streaming replies, and interactive dialog cards (see [Claude via tmux](#claude-via-tmux-experimental))
 - **Direct messages** — Chat with Claude through Feishu DMs
 - **Group chats** — Add the bot to group chats with @mention support
 - **Access control** — Pairing-based onboarding, allowlists, and per-group policies
@@ -325,6 +327,8 @@ fallback:
 
 `agents.yaml` never decides which project a chat maps to — that's still `access.json`'s job (see below). It only declares which backends exist and which agents each project is allowed to use. Only `fallback.enabled` is actually read by the router today — the other `fallback.*` fields are validated but not yet consulted anywhere in dispatch; they're placeholders for a future richer fallback policy.
 
+`requestTimeoutSeconds` bounds each individual HTTP request to `opencode serve`, while `taskTimeoutSeconds` independently bounds the whole turn — the two are deliberately separate (see [Long turns](#long-turns)).
+
 ### 2. Opt a group or DM into OpenCode via `access.json`
 
 `access.json` is the single source of truth for chat → project/agent mapping. Add an optional `agent` field to any group entry (or `defaultAgent` at the top level for DMs):
@@ -342,6 +346,16 @@ fallback:
 
 Any group/DM without an explicit `agent` field stays on Claude, regardless of what's declared in `agents.yaml`. A request for an agent not in that project's `allowedAgents` (or a workdir not declared in `agents.yaml` at all) silently falls back to Claude-only — check `router-debug.log` if a group doesn't behave as expected.
 
+### Long turns
+
+A turn is submitted once to `POST /session/{id}/prompt_async` (which returns immediately) and then observed by polling `/session/status` and reading `/session/{id}/message` once the session is idle. No single HTTP request has to stay open for the duration of the turn, so long multi-step turns (75+ steps, several minutes) are no longer cut off by the HTTP transport with a `connection_failed: The operation timed out.` while `opencode serve` keeps working in the background.
+
+- `requestTimeoutSeconds` bounds each individual HTTP call; `taskTimeoutSeconds` bounds the whole turn.
+- The adapter submits its own user-message ID and finalizes only from assistant messages whose `parentID` matches that ID, so concurrent or stale turns in the same session can't be mistaken for this one.
+- A lost `prompt_async` acknowledgement is ambiguous — the server may already have accepted the prompt — so the adapter watches the exact message ID instead of submitting the prompt a second time.
+- Completion requires an idle `/session/status` plus a final assistant message with a completion timestamp (and not a `tool-calls` continuation); stale SSE idle notifications never finalize a turn.
+- Permission requests are observed both on the SSE stream and by polling `/permission`, so a dropped stream doesn't strand a task waiting for approval.
+
 ### Fallback to OpenCode
 
 Set `agent.fallback: "opencode"` on a group/DM (alongside `primary: "claude"`) and `agents.yaml`'s `fallback.enabled: true` to let that chat fail over to OpenCode. This covers two narrow, safe cases where the message provably never reached Claude, so there's no partial work to reconcile:
@@ -354,9 +368,9 @@ In either case the router replies with a one-line notice and hands the task to O
 It does **not** cover a Claude worker accepting a task and then failing partway through — that needs real task-state tracking (the design doc's full fallback state machine, `routing/task-machine.ts`), which exists as pure logic but isn't wired into the live dispatch path yet.
 
 **Notes:**
-- OpenCode sessions are sticky per conversation and persisted in SQLite (`router.db`) — they survive a router restart.
+- OpenCode sessions are sticky per conversation and persisted in SQLite (`router.db`) — they survive a router restart. A binding is evicted only when `GET /session/{id}` confirms the session is gone (HTTP 404/410); transport timeouts, rate limits and provider errors keep the conversation context for the next message.
 - Permission requests from OpenCode's tool calls surface as an interactive Feishu approve/deny card, same as Claude's.
-- Attachments aren't supported on the OpenCode path yet.
+- Incoming Feishu attachments aren't forwarded to OpenCode yet, but files produced by its tools (e.g. a screenshot tool's image) are sent back to the chat.
 - OpenCode replies are chunked at a fixed 4096 chars — they don't honor a group's `textChunkLimit` override (that setting only applies to Claude Code replies today).
 
 ## Claude via tmux (experimental)
@@ -382,6 +396,14 @@ This exists because Claude Code CLI wraps a channel-sourced message received whi
 
 Each spawned session also gets a per-session Stop hook (via `--settings`, layered on top of the project's own settings) that signals the router when a turn actually finishes — this is the primary completion signal; a quiet-period heuristic on the JSONL transcript is only a fallback. Attachments are downloaded by the router itself (there's no MCP channel plugin loaded for the CLI to call `download_attachment` with) and handed to the CLI as a local file path to `Read`. `agent.fallback: "opencode"` works here too, under the same pre-execution-only guarantee as the socket path — `sendAndAwaitReply` throwing is, by contract, always a failure *before* the message reached the CLI, so it's provably safe to hand the task to OpenCode instead.
 
+### Live progress, streaming replies, and mid-turn messages
+
+Each tmux turn gets a "🤔 思考中…" status card that live-updates with the tool currently running and elapsed time. Patches are throttled to one every 1.5s (each carries the latest state, never a backlog), and a 15s heartbeat keeps the elapsed time ticking even during a single long tool call that produces no new progress events. While a dialog card is pending for the same workdir the status card stays quiet — the CLI is blocked on the user, and two cards competing for attention would be worse than silence.
+
+Reply text streams into the chat as each new text block is written to the transcript, rather than waiting for the whole turn to finish. The status card still finalizes once the turn ends (`✅ 已回复` / `⚠️ 执行失败`, or the fallback notice).
+
+A message that arrives while a turn is already in flight is absorbed into that same turn by Claude Code itself: the router doesn't send it as a separate prompt, skips its own status card, and marks it `↪️ 已并入上一条消息的回复` once the in-flight turn settles. A turn can run up to 8 hours before the hard reply timeout.
+
 ### Interactive dialogs (permission prompts, `/status`-style panels)
 
 A session blocked on an interactive menu (nothing being written to its transcript, no Stop signal) gets its pane scraped for a numbered choice menu. If one is found — e.g. a tool permission prompt:
@@ -397,6 +419,8 @@ Cards are built as Feishu interactive-card schema 2.0, which dropped the older `
 
 `/restart` and `/esc` both cancel any dialog this workdir is still waiting on before acting — otherwise a click arriving after a `/restart` would hit a brand-new, unrelated session under the same name.
 
+`/select <n>` is the manual escape hatch for a menu whose layout the parser doesn't recognize (so no card was ever sent): it types option `n` into the pane and presses Enter, exactly like clicking that option on a card would.
+
 A plain tab bar with no numbered options (`/status`'s "Settings  Status   Config   Usage   Stats") also gets a card — one button per tab name — but navigating it is necessarily an *approximation*: which tab is actually focused is conveyed by color/style alone, invisible to a plain-text pane capture, so `parseTabBar` just assumes the panel opened on the leftmost tab and reaches option N by pressing Right (N-1) times, wrapping circularly since there's no Left. After a switch, a screenshot of wherever it actually landed is sent, followed automatically by a fresh card offering the same tab choices again — and that repeat card (and its Right-press math) is relative to the *real* last-clicked tab, not re-assuming leftmost every time, so a chain of switches stays accurate even if the first guess wasn't. That tracking only lives for one message's whole switching chain, though — pressing Esc, or sending a new message later, resets back to the leftmost assumption.
 
 This doesn't catch every possible interactive state — a deeper nested view inside a panel (e.g. `/status`'s own Settings tab, itself a scrollable, searchable list of toggles) has neither a numbered menu nor a plain tab bar to convert, so it still just sits there. For that case, `pane-screenshot.ts` instead renders the pane (ANSI colors included, via `ansi-to-html` + a headless Chromium) to a PNG and sends it as an image — so you can at least see what's on screen, even though clicking into it isn't possible. Falls back to doing nothing (logged, not an error) if this machine has no cached Playwright Chromium build. `/esc` (a bare Escape keypress straight to the session) and `/restart` (kill + respawn) remain the ways to actually get past a stuck panel like this.
@@ -405,7 +429,7 @@ Not every slash command produces a real assistant turn at all — a repeat `/mod
 
 **Known gaps:**
 - Tab-bar navigation (`/status`'s top-level tabs) is a best-effort guess, not a measured fact — it can land on the wrong tab, and the tracking that keeps repeat switches relative to the real last click doesn't survive past Esc or a new message. Deeper nested views inside a panel get a screenshot instead of a card; use `/esc` to actually dismiss one.
-- A tmux session survives a router restart (its context isn't lost, unlike socket mode) but the router's in-memory `--session-id` pin doesn't — the next message after a restart falls back to "newest transcript by mtime" for that workdir, which can misattribute output if more than one `claude` process targets the same directory.
+- A tmux session survives a router restart (its context isn't lost, unlike socket mode), and the router persists each workdir's `--session-id` in `router.db` so after a restart it reattaches to the exact transcript file. Only if that bookkeeping is lost (e.g. a fresh state directory) does it fall back to "newest transcript by mtime", which can misattribute output if more than one `claude` process targets the same directory.
 - Idle tmux sessions are killed after an hour of no messages (`TMUX_IDLE_MS` in `router.ts`).
 - The `claude` binary is resolved once at startup (`Bun.which`, then `~/.local/bin/claude` and a couple of other common install paths) rather than trusting PATH inside the spawned tmux pane — found the hard way when a launchd service's stripped PATH didn't include it, see `claude-tmux-worker.ts`'s `resolveClaudeBin`.
 
@@ -492,7 +516,7 @@ Groups are off by default. The bot must be added to the group by a group admin f
 ├── debug.log         # Worker (server.ts) debug log
 ├── router-debug.log  # Router debug log
 ├── router.sock       # Unix socket workers connect to
-├── router.db         # SQLite: conversation bindings, permission callbacks, processed-event dedup
+├── router.db         # SQLite: conversation bindings, tmux session-id pins, permission callbacks, processed-event dedup
 └── router.lock/       # Router singleton lock (prevents duplicate router processes)
 ```
 
@@ -523,7 +547,7 @@ When the parent Claude process exits, the plugin detects the ppid change within 
 bun test
 ```
 
-147 tests across 10 files. `server.test.ts` covers access control (gate logic), text chunking, mention detection, permission reply parsing, confirm code generation, and chat authorization. `routing/*.test.ts` covers config loading/validation, route resolution (`access.json` + `agents.yaml` merge, sanitization), conversation bindings, SQLite storage, and the (currently-unwired) fallback state machine. `adapters/**/*.test.ts` covers the OpenCode HTTP/SSE client (including the event-stream-never-closes edge case) and the Claude adapter's capability boundaries.
+261 tests across 19 files. `server.test.ts` covers access control (gate logic), text chunking, mention detection, permission reply parsing, confirm code generation, and chat authorization. `routing/*.test.ts` covers config loading/validation (including allowed-root canonicalization for symlinked paths), route resolution (`access.json` + `agents.yaml` merge, sanitization), conversation bindings, SQLite storage (including tmux session-id persistence), OpenCode session-eviction rules, and the (currently-unwired) fallback state machine. `adapters/**/*.test.ts` covers the OpenCode async prompt/status-poll client (SSE parsing, permission polling, status-poll completion, multi-step message merging, attachment forwarding, timeout/abort paths), and the Claude adapter's capability boundaries. `claude-tmux-worker.test.ts` covers dialog/tab-bar parsing and reply-completion heuristics; the remaining root-level tests cover attachments, pane screenshots, data-URI decoding, chunking, rate-limit parsing, and reconnect backoff.
 
 ## Security
 
