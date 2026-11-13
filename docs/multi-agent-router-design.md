@@ -155,7 +155,8 @@ agents:
     baseUrl: http://127.0.0.1:4096
     passwordEnv: OPENCODE_SERVER_PASSWORD
     requestTimeoutSeconds: 30
-    taskTimeoutSeconds: 3600
+    taskTimeoutSeconds: 3600   # no-progress timeout; re-armed by activity
+    taskHardCapSeconds: 28800  # optional absolute cap (default 8 hours)
     maxConcurrency: 4
 
 projects:
@@ -468,10 +469,16 @@ MVP 验收：
 
 OpenCode turns are submitted once through `POST /session/{id}/prompt_async`,
 with a caller-owned `messageID`. Each HTTP request is bounded by
-`requestTimeoutSeconds`; the overall turn is bounded independently by
-`taskTimeoutSeconds`. Long turns do not hold one HTTP response open. A lost
-POST acknowledgement is ambiguous, so the adapter observes that exact message
-ID instead of automatically submitting the work a second time.
+`requestTimeoutSeconds`; long turns do not hold one HTTP response open.
+`taskTimeoutSeconds` is a no-progress timeout, re-armed whenever tool, text or
+permission activity is observed on the directory-scoped stream, so a
+legitimately long turn (75+ steps, multiple pytest runs) is not cut off merely
+for exceeding a fixed wall clock. `taskHardCapSeconds` remains an absolute
+ceiling regardless of progress (default 8 hours). A timeout failure carries a
+human-readable `detail` (elapsed, idle duration, last activity) so the user
+sees why the turn was reclaimed instead of a bare `task_timeout`. A lost POST
+acknowledgement is ambiguous, so the adapter observes that exact message ID
+instead of automatically submitting the work a second time.
 
 A short `/session/status` poll confirms idle; `/session/{id}/message` then
 collects only assistant messages whose `parentID` matches this turn. A final

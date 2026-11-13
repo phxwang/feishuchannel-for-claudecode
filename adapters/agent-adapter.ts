@@ -72,7 +72,8 @@ export type AgentEvent =
   | { type: 'permission.requested'; taskId: string; requestId: string; toolName: string; description: string }
   | { type: 'attachment.completed'; taskId: string; mime: string; dataUrl: string; filename?: string }
   | { type: 'session.idle'; taskId: string }
-  | { type: 'task.failed'; taskId: string; reason: string }
+  /** `detail` is optional human-readable context (e.g. timeout elapsed/last activity), shown alongside `reason`. */
+  | { type: 'task.failed'; taskId: string; reason: string; detail?: string }
   | { type: 'task.aborted'; taskId: string }
 
 export interface AgentAdapter {

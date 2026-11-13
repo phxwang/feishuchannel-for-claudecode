@@ -12,7 +12,7 @@
  * with prompt_async and finalizes from the message list once idle.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { OpenCodeAdapter, OpenCodeError } from './opencode-adapter'
+import { describeTaskTimeout, formatTaskDuration, OpenCodeAdapter, OpenCodeError } from './opencode-adapter'
 
 let server: ReturnType<typeof Bun.serve>
 let baseUrl: string
@@ -121,7 +121,7 @@ function startMockServer() {
 beforeEach(startMockServer)
 afterEach(() => server.stop(true))
 
-function adapter(overrides: Partial<{ requestTimeoutSeconds: number; taskTimeoutSeconds: number; pollIntervalMs: number }> = {}) {
+function adapter(overrides: Partial<{ requestTimeoutSeconds: number; taskTimeoutSeconds: number; taskHardCapSeconds: number; pollIntervalMs: number }> = {}) {
   return new OpenCodeAdapter({ baseUrl, requestTimeoutSeconds: 5, taskTimeoutSeconds: 5, pollIntervalMs: 10, ...overrides })
 }
 
@@ -358,7 +358,8 @@ describe('send — abort / timeout / connection failures', () => {
     eventStreamNeverCloses = true
     const out: any[] = []
     for await (const e of adapter({ taskTimeoutSeconds: 0.2 }).send(task(), new AbortController().signal)) out.push(e)
-    expect(out.at(-1)).toEqual({ type: 'task.failed', taskId: 't1', reason: 'task_timeout' })
+    expect(out.at(-1)?.reason).toBe('task_timeout')
+    expect(out.at(-1)?.detail).toContain('无新进展')
   })
 
   test('the same stuck turn, but the /event stream never connected — a mid-task permission would have been unobservable', async () => {
@@ -371,7 +372,8 @@ describe('send — abort / timeout / connection failures', () => {
     const a = new OpenCodeAdapter({ baseUrl, requestTimeoutSeconds: 5, taskTimeoutSeconds: 0.2, pollIntervalMs: 10 }, noEventFetch)
     const out: any[] = []
     for await (const e of a.send(task(), new AbortController().signal)) out.push(e)
-    expect(out.at(-1)).toEqual({ type: 'task.failed', taskId: 't1', reason: 'task_timeout_no_event_stream' })
+    expect(out.at(-1)?.reason).toBe('task_timeout_no_event_stream')
+    expect(out.at(-1)?.detail).toContain('无新进展')
   })
 
   test('lost prompt acknowledgement observes accepted turn without reposting', async () => {
@@ -431,6 +433,41 @@ describe('long-running turn regression', () => {
     for await (const event of a.send(task(), new AbortController().signal)) out.push(event)
     return out
   }
+
+  test('progress re-arms the no-progress timeout instead of killing a long turn at a fixed wall clock', async () => {
+    statusBody = { 'sess-1': { type: 'busy' } }
+    eventStreamNeverCloses = true
+    const interval = setInterval(() => {
+      eventController?.enqueue(encoder().encode(`data: ${JSON.stringify({
+        type: 'message.part.updated',
+        properties: { sessionID: 'sess-1', part: { type: 'tool', tool: 'bash', state: { status: 'running' } } },
+      })}\n\n`))
+    }, 40)
+    const stop = setTimeout(() => { clearInterval(interval); statusBody = {} }, 420)
+    try {
+      // A 150ms no-progress timeout would fire at least twice without re-arming.
+      const out = await collect(adapter({ taskTimeoutSeconds: 0.15 }))
+      expect(out.filter(e => e.type === 'task.failed')).toHaveLength(0)
+      expect(out.at(-1)?.type).toBe('session.idle')
+    } finally { clearInterval(interval); clearTimeout(stop) }
+  })
+
+  test('the hard cap still reclaims a turn that keeps producing progress', async () => {
+    statusBody = { 'sess-1': { type: 'busy' } }
+    eventStreamNeverCloses = true
+    const interval = setInterval(() => {
+      eventController?.enqueue(encoder().encode(`data: ${JSON.stringify({
+        type: 'message.part.updated',
+        properties: { sessionID: 'sess-1', part: { type: 'tool', tool: 'bash', state: { status: 'running' } } },
+      })}\n\n`))
+    }, 30)
+    try {
+      const out = await collect(adapter({ taskTimeoutSeconds: 5, taskHardCapSeconds: 0.2 }))
+      expect(out.at(-1)?.reason).toBe('task_timeout')
+      expect(out.at(-1)?.detail).toContain('最长运行上限')
+      expect(out.at(-1)?.detail).toContain('bash')
+    } finally { clearInterval(interval) }
+  })
 
   test('task survives many short-request timeout windows and an SSE disconnect', async () => {
     statusBody = { 'sess-1': { type: 'busy' } }
@@ -571,4 +608,15 @@ test('keeps completed artifacts from earlier steps when the final assistant erro
   for await (const event of adapter().send(task(), new AbortController().signal)) out.push(event)
   expect(out.map(e => e.type)).toEqual(['task.started', 'tool.completed', 'attachment.completed', 'task.failed'])
   expect(out.at(-1)?.reason).toBe('backend reset')
+})
+
+test('timeout diagnostics distinguish no-progress from the hard cap and include durations', () => {
+  expect(formatTaskDuration(0)).toBe('0秒')
+  expect(formatTaskDuration(59_000)).toBe('59秒')
+  expect(formatTaskDuration(3_661_000)).toBe('1小时1分')
+
+  expect(describeTaskTimeout({ kind: 'idle', elapsedMs: 3_661_000, idleMs: 3_600_000, hardCapMs: 28_800_000, lastActivity: '工具 bash' }))
+    .toBe('已运行 1小时1分；已 1小时0分 无新进展；最后活动：工具 bash')
+  expect(describeTaskTimeout({ kind: 'hard_cap', elapsedMs: 28_800_000, idleMs: 5_000, hardCapMs: 28_800_000, lastActivity: '文本输出' }))
+    .toBe('已达最长运行上限 8小时0分；已运行 8小时0分；最后活动：文本输出')
 })

@@ -45,6 +45,7 @@ const routerConfigSchema = z.object({
       passwordEnv: z.string().optional(),
       requestTimeoutSeconds: z.number().positive(),
       taskTimeoutSeconds: z.number().positive(),
+      taskHardCapSeconds: z.number().positive().optional(),
       maxConcurrency: z.number().int().positive(),
     }).optional(),
   }).default({}),

@@ -99,6 +99,7 @@ const openCodeAdapter = openCodeCfg
       baseUrl: openCodeCfg.baseUrl,
       requestTimeoutSeconds: openCodeCfg.requestTimeoutSeconds,
       taskTimeoutSeconds: openCodeCfg.taskTimeoutSeconds,
+      taskHardCapSeconds: openCodeCfg.taskHardCapSeconds,
       passwordEnv: openCodeCfg.passwordEnv,
       onWarn: dbg,
     })
@@ -457,11 +458,14 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
       } else if (event.type === 'attachment.completed') {
         attachments.push(event)
       } else if (event.type === 'task.failed') {
-        dbg(`opencode: task ${taskId} failed: ${event.reason}`)
+        dbg(`opencode: task ${taskId} failed: ${event.reason}${event.detail ? ` (${event.detail})` : ''}`)
         // Transport/provider/deadline failures do not invalidate a session.
         // Only delete the binding we used, and only on proven session absence.
         evictMissingOpenCodeBinding(openCodeBindings, key, sessionId, event.reason)
-        void replyText(chatId, messageId, `⚠️ OpenCode 执行失败：${event.reason}`)
+        const timedOut = event.reason === 'task_timeout' || event.reason === 'task_timeout_no_event_stream'
+        void replyText(chatId, messageId, timedOut
+          ? `⏱️ OpenCode 任务超时${event.detail ? `：${event.detail}` : ''}`
+          : `⚠️ OpenCode 执行失败：${event.reason}${event.detail ? `（${event.detail}）` : ''}`)
         await flushAttachments()
         return
       } else if (event.type === 'task.aborted') {

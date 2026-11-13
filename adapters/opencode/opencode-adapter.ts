@@ -72,7 +72,12 @@ export const DEFAULT_OPENCODE_PATHS: OpenCodeApiPaths = {
 export interface OpenCodeAdapterConfig {
   baseUrl: string
   requestTimeoutSeconds: number
+  /** No-progress timeout: a turn is aborted only after this long without any observed
+   *  tool/text/permission activity. Progress re-arms the timer, so legitimate long
+   *  turns are not cut off just for exceeding a fixed wall-clock duration. */
   taskTimeoutSeconds: number
+  /** Absolute cap regardless of progress (seconds). Defaults to 8 hours. */
+  taskHardCapSeconds?: number
   passwordEnv?: string
   paths?: Partial<OpenCodeApiPaths>
   /** How often to poll `/session/status` while a turn runs (ms). Defaults to 1000. */
@@ -93,7 +98,39 @@ type RawMessage = {
 type SessionStatus = { type?: string }
 
 const DEFAULT_POLL_INTERVAL_MS = 1000
+const DEFAULT_TASK_HARD_CAP_SECONDS = 8 * 60 * 60
 const STATUS_PATH = '/session/status'
+
+/** Coarse, human-readable duration for timeout diagnostics (Chinese, matching user-facing replies). */
+export function formatTaskDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  if (seconds < 60) return `${seconds}秒`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}分${seconds % 60}秒`
+  return `${Math.floor(minutes / 60)}小时${minutes % 60}分`
+}
+
+export type TaskTimeoutKind = 'idle' | 'hard_cap'
+
+/** Builds the `detail` shown next to a task_timeout failure. */
+export function describeTaskTimeout(opts: {
+  kind: TaskTimeoutKind
+  elapsedMs: number
+  idleMs: number
+  hardCapMs: number
+  lastActivity?: string
+}): string {
+  const parts: string[] = []
+  if (opts.kind === 'hard_cap') {
+    parts.push(`已达最长运行上限 ${formatTaskDuration(opts.hardCapMs)}`)
+    parts.push(`已运行 ${formatTaskDuration(opts.elapsedMs)}`)
+  } else {
+    parts.push(`已运行 ${formatTaskDuration(opts.elapsedMs)}`)
+    parts.push(`已 ${formatTaskDuration(opts.idleMs)} 无新进展`)
+  }
+  if (opts.lastActivity) parts.push(`最后活动：${opts.lastActivity}`)
+  return parts.join('；')
+}
 
 // Match OpenCode v1.18.15's ascending message identifier: a six-byte
 // timestamp/counter prefix plus 14 random base62 characters. Arbitrary UUIDs
@@ -209,7 +246,60 @@ export class OpenCodeAdapter implements AgentAdapter {
     const onAbort = () => { run.abort(); stopTurn() }
     if (signal.aborted) { yield { type: 'task.aborted', taskId: task.taskId }; return }
     signal.addEventListener('abort', onAbort)
-    const deadline = setTimeout(() => { run.abort(); stopTurn() }, this.config.taskTimeoutSeconds * 1000)
+
+    // A fixed wall-clock deadline kills legitimate long turns (observed live:
+    // a 75+-step verification turn still making progress at the 1-hour mark).
+    // taskTimeoutSeconds is therefore a *no-progress* timeout: any observed
+    // tool/text/permission activity re-arms it. taskHardCapSeconds remains an
+    // absolute ceiling so a session that keeps emitting events forever still
+    // eventually gets reclaimed.
+    const startedAt = Date.now()
+    const idleTimeoutMs = this.config.taskTimeoutSeconds * 1000
+    const hardCapMs = (this.config.taskHardCapSeconds ?? DEFAULT_TASK_HARD_CAP_SECONDS) * 1000
+    let lastProgressAt = startedAt
+    let lastActivity: string | undefined
+    let timeoutKind: TaskTimeoutKind | undefined
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+
+    const timeoutSnapshot = () => ({
+      kind: timeoutKind ?? 'idle' as TaskTimeoutKind,
+      elapsedMs: Date.now() - startedAt,
+      idleMs: Date.now() - lastProgressAt,
+      hardCapMs,
+      lastActivity,
+    })
+
+    function checkDeadline() {
+      if (run.signal.aborted) return
+      const now = Date.now()
+      if (now - startedAt >= hardCapMs) {
+        timeoutKind = 'hard_cap'
+        run.abort(); stopTurn(); return
+      }
+      if (now - lastProgressAt >= idleTimeoutMs) {
+        timeoutKind = 'idle'
+        run.abort(); stopTurn(); return
+      }
+      armWatchdog()
+    }
+
+    function armWatchdog() {
+      if (run.signal.aborted) return
+      clearTimeout(watchdog)
+      const now = Date.now()
+      const idleIn = lastProgressAt + idleTimeoutMs - now
+      const hardIn = startedAt + hardCapMs - now
+      watchdog = setTimeout(checkDeadline, Math.max(1, Math.min(idleIn, hardIn)))
+    }
+
+    /** Any turn activity postpones the idle timeout; only real progress should call this. */
+    function markProgress(label: string) {
+      lastProgressAt = Date.now()
+      lastActivity = label
+      armWatchdog()
+    }
+
+    armWatchdog()
     const pollInterval = this.config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
     let sseConnected = false
     const events = this.openEventStream(task, run.signal, () => { sseConnected = true }, directory)
@@ -232,7 +322,7 @@ export class OpenCodeAdapter implements AgentAdapter {
         }, { directory })
       } catch (error) {
         if (run.signal.aborted) {
-          yield signal.aborted ? { type: 'task.aborted', taskId: task.taskId } : this.timeoutEvent(task, sseConnected)
+          yield signal.aborted ? { type: 'task.aborted', taskId: task.taskId } : this.timeoutEvent(task, sseConnected, timeoutSnapshot())
           return
         }
         if (error instanceof OpenCodeError) {
@@ -255,9 +345,19 @@ export class OpenCodeAdapter implements AgentAdapter {
           pendingEvent = undefined
           if (result.done) { exhausted = true; continue }
           const event = result.value
+          // Liveness only (these are not forwarded to the router yet): any
+          // tool/text activity in this directory-scoped stream proves the turn
+          // is still moving, so the no-progress timeout must not fire. Events
+          // from other turns in the same session can only make the timeout more
+          // lenient here, never terminate our turn early.
+          if (event.type === 'tool.started') markProgress(`工具 ${event.toolName}`)
+          else if (event.type === 'tool.completed') markProgress(`工具 ${event.toolName} 完成`)
+          else if (event.type === 'tool.failed') markProgress(`工具 ${event.toolName} 失败`)
+          else if (event.type === 'text.delta') markProgress('文本输出')
           // Session-wide idle/error events have no turn identity. The message
           // list plus idle status, not these potentially stale events, decides completion.
           if (event.type === 'permission.requested' && !permissions.has(event.requestId)) {
+            markProgress(`授权请求：${event.toolName}`)
             permissions.add(event.requestId)
             if (directory) this.permissionDirectories.set(event.requestId, directory)
             yield event
@@ -273,6 +373,7 @@ export class OpenCodeAdapter implements AgentAdapter {
             if (raw.sessionID !== task.sessionId || permissions.has(raw.id)) continue
             const event = normalizeOpenCodeEvent({ type: 'permission.asked', properties: raw }, task.taskId)
             if (event?.type !== 'permission.requested') continue
+            markProgress(`授权请求：${event.toolName}`)
             permissions.add(event.requestId)
             if (directory) this.permissionDirectories.set(event.requestId, directory)
             yield event
@@ -291,9 +392,9 @@ export class OpenCodeAdapter implements AgentAdapter {
           this.config.onWarn?.(`opencode adapter: polling ${task.sessionId} failed: ${error}`)
         }
       }
-      yield signal.aborted ? { type: 'task.aborted', taskId: task.taskId } : this.timeoutEvent(task, sseConnected)
+      yield signal.aborted ? { type: 'task.aborted', taskId: task.taskId } : this.timeoutEvent(task, sseConnected, timeoutSnapshot())
     } finally {
-      clearTimeout(deadline)
+      clearTimeout(watchdog)
       clearTimeout(tickTimer)
       signal.removeEventListener('abort', onAbort)
       run.abort()
@@ -309,10 +410,21 @@ export class OpenCodeAdapter implements AgentAdapter {
     } catch (error) { return isMissingOpenCodeSession(error) }
   }
 
-  private timeoutEvent(task: AgentTask, sseConnected: boolean): AgentEvent {
+  private timeoutEvent(
+    task: AgentTask,
+    sseConnected: boolean,
+    timeout: { kind: TaskTimeoutKind; elapsedMs: number; idleMs: number; hardCapMs: number; lastActivity?: string },
+  ): AgentEvent {
     // Preserve the diagnostic distinguishing unavailable SSE; pending
     // permissions are additionally recovered through short /permission polls.
-    return { type: 'task.failed', taskId: task.taskId, reason: sseConnected ? 'task_timeout' : 'task_timeout_no_event_stream' }
+    // `detail` tells the user *why* the turn was reclaimed (no progress vs the
+    // absolute ceiling) and what it was doing last, instead of a bare reason.
+    return {
+      type: 'task.failed',
+      taskId: task.taskId,
+      reason: sseConnected ? 'task_timeout' : 'task_timeout_no_event_stream',
+      detail: describeTaskTimeout(timeout),
+    }
   }
 
   /**

@@ -42,7 +42,10 @@ export interface OpenCodeAgentConfig {
   baseUrl: string
   passwordEnv?: string
   requestTimeoutSeconds: number
+  /** No-progress timeout: re-armed by observed tool/text activity. */
   taskTimeoutSeconds: number
+  /** Absolute cap regardless of progress (seconds). Defaults to 8 hours. */
+  taskHardCapSeconds?: number
   maxConcurrency: number
 }
 

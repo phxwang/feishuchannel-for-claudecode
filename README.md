@@ -310,7 +310,8 @@ agents:
     type: opencode
     baseUrl: http://127.0.0.1:4096
     requestTimeoutSeconds: 30
-    taskTimeoutSeconds: 600
+    taskTimeoutSeconds: 600        # no-progress timeout, re-armed by tool/text activity
+    taskHardCapSeconds: 28800      # optional absolute cap (default 8 hours)
     maxConcurrency: 4
 projects:
   my-project:
@@ -327,7 +328,7 @@ fallback:
 
 `agents.yaml` never decides which project a chat maps to — that's still `access.json`'s job (see below). It only declares which backends exist and which agents each project is allowed to use. Only `fallback.enabled` is actually read by the router today — the other `fallback.*` fields are validated but not yet consulted anywhere in dispatch; they're placeholders for a future richer fallback policy.
 
-`requestTimeoutSeconds` bounds each individual HTTP request to `opencode serve`, while `taskTimeoutSeconds` independently bounds the whole turn — the two are deliberately separate (see [Long turns](#long-turns)).
+`requestTimeoutSeconds` bounds each individual HTTP request to `opencode serve`. `taskTimeoutSeconds` is a **no-progress** timeout: any observed tool, text or permission activity re-arms it, so a legitimate long turn is not killed just for exceeding a fixed wall-clock duration. `taskHardCapSeconds` is the absolute ceiling regardless of progress (default 8 hours) — see [Long turns](#long-turns).
 
 ### 2. Opt a group or DM into OpenCode via `access.json`
 
@@ -350,7 +351,8 @@ Any group/DM without an explicit `agent` field stays on Claude, regardless of wh
 
 A turn is submitted once to `POST /session/{id}/prompt_async` (which returns immediately) and then observed by polling `/session/status` and reading `/session/{id}/message` once the session is idle. No single HTTP request has to stay open for the duration of the turn, so long multi-step turns (75+ steps, several minutes) are no longer cut off by the HTTP transport with a `connection_failed: The operation timed out.` while `opencode serve` keeps working in the background.
 
-- `requestTimeoutSeconds` bounds each individual HTTP call; `taskTimeoutSeconds` bounds the whole turn.
+- `requestTimeoutSeconds` bounds each individual HTTP call; `taskTimeoutSeconds` is a no-progress timeout re-armed by tool/text/permission activity, and `taskHardCapSeconds` (default 8 hours) is the absolute cap.
+- When a turn is reclaimed, the failure message says why — e.g. `⏱️ OpenCode 任务超时：已运行 1小时1分；已 1小时0分 无新进展；最后活动：工具 bash` — instead of a bare `task_timeout`.
 - The adapter submits its own user-message ID and finalizes only from assistant messages whose `parentID` matches that ID, so concurrent or stale turns in the same session can't be mistaken for this one.
 - A lost `prompt_async` acknowledgement is ambiguous — the server may already have accepted the prompt — so the adapter watches the exact message ID instead of submitting the prompt a second time.
 - Completion requires an idle `/session/status` plus a final assistant message with a completion timestamp (and not a `tool-calls` continuation); stale SSE idle notifications never finalize a turn.
