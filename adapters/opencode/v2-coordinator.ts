@@ -84,11 +84,19 @@ export class V2SessionCoordinator {
   private async initialize() {
     // Restart recovery is intentionally not inferred. A reused v2 session must be idle.
     await this.request(this.path('/wait'), {}, undefined, Math.min(this.config.requestTimeoutMs, 1000))
+    const pendingInputs = new Set<string>()
     for (let page = 0; page < 100; page++) {
       const history = await this.request(this.path(`/history?limit=200&after=${this.cursor}`))
       if (!Array.isArray(history?.data)) throw new V2ProtocolError('v2 history contract missing')
-      for (const event of history.data) this.cursor = Math.max(this.cursor, event.durable?.seq ?? 0)
-      if (!history.hasMore) return
+      for (const event of history.data) {
+        this.cursor = Math.max(this.cursor, event.durable?.seq ?? 0)
+        if (event.type === 'session.next.prompt.admitted') pendingInputs.add(event.data.messageID)
+        if (event.type === 'session.next.prompted') pendingInputs.delete(event.data.messageID)
+      }
+      if (!history.hasMore) {
+        if (pendingInputs.size) throw new V2ProtocolError('会话含未消费输入；拒绝自动唤醒，请先在 OpenCode 核验')
+        return
+      }
     }
     throw new V2ProtocolError('v2 history baseline exceeds bounded scan; no input submitted')
   }
@@ -141,7 +149,7 @@ export class V2SessionCoordinator {
     })
   }
   private ensureObserver() {
-    if (this.observing) return
+    if (this.observing || this.suspended) return
     const controller = new AbortController(); this.run = controller
     this.observing = this.observe(controller.signal).catch(() => { this.config.onWarn?.('opencode v2 observer stopped unexpectedly') }).finally(() => {
       controller.abort(); this.observing = undefined
@@ -305,12 +313,20 @@ export class V2SessionCoordinator {
     this.permissionGroups.delete(id); this.resolvedPermissions.add(id)
   }
   async stop(source: string) {
+    if ([...this.groups.values()].some(g => g.source !== source)) throw new V2ProtocolError('Session belongs to another chat')
+    // Cancel observation HTTP before waiting for its short mutation lock: stop
+    // must not queue behind stalled history/projection requests.
+    this.suspended = true
+    this.run?.abort()
     return this.lock(async () => {
-      if ([...this.groups.values()].some(g => g.source !== source)) throw new V2ProtocolError('Session belongs to another chat')
-      this.suspended = true // Future prompt must not accidentally wake pending queued input.
-      await this.request(this.path('/interrupt'), {})
-      for (const group of [...this.groups.values()]) this.close(group, [...group.texts.values()], { reason: 'interrupted', detail: '停止已请求；待处理输入未删除，不自动恢复执行' })
-      this.run?.abort()
+      let confirmed = false
+      try { await this.request(this.path('/interrupt'), {}); confirmed = true }
+      finally {
+        for (const group of [...this.groups.values()]) this.close(group, [...group.texts.values()], {
+          reason: confirmed ? 'interrupted' : 'interrupt_outcome_unknown',
+          detail: '停止已请求；待处理输入未删除，不自动恢复执行',
+        })
+      }
     })
   }
 }

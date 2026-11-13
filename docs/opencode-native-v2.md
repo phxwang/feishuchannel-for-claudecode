@@ -34,7 +34,7 @@ Native mode currently deliberately refuses `route.agent.model` overrides rather 
 
 ## Ownership and completion
 
-The coordinator key contains endpoint, realpath directory and session. Only one source conversation may own its active/queued groups. Reusing a persisted native session first requires bounded idle proof and a finite history baseline; an active session is not silently adopted after router restart.
+The coordinator key contains endpoint, realpath directory and session. Only one source conversation may own its active/queued groups. Reusing a persisted native session first requires bounded idle proof and a finite history baseline; an active session or one with preexisting unconsumed admissions is not silently adopted/woken after router restart.
 
 Durable `session.next.prompted` marks input consumption, and the subsequent `session.next.step.started` associates assistant IDs with that execution group. No v2 `parentID` is invented. Unknown external input suspends the coordinator and suppresses that work's output. A new message arriving after proven idle creates a fresh group rather than losing its reply under a stale “absorbed” flag. Queue inputs maintain their own group and manifest.
 
