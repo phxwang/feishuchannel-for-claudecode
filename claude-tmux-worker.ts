@@ -117,7 +117,7 @@ function extractLocalCommandOutput(value: unknown): string | null {
  * model is already set just prints "Kept model as X") — found live that
  * this never produces a real assistant turn or a Stop-hook signal at all,
  * so without this, sendAndAwaitReply would sit polling for the full
- * replyTimeoutMs (10 minutes by default) even though the CLI already
+ * replyTimeoutMs (8 hours by default) even though the CLI already
  * answered on screen. This is recorded in the transcript as either a
  * `type: 'system', subtype: 'local_command'` line (content at the top
  * level) or, in an older/different CLI build, a `type: 'user'` line
@@ -156,6 +156,51 @@ export function parseAssistantTextLines(lines: string[]): string[] {
   return out
 }
 
+export interface ProgressEvent { tool: string; summary: string }
+
+/** Tool-input fields worth surfacing as a one-line progress summary, tried in this order; the first string value found wins. Deliberately short-circuits on common built-in-tool shapes rather than trying to be exhaustive. */
+const PROGRESS_SUMMARY_FIELDS = ['command', 'file_path', 'path', 'pattern', 'url', 'query', 'description']
+const PROGRESS_SUMMARY_MAX_LEN = 80
+
+function summarizeToolInput(input: unknown): string {
+  if (!input || typeof input !== 'object') return ''
+  const obj = input as Record<string, unknown>
+  for (const key of PROGRESS_SUMMARY_FIELDS) {
+    const v = obj[key]
+    if (typeof v === 'string' && v) {
+      return v.length > PROGRESS_SUMMARY_MAX_LEN ? v.slice(0, PROGRESS_SUMMARY_MAX_LEN) + '…' : v
+    }
+  }
+  return ''
+}
+
+/**
+ * Pulls tool_use blocks out of raw JSONL transcript lines — the only
+ * "something is happening" signal available before a turn finishes, since
+ * Claude Code writes whole content blocks, not token-level deltas, to the
+ * transcript. Used to drive a live "thinking…" status card; deliberately
+ * only surfaces the tool name plus a short, truncated summary of one input
+ * field, never the raw input object, so a large file write or command
+ * doesn't get dumped onto a status card visible to the whole chat.
+ */
+export function parseProgressLines(lines: string[]): ProgressEvent[] {
+  const out: ProgressEvent[] = []
+  for (const line of lines) {
+    if (!line.trim()) continue
+    let parsed: TranscriptLine
+    try { parsed = JSON.parse(line) } catch { continue }
+    if (parsed.type !== 'assistant') continue
+    const content = parsed.message?.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (block && typeof block === 'object' && (block as any).type === 'tool_use' && typeof (block as any).name === 'string') {
+        out.push({ tool: (block as any).name, summary: summarizeToolInput((block as any).input) })
+      }
+    }
+  }
+  return out
+}
+
 /** True once `quietMs` have passed since the transcript last grew — our proxy for "turn finished". */
 export function isQuietDone(lastChangeAtMs: number, nowMs: number, quietMs: number): boolean {
   return nowMs - lastChangeAtMs >= quietMs
@@ -189,11 +234,25 @@ export const DIALOG_TIMED_OUT_CHOICE = -1
 export type StuckPaneHandler = (paneAnsiText: string) => Promise<void>
 /** Called with the raw ANSI pane text right after a `kind: 'tabs'` choice's Right-key presses land — since the chosen tab can't be confirmed from plain-text parsing (see parseTabBar's "assumed leftmost tab" caveat), the caller is expected to render and send a screenshot so the user can see which tab was actually reached. Purely informational, like StuckPaneHandler; the next dialog card (offering the same tab choices again) is sent automatically afterward once the still-visible tab bar is re-detected on the next poll. */
 export type TabSwitchedHandler = (paneAnsiText: string) => Promise<void>
+/** Called synchronously with newly-seen tool_use events as soon as they're parsed off the transcript — fire-and-forget, so this must not throw or block; the caller is expected to just update its own in-memory state and let its own throttle/timer decide when (and whether) to actually act on it (e.g. patching a status card), not do network I/O here on every single call. */
+export type ProgressHandler = (events: ProgressEvent[]) => void
+/** Called synchronously with each new assistant text block as soon as it's parsed off the transcript, independent of whether a Stop has fired yet — the caller is expected to forward it right away (e.g. as its own Feishu message) rather than wait for the whole call to finish, so a reply mid-task reaches the chat as soon as it's written instead of being batched until collectReply's eventual return. Fire-and-forget, like ProgressHandler — must not throw or block. */
+export type TextChunkHandler = (text: string) => void
 export interface SendAndAwaitReplyOptions {
   model?: string
   onDialog?: DialogHandler
   onStuckPane?: StuckPaneHandler
   onTabSwitched?: TabSwitchedHandler
+  onProgress?: ProgressHandler
+  onTextChunk?: TextChunkHandler
+  /**
+   * Called synchronously, before delivery, if this call is being absorbed
+   * into an already-in-flight turn for the same workdir instead of starting
+   * its own — see `sendAndAwaitReply`. The caller can use this to finalize
+   * its own status card without a duplicate reply, since the in-flight
+   * call's eventual result already answers this message too.
+   */
+  onAbsorbed?: () => void
 }
 
 const OPTION_LINE_RE = /^\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$/
@@ -224,38 +283,102 @@ export function stripAnsi(text: string): string {
  *   - the option block must be the last non-blank content in the pane —
  *     a real menu replaces the normal input box/status bar while it's
  *     showing; a finished reply is always followed by both.
+ * Tolerates a wrapped description line under an option (indented prose,
+ * no leading digit), a divider, or a blank separator between options —
+ * found live on Claude's own multi-question AskUserQuestion dialogs,
+ * which interleave these between numbered options instead of keeping
+ * them in one tight block; without this the scan stopped at the first
+ * option's description and the whole dialog went unrecognized (no Feishu
+ * card at all). Only tolerated when a further option continuing the
+ * sequence actually follows, though — otherwise this is just ordinary
+ * content trailing a *finished* numbered list (quoted text, a nested
+ * bullet, a code block), which still has to clear the "last content in
+ * the pane" check below like before.
+ *
+ * The pane can contain more than one numbered-list-shaped block — e.g. a
+ * finished reply's own "1. ... 2. ... 3. ..." prose list sitting above a
+ * *real* dialog that only appears later (found live: a tool-use reply
+ * walking through a numbered data pipeline, immediately followed by a
+ * genuine permission prompt further down). Scanning every such block and
+ * preferring the last one that actually sits at the bottom of the pane —
+ * rather than stopping at the first block found and giving up as soon as
+ * it doesn't qualify — is what lets the real dialog still be found.
  * Returns null if no such menu is found.
  */
 export function parseDialogOptions(paneText: string): Dialog | null {
   const lines = paneText.split('\n')
-  const options: DialogOption[] = []
-  let firstOptionIdx = -1
-  let lastOptionIdx = -1
+  const blocks: { firstOptionIdx: number; lastOptionIdx: number; options: DialogOption[] }[] = []
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(OPTION_LINE_RE)
-    if (m) {
-      if (firstOptionIdx === -1) firstOptionIdx = i
-      lastOptionIdx = i
-      options.push({ number: m[1], label: m[2].trim() })
-    } else if (firstOptionIdx !== -1) {
-      break  // option block ended
+    if (!m || m[1] !== '1') continue  // a block only starts at option "1."
+    const options: DialogOption[] = [{ number: m[1], label: m[2].trim() }]
+    let lastOptionIdx = i
+    let j = i + 1
+    while (j < lines.length) {
+      const m2 = lines[j].match(OPTION_LINE_RE)
+      if (m2) {
+        if (m2[1] !== String(options.length + 1)) break  // non-sequential — block ends here
+        options.push({ number: m2[1], label: m2[2].trim() })
+        lastOptionIdx = j
+        j++
+        continue
+      }
+      // Tolerate this filler line only if the *nearest* upcoming option-shaped
+      // line (not just any later line) continues the sequence — bounded to
+      // "the next thing that looks like an option" rather than scanning
+      // arbitrarily far into the rest of the pane, which could otherwise
+      // match unrelated later content and wrongly swallow it into this block.
+      const nextNumber = String(options.length + 1)
+      const nextOptionLine = lines.slice(j + 1).find(l => OPTION_LINE_RE.test(l))
+      if (nextOptionLine && nextOptionLine.match(OPTION_LINE_RE)![1] === nextNumber) { j++; continue }
+      break
     }
-  }
-  if (options.length === 0) return null
-  if (!options.every((o, idx) => o.number === String(idx + 1))) return null
-  for (let i = lastOptionIdx + 1; i < lines.length; i++) {
-    const line = lines[i]
-    if (line.trim() === '' || TRAILING_DECORATION_RE.test(line) || ESC_HINT_RE.test(line)) continue
-    return null  // something else follows — not the bottom of the screen
+    blocks.push({ firstOptionIdx: i, lastOptionIdx, options })
+    i = lastOptionIdx  // resume scanning right after this block (loop's i++ advances past it)
   }
 
-  let question = ''
-  for (let i = firstOptionIdx - 1; i >= 0; i--) {
-    if (lines[i].trim() === '' || DIVIDER_LINE_RE.test(lines[i])) continue
-    question = lines[i].trim()
-    break
+  for (let b = blocks.length - 1; b >= 0; b--) {
+    const { firstOptionIdx, lastOptionIdx, options } = blocks[b]
+    let isBottomOfPane = true
+    for (let i = lastOptionIdx + 1; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.trim() === '' || TRAILING_DECORATION_RE.test(line) || ESC_HINT_RE.test(line)) continue
+      isBottomOfPane = false
+      break  // something else follows — not the bottom of the screen
+    }
+    if (!isBottomOfPane) continue
+
+    let question = ''
+    for (let i = firstOptionIdx - 1; i >= 0; i--) {
+      if (lines[i].trim() === '' || DIVIDER_LINE_RE.test(lines[i])) continue
+      question = lines[i].trim()
+      break
+    }
+    return { kind: 'numbered', question: question || 'Claude 需要你的输入', options }
   }
-  return { kind: 'numbered', question: question || 'Claude 需要你的输入', options }
+  return null
+}
+
+const RUNNING_SHELL_RE = /(\d+)\s+shells?\b/i
+
+/**
+ * Reads the CLI's own "N shell(s) [still running]" footer indicator off the
+ * last non-blank line of the pane — the same signal a human watching the
+ * terminal would use to tell a background bash task is still going after
+ * the turn's own Stop hook has already fired. Only checked on that last
+ * line (mirroring parseTabBar's lastNonBlank scan) so this can't match the
+ * phrase "shell" appearing incidentally in Claude's own finished reply text
+ * sitting higher up in the pane. Returns 0 (not found == none running) when
+ * the line doesn't match at all.
+ */
+export function parseRunningShellCount(paneText: string): number {
+  const lines = paneText.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() === '') continue
+    const m = lines[i].match(RUNNING_SHELL_RE)
+    return m ? parseInt(m[1], 10) : 0
+  }
+  return 0
 }
 
 const TAB_BAR_RE = /^\s*[A-Z][\w-]*(?:\s{2,}[A-Z][\w-]*){1,}\s*$/
@@ -376,8 +499,6 @@ export interface TmuxClaudeManagerOptions {
   replyTimeoutMs?: number
   /** After the Stop hook fires, how long to keep confirming the transcript has gone quiet before trusting it's really done. */
   postStopQuietMs?: number
-  /** Hard cap on the post-Stop confirmation window. */
-  postStopMaxMs?: number
   /** How long with no transcript growth before checking the pane for a pending interactive dialog (permission prompt, etc.) — shorter than quietMs since this is just "is the CLI blocked on input", not "is the turn over". */
   dialogCheckMs?: number
   /**
@@ -401,6 +522,20 @@ export interface TmuxClaudeManagerOptions {
    * across multiple distinct stuck episodes in one long reply.
    */
   stuckPaneCooldownMs?: number
+  /**
+   * Durable workdir -> tmux --session-id storage, so a router restart can
+   * reattach to an already-running session's exact transcript file instead
+   * of falling back to "most recently modified .jsonl in this workdir" —
+   * ambiguous if the user ever has another Claude Code session open in the
+   * same directory outside this tmux session. The tmux session itself is
+   * unaffected by a router restart (tmux is a separate daemon); only this
+   * manager's in-memory sessionIds map is lost, which this backs.
+   */
+  persistence?: {
+    get(workdir: string): string | undefined
+    set(workdir: string, sessionId: string): void
+    delete(workdir: string): void
+  }
 }
 
 export class TmuxClaudeManager {
@@ -411,16 +546,16 @@ export class TmuxClaudeManager {
   private readonly quietMs: number
   private readonly replyTimeoutMs: number
   private readonly postStopQuietMs: number
-  private readonly postStopMaxMs: number
   private readonly dialogCheckMs: number
   private readonly stuckPaneCheckMs: number
   private readonly stuckPaneCooldownMs: number
+  private readonly persistence: TmuxClaudeManagerOptions['persistence']
   /** Workdirs we've confirmed a live tmux session for, to skip a has-session round-trip on every message. */
   private knownAlive = new Set<string>()
-  /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost on router restart. */
+  /** workdir -> the --session-id we spawned `claude` with, so we can tail its exact transcript file instead of guessing by mtime. Lost from memory on router restart, but recovered from `persistence` (if configured) the next time ensureSession reattaches to an already-live session. */
   private sessionIds = new Map<string, string>()
-  /** workdir -> tail of the in-flight sendAndAwaitReply call, so a second message for the same workdir queues instead of racing the first one on the same tmux pane/transcript. */
-  private queues = new Map<string, Promise<unknown>>()
+  /** workdir -> the in-flight sendAndAwaitReply call, if any, so a second message for the same workdir gets absorbed into it instead of racing it with a second collectReply loop on the same tmux pane/transcript. Deleted once the call settles — which now includes any self-continued rounds collectReply keeps waiting through on its own (see its Stop-handling block), so this stays populated for the whole thing, not just a "primary" reply. */
+  private queues = new Map<string, Promise<string>>()
   /** workdir -> last time a message was sent to it, for killIdleSessions(). */
   private lastUsedAt = new Map<string, number>()
 
@@ -430,12 +565,17 @@ export class TmuxClaudeManager {
     this.rows = opts.rows ?? 50
     this.startupTimeoutMs = opts.startupTimeoutMs ?? 20_000
     this.quietMs = opts.quietMs ?? 2_500
-    this.replyTimeoutMs = opts.replyTimeoutMs ?? 10 * 60 * 1000
+    // Raised 10min -> 60min -> 8h (2026-11-12): a single long-running tool
+    // call, or a chain of self-continued turns collectReply itself keeps
+    // polling through (see its Stop-handling block), can legitimately run
+    // for hours — this is a last-resort ceiling against a genuinely stuck
+    // session, not the expected wait time for an ordinary reply.
+    this.replyTimeoutMs = opts.replyTimeoutMs ?? 8 * 60 * 60 * 1000
     this.postStopQuietMs = opts.postStopQuietMs ?? 800
-    this.postStopMaxMs = opts.postStopMaxMs ?? 8_000
     this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
     this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 90_000
     this.stuckPaneCooldownMs = opts.stuckPaneCooldownMs ?? 5 * 60_000
+    this.persistence = opts.persistence
   }
 
   private async hasSession(name: string): Promise<boolean> {
@@ -502,6 +642,23 @@ export class TmuxClaudeManager {
     await runTmux(['send-keys', '-t', name, 'Escape'])
   }
 
+  /**
+   * Manual fallback for `/select <n>`: type the digit and press Enter,
+   * same as clicking option `n` on a Feishu dialog card — for when a
+   * pending dialog's layout isn't one `parseDialogOptions`/`parseTabBar`
+   * recognizes yet, so no card ever got sent, but the dialog is still
+   * genuinely there and a plain numbered selection is enough to answer it.
+   * Returns false (without sending anything) if there's no live session,
+   * so the caller can tell the user it didn't actually do anything instead
+   * of reporting a false success.
+   */
+  async selectOption(workdir: string, number: string): Promise<boolean> {
+    const name = sessionNameFor(workdir)
+    if (!(await this.hasSession(name))) return false
+    await this.selectDialogOption(name, { number, label: '' })
+    return true
+  }
+
   /** Kill and respawn the session for this workdir — a fresh `claude` process with a new session id (and conversation history, from the CLI's own perspective). */
   async restartSession(workdir: string, model?: string): Promise<string> {
     await this.killSession(workdir)
@@ -527,6 +684,18 @@ export class TmuxClaudeManager {
 
     if (await this.hasSession(name)) {
       this.knownAlive.add(workdir)
+      // Reattaching after a router restart: this manager's own sessionIds
+      // map was lost with the old process, but the tmux session (and the
+      // --session-id it was spawned with) is still the same one — recover
+      // it from persistence so transcript tailing targets the exact file
+      // instead of falling back to the mtime heuristic.
+      if (!this.sessionIds.has(workdir)) {
+        const persisted = this.persistence?.get(workdir)
+        if (persisted) {
+          this.dbg(`tmux: reattached to ${workdir}'s live session, recovered session-id ${persisted} from persistence`)
+          this.sessionIds.set(workdir, persisted)
+        }
+      }
       return name
     }
 
@@ -541,6 +710,7 @@ export class TmuxClaudeManager {
     ])
     if (!spawn.ok) throw new Error(`tmux new-session failed: ${spawn.stderr || spawn.stdout}`)
     this.sessionIds.set(workdir, sessionId)
+    this.persistence?.set(workdir, sessionId)
 
     await this.waitForStartup(name, spawnStartMs)
     this.knownAlive.add(workdir)
@@ -589,17 +759,47 @@ export class TmuxClaudeManager {
    * Deliver a message to the workdir's Claude session and wait for its reply.
    * Returns the concatenation of every assistant text turn produced before
    * the transcript goes quiet for `quietMs` (or `replyTimeoutMs` elapses).
-   * Calls for the same workdir are serialized — see `queues`.
+   *
+   * A message for a workdir that already has a reply in flight is NOT
+   * queued to start its own turn after the first one finishes. Verified by
+   * testing: Claude Code's own CLI absorbs a message typed while it's still
+   * working into the *current* turn (surfaced to the model as a "user sent
+   * a new message while you were working" system-reminder, same mechanism
+   * a real interactive user typing mid-stream gets), rather than queuing it
+   * as a separate next turn — so queuing it ourselves and sending it only
+   * after the first turn ends would just delay delivery for no benefit.
+   * Instead, send it straight into the pane now and resolve to the in-flight
+   * call's eventual result, which already covers this message too.
    */
+  /**
+   * True if a `sendAndAwaitReply` call for this workdir is currently in
+   * flight, i.e. a call made right now would be absorbed into it instead of
+   * starting its own turn. Callers can use this to skip setting up per-call
+   * UI (like a fresh "thinking" status card) for a message they can already
+   * tell is about to be merged into the in-flight one — see router.ts's
+   * handleClaudeTmuxTask. Advisory only: `sendAndAwaitReply` re-checks for
+   * itself and is the source of truth, since the in-flight call can settle
+   * in the gap between this check and that one.
+   */
+  isBusy(workdir: string): boolean {
+    return this.queues.has(workdir)
+  }
+
   async sendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions = {}): Promise<string> {
-    const previous = this.queues.get(workdir) ?? Promise.resolve()
-    const task = previous.catch(() => {}).then(() => this.doSendAndAwaitReply(workdir, text, opts))
+    const inFlight = this.queues.get(workdir)
+    if (inFlight) {
+      opts.onAbsorbed?.()
+      await this.sendKeys(sessionNameFor(workdir), text)
+      return inFlight
+    }
+    const task = this.doSendAndAwaitReply(workdir, text, opts)
     this.queues.set(workdir, task)
+    task.finally(() => { if (this.queues.get(workdir) === task) this.queues.delete(workdir) })
     return task
   }
 
   private async doSendAndAwaitReply(workdir: string, text: string, opts: SendAndAwaitReplyOptions): Promise<string> {
-    const { model, onDialog, onStuckPane, onTabSwitched } = opts
+    const { model, onDialog, onStuckPane, onTabSwitched, onProgress, onTextChunk } = opts
     this.lastUsedAt.set(workdir, Date.now())
     const name = await this.ensureSession(workdir, model)
     const sessionId = this.sessionIds.get(workdir)
@@ -622,7 +822,7 @@ export class TmuxClaudeManager {
     // unexpected failure while waiting for the reply is swallowed and
     // whatever text was collected so far (possibly none) is returned instead.
     try {
-      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane, onTabSwitched)
+      return await this.collectReply(workdir, sessionId, beforeSendMs, transcriptBefore, startOffset, signalPath, baselineStopMs, onDialog, onStuckPane, onTabSwitched, onProgress, onTextChunk)
     } catch (e) {
       this.dbg(`tmux: error while waiting for ${workdir}'s reply (message was already delivered, not retryable): ${e}`)
       return ''
@@ -632,7 +832,7 @@ export class TmuxClaudeManager {
   private async collectReply(
     workdir: string, sessionId: string | undefined, beforeSendMs: number,
     transcriptBefore: string | null, startOffset: number, signalPath: string | null, baselineStopMs: number,
-    onDialog?: DialogHandler, onStuckPane?: StuckPaneHandler, onTabSwitched?: TabSwitchedHandler,
+    onDialog?: DialogHandler, onStuckPane?: StuckPaneHandler, onTabSwitched?: TabSwitchedHandler, onProgress?: ProgressHandler, onTextChunk?: TextChunkHandler,
   ): Promise<string> {
     let deadline = beforeSendMs + this.replyTimeoutMs
     let lastChangeMs = Date.now()
@@ -664,7 +864,22 @@ export class TmuxClaudeManager {
       const lastNewline = newBytes.lastIndexOf(0x0a)
       if (lastNewline === -1) return false
       const completeChunk = newBytes.subarray(0, lastNewline + 1)
-      collected.push(...parseAssistantTextLines(completeChunk.toString('utf8').split('\n')))
+      const newLines = completeChunk.toString('utf8').split('\n')
+      const newTexts = parseAssistantTextLines(newLines)
+      collected.push(...newTexts)
+      if (onTextChunk) {
+        // Forwarded as soon as it's seen, independent of whether a Stop has
+        // fired yet — see TextChunkHandler's doc comment. `collected` is
+        // still built up in parallel purely so the caller can tell whether
+        // *anything* was ever produced (e.g. router.ts's "⚠️ 未产生文本回复").
+        for (const text of newTexts) {
+          try { onTextChunk(text) } catch (e) { this.dbg(`tmux: onTextChunk callback for ${workdir} threw: ${e}`) }
+        }
+      }
+      if (onProgress) {
+        const events = parseProgressLines(newLines)
+        if (events.length) { try { onProgress(events) } catch (e) { this.dbg(`tmux: onProgress callback for ${workdir} threw: ${e}`) } }
+      }
       lastSize += completeChunk.length
       lastChangeMs = Date.now()
       return true
@@ -672,6 +887,12 @@ export class TmuxClaudeManager {
 
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 400))
+      // Refreshed on every poll tick, not just at message-send time: with
+      // replyTimeoutMs now able to run up to 8 hours, including through
+      // several self-continued turns this loop keeps polling past their own
+      // Stop, a single long active wait could otherwise cross
+      // killIdleSessions' own idle threshold and get reaped mid-task.
+      this.lastUsedAt.set(workdir, Date.now())
       if (readGrowth()) continue
       const stopFired = !!signalPath && existsSync(signalPath) && statSync(signalPath).mtimeMs > baselineStopMs
       if (stopFired) {
@@ -681,13 +902,32 @@ export class TmuxClaudeManager {
         // growth" on the *next* call instead of this one, especially when
         // other Stop hooks in the same chain are still running. So instead
         // of trusting one delayed read, keep reading until growth itself
-        // goes quiet for a (short) beat, capped at POST_STOP_MAX_MS.
-        const postStopDeadline = Date.now() + this.postStopMaxMs
+        // goes quiet for a (short) beat. Deliberately uncapped beyond that
+        // (other than the outer replyTimeoutMs via `deadline`): a turn can
+        // keep writing to the transcript well past its own Stop hook (a
+        // lingering background bash task, a subagent still finishing up),
+        // and a short fixed cap here would stop forwarding that activity to
+        // onProgress/the status card even though the CLI is still working.
         let lastGrowthMs = Date.now()
-        while (Date.now() < postStopDeadline) {
+        while (Date.now() < deadline) {
           await new Promise(r => setTimeout(r, 300))
           if (readGrowth()) { lastGrowthMs = Date.now(); continue }
           if (isQuietDone(lastGrowthMs, Date.now(), this.postStopQuietMs)) break
+        }
+        // A Stop firing doesn't necessarily mean there's nothing left to
+        // wait for: the CLI can auto-continue into a fresh turn (its own
+        // later Stop) once a background shell it started finishes — found
+        // live with qttresearch running a long verification chain. Its own
+        // footer still reporting a shell running is the signal that more is
+        // coming; if so, treat this Stop as just one turn's end, not the
+        // whole call's, and keep polling instead of returning now. Any text
+        // from that next turn already went out via onTextChunk as it
+        // happened, same as this one did — nothing is batched or re-sent.
+        const stillRunning = parseRunningShellCount(stripAnsi(await this.capturePane(sessionNameFor(workdir))))
+        if (stillRunning > 0) {
+          // signalPath is guaranteed non-null here — stopFired required it.
+          baselineStopMs = statSync(signalPath!).mtimeMs
+          continue
         }
         break
       }
@@ -850,6 +1090,7 @@ export class TmuxClaudeManager {
     this.knownAlive.delete(workdir)
     this.sessionIds.delete(workdir)
     this.lastUsedAt.delete(workdir)
+    this.persistence?.delete(workdir)
     await runTmux(['kill-session', '-t', name])
   }
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
-  markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, SqliteBindingStore, wasEventProcessed,
+  deleteTmuxSessionId, getTmuxSessionId, markEventProcessed, openDb, PermissionRegistry,
+  pruneProcessedEvents, setTmuxSessionId, SqliteBindingStore, wasEventProcessed,
 } from './storage'
 import { createBinding, switchActiveAgent } from './bindings'
 
@@ -89,5 +90,32 @@ describe('pruneProcessedEvents', () => {
     expect(deleted).toBe(1)
     expect(wasEventProcessed(db, 'old')).toBe(false)
     expect(wasEventProcessed(db, 'new')).toBe(true)
+  })
+})
+
+describe('tmux session-id persistence', () => {
+  test('round-trips a workdir -> session-id mapping', () => {
+    const db = openDb(':memory:')
+    setTmuxSessionId(db, '/proj/a', 'sess-1', '2026-01-01T00:00:00Z')
+    expect(getTmuxSessionId(db, '/proj/a')).toBe('sess-1')
+  })
+
+  test('returns undefined for an unknown workdir', () => {
+    const db = openDb(':memory:')
+    expect(getTmuxSessionId(db, '/proj/unknown')).toBeUndefined()
+  })
+
+  test('overwrites the session-id on a later set for the same workdir', () => {
+    const db = openDb(':memory:')
+    setTmuxSessionId(db, '/proj/a', 'sess-1', '2026-01-01T00:00:00Z')
+    setTmuxSessionId(db, '/proj/a', 'sess-2', '2026-01-02T00:00:00Z')
+    expect(getTmuxSessionId(db, '/proj/a')).toBe('sess-2')
+  })
+
+  test('delete removes the mapping', () => {
+    const db = openDb(':memory:')
+    setTmuxSessionId(db, '/proj/a', 'sess-1', '2026-01-01T00:00:00Z')
+    deleteTmuxSessionId(db, '/proj/a')
+    expect(getTmuxSessionId(db, '/proj/a')).toBeUndefined()
   })
 })
