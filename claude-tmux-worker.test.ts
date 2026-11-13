@@ -371,6 +371,44 @@ describe('parseDialogOptions', () => {
       { number: '4', label: 'Chat about this' },
     ])
   })
+
+  // Captured verbatim (2026-11-13) from a real qtt tmux session: the
+  // assistant's finished reply explained a data pipeline as a numbered
+  // "1. ... 2. ... 3. ..." list, and a real WebFetch permission dialog
+  // only popped up *after* that — reported live as "no card sent" because
+  // the scan stopped at the first (finished-reply) numbered block and gave
+  // up without ever reaching the real dialog further down.
+  const realDialogAfterPriorNumberedReply = [
+    '  1. 转回原始价： still 是拆股调整后的价格。',
+    '  2. 存原始数据： 回放数据目录只存原始 K 线。',
+    '  3. 决策时现场复权： 每个决策日都现算一次。',
+    '',
+    '⏺ Fetch(https://sharadar.com/llms.txt)',
+    '  ⎿  Fetching…',
+    '     (ctrl+b ctrl+b (twice) to run in background)',
+    '',
+    ' Fetch · from the web-fetch agent',
+    ' Claude wants to fetch content from sharadar.com',
+    '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+    ' url: https://sharadar.com/llms.txt',
+    ' Do you want to allow Claude to fetch this content?',
+    ' ❯ 1. Yes',
+    "   2. Yes, and don't ask again for sharadar.com",
+    '   3. No, and tell Claude what to do differently (esc)',
+    '',
+    '',
+  ].join('\n')
+
+  test('finds a real dialog that appears after a finished reply\'s own numbered list', () => {
+    const dialog = parseDialogOptions(realDialogAfterPriorNumberedReply)
+    expect(dialog).not.toBeNull()
+    expect(dialog!.question).toBe('Do you want to allow Claude to fetch this content?')
+    expect(dialog!.options).toEqual([
+      { number: '1', label: 'Yes' },
+      { number: '2', label: "Yes, and don't ask again for sharadar.com" },
+      { number: '3', label: 'No, and tell Claude what to do differently (esc)' },
+    ])
+  })
 })
 
 describe('parseTabBar', () => {

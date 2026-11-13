@@ -294,49 +294,69 @@ export function stripAnsi(text: string): string {
  * content trailing a *finished* numbered list (quoted text, a nested
  * bullet, a code block), which still has to clear the "last content in
  * the pane" check below like before.
+ *
+ * The pane can contain more than one numbered-list-shaped block — e.g. a
+ * finished reply's own "1. ... 2. ... 3. ..." prose list sitting above a
+ * *real* dialog that only appears later (found live: a tool-use reply
+ * walking through a numbered data pipeline, immediately followed by a
+ * genuine permission prompt further down). Scanning every such block and
+ * preferring the last one that actually sits at the bottom of the pane —
+ * rather than stopping at the first block found and giving up as soon as
+ * it doesn't qualify — is what lets the real dialog still be found.
  * Returns null if no such menu is found.
  */
 export function parseDialogOptions(paneText: string): Dialog | null {
   const lines = paneText.split('\n')
-  const options: DialogOption[] = []
-  let firstOptionIdx = -1
-  let lastOptionIdx = -1
+  const blocks: { firstOptionIdx: number; lastOptionIdx: number; options: DialogOption[] }[] = []
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(OPTION_LINE_RE)
-    if (m) {
-      if (firstOptionIdx === -1) firstOptionIdx = i
-      lastOptionIdx = i
-      options.push({ number: m[1], label: m[2].trim() })
-      continue
+    if (!m || m[1] !== '1') continue  // a block only starts at option "1."
+    const options: DialogOption[] = [{ number: m[1], label: m[2].trim() }]
+    let lastOptionIdx = i
+    let j = i + 1
+    while (j < lines.length) {
+      const m2 = lines[j].match(OPTION_LINE_RE)
+      if (m2) {
+        if (m2[1] !== String(options.length + 1)) break  // non-sequential — block ends here
+        options.push({ number: m2[1], label: m2[2].trim() })
+        lastOptionIdx = j
+        j++
+        continue
+      }
+      // Tolerate this filler line only if the *nearest* upcoming option-shaped
+      // line (not just any later line) continues the sequence — bounded to
+      // "the next thing that looks like an option" rather than scanning
+      // arbitrarily far into the rest of the pane, which could otherwise
+      // match unrelated later content and wrongly swallow it into this block.
+      const nextNumber = String(options.length + 1)
+      const nextOptionLine = lines.slice(j + 1).find(l => OPTION_LINE_RE.test(l))
+      if (nextOptionLine && nextOptionLine.match(OPTION_LINE_RE)![1] === nextNumber) { j++; continue }
+      break
     }
-    if (firstOptionIdx === -1) continue  // option block hasn't started yet
-    // Tolerate this filler line only if the *nearest* upcoming option-shaped
-    // line (not just any later line) continues the sequence — bounded to
-    // "the next thing that looks like an option" rather than scanning
-    // arbitrarily far into the rest of the pane, which could otherwise
-    // match unrelated later content (e.g. a numbered sentence in prose
-    // after the dialog has already closed) and wrongly swallow real
-    // trailing content as if it were still part of this block.
-    const nextNumber = String(options.length + 1)
-    const nextOptionLine = lines.slice(i + 1).find(l => OPTION_LINE_RE.test(l))
-    if (nextOptionLine && nextOptionLine.match(OPTION_LINE_RE)![1] === nextNumber) continue
-    break  // option block ended
-  }
-  if (options.length === 0) return null
-  if (!options.every((o, idx) => o.number === String(idx + 1))) return null
-  for (let i = lastOptionIdx + 1; i < lines.length; i++) {
-    const line = lines[i]
-    if (line.trim() === '' || TRAILING_DECORATION_RE.test(line) || ESC_HINT_RE.test(line)) continue
-    return null  // something else follows — not the bottom of the screen
+    blocks.push({ firstOptionIdx: i, lastOptionIdx, options })
+    i = lastOptionIdx  // resume scanning right after this block (loop's i++ advances past it)
   }
 
-  let question = ''
-  for (let i = firstOptionIdx - 1; i >= 0; i--) {
-    if (lines[i].trim() === '' || DIVIDER_LINE_RE.test(lines[i])) continue
-    question = lines[i].trim()
-    break
+  for (let b = blocks.length - 1; b >= 0; b--) {
+    const { firstOptionIdx, lastOptionIdx, options } = blocks[b]
+    let isBottomOfPane = true
+    for (let i = lastOptionIdx + 1; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.trim() === '' || TRAILING_DECORATION_RE.test(line) || ESC_HINT_RE.test(line)) continue
+      isBottomOfPane = false
+      break  // something else follows — not the bottom of the screen
+    }
+    if (!isBottomOfPane) continue
+
+    let question = ''
+    for (let i = firstOptionIdx - 1; i >= 0; i--) {
+      if (lines[i].trim() === '' || DIVIDER_LINE_RE.test(lines[i])) continue
+      question = lines[i].trim()
+      break
+    }
+    return { kind: 'numbered', question: question || 'Claude 需要你的输入', options }
   }
-  return { kind: 'numbered', question: question || 'Claude 需要你的输入', options }
+  return null
 }
 
 const RUNNING_SHELL_RE = /(\d+)\s+shells?\b/i
