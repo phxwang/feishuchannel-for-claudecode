@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, writeFileSync, mkdirSync } from 'fs'
+import { mkdtempSync, realpathSync, writeFileSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { loadRouterConfig, RouterConfigError, validateRouterConfig } from './config'
@@ -7,7 +7,9 @@ import { loadRouterConfig, RouterConfigError, validateRouterConfig } from './con
 function tmpRoot(): string {
   const dir = mkdtempSync(join(tmpdir(), 'agents-cfg-'))
   mkdirSync(join(dir, 'proj'), { recursive: true })
-  return dir
+  // Canonicalize so assertions comparing against join(root, ...) match the
+  // realpath'd workdir validateRouterConfig stores (macOS /var vs /private/var).
+  return realpathSync(dir)
 }
 
 function baseConfig(root: string) {

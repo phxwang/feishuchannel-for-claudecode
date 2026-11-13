@@ -82,6 +82,17 @@ export function validateRouterConfig(raw: unknown, allowedRoots: string[]): Rout
   }
   const cfg = parsed.data as RouterConfig
 
+  // Canonicalize the roots too: workdir is compared as a realpath below, and
+  // on platforms where temp dirs are symlinks (macOS /var -> /private/var) a
+  // merely `resolve()`d root would never match its own canonical children.
+  const realRoots = allowedRoots.map(root => {
+    try {
+      return existsSync(root) ? realpathSync(root) : resolve(root)
+    } catch {
+      return resolve(root)
+    }
+  })
+
   for (const [projectId, proj] of Object.entries(cfg.projects)) {
     if (!isAbsolute(proj.workdir)) {
       throw new RouterConfigError(`project "${projectId}": workdir must be an absolute path, got "${proj.workdir}"`)
@@ -92,8 +103,8 @@ export function validateRouterConfig(raw: unknown, allowedRoots: string[]): Rout
     } catch (e) {
       throw new RouterConfigError(`project "${projectId}": cannot resolve workdir "${proj.workdir}": ${e}`)
     }
-    const withinAllowedRoot = allowedRoots.some(root => {
-      const rroot = resolve(root)
+    const withinAllowedRoot = realRoots.some(root => {
+      const rroot = root.endsWith('/') ? root.slice(0, -1) : root
       return real === rroot || real.startsWith(rroot + '/')
     })
     if (!withinAllowedRoot) {
