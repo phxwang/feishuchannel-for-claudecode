@@ -62,13 +62,16 @@ export interface FileDiff {
 // Design doc §4: "task.started、text.delta、text.completed、tool.started、
 // tool.completed、tool.failed、permission.requested、session.idle、
 // task.failed、task.aborted"
+export interface PartIdentity { messageId?: string; partId?: string; callId?: string }
+
 export type AgentEvent =
   | { type: 'task.started'; taskId: string }
   | { type: 'text.delta'; taskId: string; text: string }
   | { type: 'text.completed'; taskId: string; text: string }
-  | { type: 'tool.started'; taskId: string; toolName: string }
-  | { type: 'tool.completed'; taskId: string; toolName: string }
-  | { type: 'tool.failed'; taskId: string; toolName: string; error: string }
+  | { type: 'text.snapshot'; taskId: string; messageId: string; partId: string; text: string }
+  | ({ type: 'tool.started'; taskId: string; toolName: string } & PartIdentity)
+  | ({ type: 'tool.completed'; taskId: string; toolName: string } & PartIdentity)
+  | ({ type: 'tool.failed'; taskId: string; toolName: string; error: string } & PartIdentity)
   | { type: 'permission.requested'; taskId: string; requestId: string; toolName: string; description: string }
   | { type: 'attachment.completed'; taskId: string; mime: string; dataUrl: string; filename?: string }
   | { type: 'session.idle'; taskId: string }

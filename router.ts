@@ -27,6 +27,8 @@ import { resolveRoute } from './routing/resolver'
 import { conversationKey } from './routing/bindings'
 import { evictMissingOpenCodeBinding } from './routing/opencode-recovery'
 import type { AgentPolicy, RouterConfig } from './routing/types'
+import { V2SessionCoordinator, coordinatorKey, nativeInputId, v2Request } from './adapters/opencode/v2-coordinator'
+import { ProgressCard, TextDelivery, safeSummary, type TextPartSnapshot } from './adapters/opencode/presentation'
 import { OpenCodeAdapter } from './adapters/opencode/opencode-adapter'
 import type { AgentEvent } from './adapters/agent-adapter'
 import { createBinding } from './routing/bindings'
@@ -388,7 +390,7 @@ const MIME_EXT: Record<string, string> = {
 }
 
 /** Decode a tool-produced `data:` attachment (e.g. a screenshot) and send it to Feishu as an image or file message. */
-async function sendOpenCodeAttachment(chatId: string, mime: string, dataUrl: string, filename: string | undefined, dbgTag: string) {
+async function sendOpenCodeAttachment(chatId: string, mime: string, dataUrl: string, filename: string | undefined, dbgTag: string, client = apiClient) {
   const decoded = decodeBase64DataUri(dataUrl, MAX_ATTACHMENT_BYTES)
   if (!decoded.ok) {
     dbg(decoded.reason === 'too_large'
@@ -400,7 +402,7 @@ async function sendOpenCodeAttachment(chatId: string, mime: string, dataUrl: str
   const tmpPath = join(tmpdir(), `oc-attach-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
   try {
     writeFileSync(tmpPath, decoded.buf)
-    await sendFeishuFile(apiClient, chatId, tmpPath, filename)
+    await sendFeishuFile(client, chatId, tmpPath, filename)
   } catch (e) {
     dbg(`${dbgTag}: attachment upload failed: ${e}`)
   } finally {
@@ -425,6 +427,8 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
     void replyText(chatId, messageId, '⚠️ OpenCode 未配置，无法处理该消息。')
     return
   }
+
+  if (openCodeCfg?.nativeV2) return handleNativeOpenCodeTask(route, chatId, messageId, chatType, content)
 
   const key = conversationKey(
     chatType === 'group' ? { kind: 'group', chatId, projectId: route.project } : { kind: 'p2p', userOpenId: chatId, projectId: route.project },
@@ -488,6 +492,146 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
     dbg(`opencode: task ${taskId} completed with no text output`)
   }
   await flushAttachments()
+}
+
+// Native v2 is deliberately opt-in and uses separate persistent bindings: changing
+// the flag never silently migrates legacy session/history/model/permission semantics.
+const nativeCoordinators = new Map<string, V2SessionCoordinator>()
+const nativePermissionOwners = new Map<string, { coordinator: V2SessionCoordinator; groupId: string; card?: ProgressCard; chatId: string }>()
+const nativeRoots = new Map<string, { chatId: string; messageId: string }>()
+let nativeApiClient: lark.Client | undefined
+function boundedNativeApi(): lark.Client {
+  if (nativeApiClient) return nativeApiClient
+  // Bound token acquisition as well as message/upload calls. Do not mutate the
+  // shared SDK HTTP instance used by mature tmux/socket paths.
+  const request = (options: any) => lark.defaultHttpInstance.request({ ...options, timeout: 5000 })
+  const http = { request } as lark.HttpInstance
+  for (const method of ['get', 'delete', 'head', 'options', 'post', 'put', 'patch'] as const) {
+    ;(http as any)[method] = (url: string, dataOrOptions?: any, options?: any) => ['post', 'put', 'patch'].includes(method)
+      ? request({ ...options, url, data: dataOrOptions, method }) : request({ ...dataOrOptions, url, method })
+  }
+  // SDK error objects may contain request credentials; log only our safe diagnostics.
+  nativeApiClient = new lark.Client({ appId: APP_ID!, appSecret: APP_SECRET!, httpInstance: http,
+    logger: { error() {}, warn() {}, info() {}, debug() {}, trace() {} } })
+  return nativeApiClient
+}
+
+/** Unlike replyText, this path checks both transport AND Feishu acknowledgement.
+ * No automatic retry after a timeout: the response could have been accepted. */
+async function nativeFeishu(path: string, method: string, data: unknown): Promise<any> {
+  const response = await boundedNativeApi().request({ url: `open-apis/im/v1/${path}`, method, data, timeout: 5000 })
+  if (response?.code !== 0) throw new Error('Feishu rejected native OpenCode delivery')
+  return response.data
+}
+function nativeCard(line: string) {
+  return JSON.stringify({ schema: '2.0', config: { update_multi: true },
+    header: { title: { tag: 'plain_text', content: 'OpenCode' }, template: 'blue' },
+    body: { elements: [{ tag: 'markdown', content: line }] } })
+}
+
+async function handleNativeOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRoute>>, chatId: string, messageId: string,
+  chatType: 'p2p' | 'group', content: string) {
+  const cfg = openCodeCfg!
+  const config = { baseUrl: cfg.baseUrl, requestTimeoutMs: cfg.requestTimeoutSeconds * 1000, passwordEnv: cfg.passwordEnv }
+  const source = conversationKey(chatType === 'group' ? { kind: 'group', chatId, projectId: route.project }
+    : { kind: 'p2p', userOpenId: chatId, projectId: route.project })
+  const bindingKey = `${source}:native-v2`
+  let pendingInputId: string | undefined
+  try {
+    // Session-specific model selection is not silently translated to v2's mutable model endpoint.
+    if (route.agent.model) throw new Error('native v2 暂不支持路由 model 覆盖；请在独立 OpenCode 会话配置模型')
+    let sessionId = openCodeBindings.get(bindingKey)?.agentSessionId
+    if (!sessionId) {
+      let creation = inFlightSessionCreations.get(bindingKey)
+      if (!creation) {
+        creation = (async () => {
+          const response = await v2Request(config, '/api/session', { location: { directory: route.workdir } })
+          if (!response?.data?.id) throw new Error('v2 会话协议不兼容；未提交任务')
+          openCodeBindings.put(createBinding(bindingKey, route.project, 'opencode', null, response.data.id, 'v2', new Date().toISOString()))
+          return String(response.data.id)
+        })()
+        inFlightSessionCreations.set(bindingKey, creation)
+      }
+      try { sessionId = await creation } finally { inFlightSessionCreations.delete(bindingKey) }
+    }
+    const key = coordinatorKey(cfg.baseUrl, route.workdir, sessionId)
+    let coordinator = nativeCoordinators.get(key)
+    if (!coordinator) {
+      if (nativeCoordinators.size >= 256) throw new Error('native v2 会话协调器数量达到上限')
+      const displays = new Map<string, { root: { chatId: string; messageId: string }; text: TextDelivery; card?: ProgressCard; attachments: Extract<AgentEvent, {type: 'attachment.completed'}>[] }>()
+      coordinator = new V2SessionCoordinator({ ...config, directory: route.workdir, sessionId,
+        idleTimeoutMs: cfg.taskTimeoutSeconds * 1000, hardCapMs: (cfg.taskHardCapSeconds ?? 8 * 3600) * 1000, onWarn: dbg }, {
+        started(groupId) {
+          const root = nativeRoots.get(groupId)!
+          const text = new TextDelivery(async text => { await nativeFeishu(`messages/${encodeURIComponent(root.messageId)}/reply`, 'POST',
+            { msg_type: 'text', content: JSON.stringify({ text }), reply_in_thread: false }) }, cfg.streamText)
+          let card: ProgressCard | undefined
+          if (cfg.progressCards) {
+            // Creation once only; ambiguous creation never triggers another create.
+            const ready = nativeFeishu(`messages?receive_id_type=chat_id`, 'POST',
+              { receive_id: root.chatId, msg_type: 'interactive', content: nativeCard('🤔 等待执行进展') })
+              .then(data => data?.message_id).catch(() => undefined)
+            card = new ProgressCard(async line => { const id = await ready; if (id) await nativeFeishu(`messages/${encodeURIComponent(id)}`, 'PATCH', { content: nativeCard(line) }) })
+          }
+          displays.set(groupId, { root, text, card, attachments: [] })
+        },
+        event(groupId, event) {
+          const display = displays.get(groupId); if (!display) return
+          display.card?.event(event)
+          if (event.type === 'text.snapshot') display.text.snapshot(event)
+          else if (event.type === 'attachment.completed') display.attachments.push(event)
+          else if (event.type === 'permission.requested') {
+            nativePermissionOwners.set(event.requestId, { coordinator: nativeCoordinators.get(key)!, groupId, card: display.card, chatId: display.root.chatId })
+            // Separate path: permission delivery never waits behind text/card patch queues.
+            const value = { code: event.requestId }
+            const card = JSON.stringify({ schema: '2.0', header: { title: { tag: 'plain_text', content: 'OpenCode 请求授权' }, template: 'orange' },
+              body: { elements: [{ tag: 'markdown', content: safeSummary(event.toolName) },
+                ...['perm_allow', 'perm_deny'].map(action => ({ tag: 'button', text: { tag: 'plain_text', content: action === 'perm_allow' ? '允许一次' : '拒绝' },
+                  value: { ...value, action }, type: action === 'perm_allow' ? 'primary' : 'danger' }))] } })
+            void nativeFeishu('messages?receive_id_type=chat_id', 'POST', { receive_id: display.root.chatId, msg_type: 'interactive', content: card })
+              .catch(() => { dbg('native OpenCode permission card failed'); void replyText(display.root.chatId, display.root.messageId, '⚠️ OpenCode 授权卡发送失败，请到 OpenCode 处理授权。') })
+          }
+        },
+        async settled(groupId, texts: TextPartSnapshot[], outcome) {
+          const display = displays.get(groupId); if (!display) return
+          try {
+            const delivery = await display.text.finalize(outcome.reason ? texts.map(p => ({ ...p, text: p.text + '\n【任务未完成】' })) : texts)
+            for (const att of display.attachments) await sendOpenCodeAttachment(display.root.chatId, att.mime, att.dataUrl, att.filename, 'native opencode', boundedNativeApi())
+            const line = outcome.reason ? `⚠️ ${safeSummary(outcome.reason)}${outcome.detail ? `：${safeSummary(outcome.detail)}` : ''}`
+              : !delivery.delivered ? '⚠️ 执行完成，回复发送失败或状态待核实' : delivery.hasText ? '✅ 已回复'
+              : display.attachments.length ? '执行完成，附件已尝试发送' : '执行结束，无可发送内容'
+            await display.card?.finalize(line)
+            if (outcome.reason || !delivery.delivered || (!delivery.hasText && !display.attachments.length)) await nativeFeishu(`messages/${encodeURIComponent(display.root.messageId)}/reply`, 'POST',
+              { msg_type: 'text', content: JSON.stringify({ text: line }) }).catch(() => dbg('native OpenCode terminal notice failed'))
+          } finally {
+            await display.card?.finalize('⚠️ 执行结束，投递未完成')
+            displays.delete(groupId); nativeRoots.delete(groupId)
+            for (const [id, owner] of nativePermissionOwners) if (owner.coordinator === nativeCoordinators.get(key) && owner.groupId === groupId) nativePermissionOwners.delete(id)
+          }
+        },
+      })
+      nativeCoordinators.set(key, coordinator)
+    }
+    if (content.trim() === '/stop') {
+      await coordinator.stop(source)
+      await replyText(chatId, messageId, '停止已请求；未消费的排队输入没有删除，不会由路由器自动恢复。')
+      return
+    }
+    const queue = /^\/queue(?:\s|$)/.test(content.trim())
+    const prompt = queue ? content.trim().replace(/^\/queue\s*/, '') : content
+    if (!prompt.trim()) throw new Error('/queue 后需要任务内容')
+    const inputId = nativeInputId(sessionId, messageId); pendingInputId = inputId
+    nativeRoots.set(inputId, { chatId, messageId })
+    const receipt = await coordinator.submit(source, messageId, prompt, queue ? 'queue' : 'steer')
+    nativeRoots.delete(inputId)
+    if (receipt.joined || queue || receipt.status === 'outcome_unknown') await replyText(chatId, messageId,
+      receipt.status === 'outcome_unknown' ? '提交结果待核实，正在按原输入 ID 对账；不会自动重复提交。'
+        : queue ? '已提交排队任务，等待执行器在空闲边界接收。' : '已提交补充，等待执行器接收；不会中止正在运行的工具。')
+  } catch (error) {
+    if (pendingInputId) nativeRoots.delete(pendingInputId)
+    dbg(`native opencode: ${error instanceof Error ? error.name : 'request failed'}`)
+    await replyText(chatId, messageId, `⚠️ OpenCode 原生插入模式失败：${safeSummary(error instanceof Error ? error.message : '请求失败')}。未自动回退 legacy 或重新提交。`)
+  }
 }
 
 const TMUX_ATTACHMENT_DIR = join(tmpdir(), 'feishu-claude-tmux-attachments')
@@ -1185,6 +1329,17 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
 
     // OpenCode permission requests are tracked separately (routed directly to the
     // OpenCode Adapter, not to a Claude worker) — see handleOpenCodePermission.
+    const nativePermission = nativePermissionOwners.get(code)
+    if (nativePermission) {
+      // The request/card belongs to one chat; never allow a forwarded callback to resolve another chat's tool.
+      const callbackChat = data?.context?.open_chat_id ?? data?.open_chat_id
+      if (callbackChat !== nativePermission.chatId) return { toast: { type: 'error', content: '授权来源不匹配' } }
+      try {
+        await nativePermission.coordinator.respondPermission(code, behavior === 'allow')
+        nativePermission.card?.permissionResolved(code); nativePermissionOwners.delete(code)
+        return { toast: { type: 'success', content: '授权回复已提交' } }
+      } catch { return { toast: { type: 'error', content: '授权发送失败，请重试' } } }
+    }
     if (openCodePermissionCodes.has(code)) {
       // Only remove the code once delivery is confirmed — deleting it first
       // (as the old code did) meant a failed respondPermission call stranded
