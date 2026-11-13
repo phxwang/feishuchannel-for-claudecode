@@ -137,4 +137,11 @@ describe('native v2 execution groups at actual HTTP/durable boundaries', () => {
     expect(f.settled[0].texts[0].text).toBe('after SSE')
   })
 
+  test('restart baseline refuses unknown pending queue input before any new prompt can wake it', async () => {
+    const f = fixture()
+    f.event('prompt.admitted',{messageID:'msg_previous_pending',delivery:'queue'})
+    await expect(f.coordinator.submit('chat','A','one')).rejects.toThrow('未消费输入')
+    expect(f.posts).toEqual([]); expect(f.started).toEqual([])
+  })
+
 })
