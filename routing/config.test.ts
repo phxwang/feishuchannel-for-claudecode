@@ -97,3 +97,14 @@ projects:
     expect(() => loadRouterConfig(yamlPath, [root])).toThrow()
   })
 })
+
+test('native insertion/progress/text require explicit opt-in and accept independent flags', () => {
+  const root = tmpRoot()
+  const raw: any = { ...baseConfig(root), agents: { opencode: { type: 'opencode', baseUrl: 'http://localhost:4096',
+    requestTimeoutSeconds: 10, taskTimeoutSeconds: 3600, maxConcurrency: 4 } } }
+  const legacy = validateRouterConfig(raw, [root]).agents.opencode!
+  expect([legacy.nativeV2, legacy.progressCards, legacy.streamText]).toEqual([false, false, false])
+  raw.agents.opencode.nativeV2 = true; raw.agents.opencode.progressCards = true
+  const native = validateRouterConfig(raw, [root]).agents.opencode!
+  expect([native.nativeV2, native.progressCards, native.streamText]).toEqual([true, true, false])
+})

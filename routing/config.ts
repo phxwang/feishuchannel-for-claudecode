@@ -47,6 +47,9 @@ const routerConfigSchema = z.object({
       taskTimeoutSeconds: z.number().positive(),
       taskHardCapSeconds: z.number().positive().optional(),
       maxConcurrency: z.number().int().positive(),
+      nativeV2: z.boolean().default(false),
+      progressCards: z.boolean().default(false),
+      streamText: z.boolean().default(false),
     }).optional(),
   }).default({}),
   projects: z.record(z.string(), z.object({
