@@ -462,3 +462,38 @@ MVP 验收：
 采用“单 Feishu Gateway + 多 Agent Adapter + 持久化任务状态”。首版支持按群/私聊选择 Claude 或 OpenCode、按 project 限制 Agent、Claude primary + OpenCode fallback、`pre_execution_only`、sticky binding，以及管理员查看/重置/显式切换后端。
 
 不要把 OpenCode Bridge 做成第二个独立 Bot 进程，也不要在任务开始执行后静默 fallback。这样能最大化复用现有 Feishu Channel 的接入、安全、卡片和 worker 能力，同时把 Claude/OpenCode 差异封装在 Adapter 层，为以后接 Codex 等后端保留清晰扩展点。
+
+
+### OpenCode long-turn transport reliability
+
+OpenCode turns are submitted once through `POST /session/{id}/prompt_async`,
+with a caller-owned `messageID`. Each HTTP request is bounded by
+`requestTimeoutSeconds`; the overall turn is bounded independently by
+`taskTimeoutSeconds`. Long turns do not hold one HTTP response open. A lost
+POST acknowledgement is ambiguous, so the adapter observes that exact message
+ID instead of automatically submitting the work a second time.
+
+A short `/session/status` poll confirms idle; `/session/{id}/message` then
+collects only assistant messages whose `parentID` matches this turn. A final
+message must have a completion timestamp and must not be a `tool-calls`
+continuation. Stale SSE idle notifications and stale/unfinished message-list
+snapshots never finalize a turn. Earlier steps' tool attachments are collected
+alongside the last assistant response. SSE has exactly one outstanding reader;
+pending permissions are also polled from `/permission`, recovering after a
+stream disconnect. All project endpoints and permission replies carry the
+project `directory`, including sessions recovered after a router restart.
+
+Cancellation/deadline aborts in-flight requests, closes the SSE reader, clears
+timers, and requests `/abort`. Transient task failures preserve the persistent
+conversation binding. Eviction requires a failed session endpoint and a second
+`GET /session/{id}` confirming HTTP 404/410; an unsupported status/prompt
+endpoint is not evidence that the conversation itself disappeared.
+
+Deployment: validate `bun test`, bundle router/server with `bun build --target=bun`,
+and typecheck the adapter/recovery modules. Merge the reviewed branch through a
+PR before updating the deployed source. Preserve the SQLite conversation store;
+restart only the router, not `opencode serve`, so running OpenCode sessions and
+their context remain available. A router restart does not replay a result from
+an observer that exited before this patch; such a result can still be inspected
+in OpenCode's message history. Test coverage uses accelerated multi-request
+long turns, not a real multi-minute provider run.
