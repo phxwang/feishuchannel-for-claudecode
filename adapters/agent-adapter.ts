@@ -33,6 +33,13 @@ export interface AgentTask {
   taskId: string
   sessionId: string
   prompt: string
+  /**
+   * Project workdir this session belongs to. OpenCode scopes both its /event
+   * stream and /session/status keyed by directory, so the adapter needs this to
+   * observe events/completion for the right session. Optional for adapters that
+   * don't use it (e.g. Claude).
+   */
+  directory?: string
 }
 
 export type PermissionBehavior = 'allow' | 'deny'

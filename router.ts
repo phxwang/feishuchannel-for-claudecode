@@ -22,6 +22,7 @@ import { markEventProcessed, openDb, PermissionRegistry, pruneProcessedEvents, S
 import { loadRouterConfig, RouterConfigError } from './routing/config'
 import { resolveRoute } from './routing/resolver'
 import { conversationKey } from './routing/bindings'
+import { evictMissingOpenCodeBinding } from './routing/opencode-recovery'
 import type { AgentPolicy, RouterConfig } from './routing/types'
 import { OpenCodeAdapter } from './adapters/opencode/opencode-adapter'
 import type { AgentEvent } from './adapters/agent-adapter'
@@ -429,7 +430,7 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
     attachments.map(att => sendOpenCodeAttachment(chatId, att.mime, att.dataUrl, att.filename, `opencode: task ${taskId}`)),
   )
   try {
-    for await (const event of openCodeAdapter.send({ taskId, sessionId, prompt: content }, controller.signal)) {
+    for await (const event of openCodeAdapter.send({ taskId, sessionId, prompt: content, directory: route.workdir }, controller.signal)) {
       if (event.type === 'permission.requested') {
         void handleOpenCodePermission(event, chatId)
       } else if (event.type === 'text.completed') {
@@ -438,10 +439,9 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
         attachments.push(event)
       } else if (event.type === 'task.failed') {
         dbg(`opencode: task ${taskId} failed: ${event.reason}`)
-        // The cached session may no longer be valid (e.g. opencode serve
-        // restarted and forgot it) — evict so the next message gets a fresh
-        // one instead of repeating the same failure forever.
-        openCodeBindings.delete(key)
+        // Transport/provider/deadline failures do not invalidate a session.
+        // Only delete the binding we used, and only on proven session absence.
+        evictMissingOpenCodeBinding(openCodeBindings, key, sessionId, event.reason)
         void replyText(chatId, messageId, `⚠️ OpenCode 执行失败：${event.reason}`)
         await flushAttachments()
         return
@@ -453,7 +453,7 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
     }
   } catch (e) {
     dbg(`opencode: send() threw: ${e}`)
-    openCodeBindings.delete(key)
+    // Unexpected observer errors do not prove session absence; keep context.
     void replyText(chatId, messageId, `⚠️ OpenCode 执行出错：${e}`)
     await flushAttachments()
     return
