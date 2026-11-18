@@ -14,7 +14,7 @@
 import { existsSync, readFileSync, realpathSync } from 'fs'
 import { isAbsolute, resolve } from 'path'
 import { z } from 'zod'
-import type { RouterConfig } from './types'
+import type { OpenCodeAgentConfig, RouterConfig } from './types'
 
 const agentPolicySchema = z.object({
   primary: z.enum(['claude', 'opencode']),
@@ -55,6 +55,13 @@ const routerConfigSchema = z.object({
   projects: z.record(z.string(), z.object({
     workdir: z.string().min(1),
     allowedAgents: z.array(z.enum(['claude', 'opencode'])).min(1),
+    /** Per-project overrides for agents.opencode feature flags. */
+    opencode: z.object({
+      nativeV2: z.boolean().optional(),
+      progressCards: z.boolean().optional(),
+      streamText: z.boolean().optional(),
+      model: z.string().min(1).optional(),
+    }).optional(),
   })),
   fallback: z.object({
     enabled: z.boolean().default(true),
@@ -123,6 +130,30 @@ export function validateRouterConfig(raw: unknown, allowedRoots: string[]): Rout
   }
 
   return cfg
+}
+
+/**
+ * Effective `agents.opencode` settings for one project workdir, with the
+ * project's `opencode` overrides merged over the global backend config.
+ *
+ * Routes carry the workdir (not the agents.yaml project key) — see
+ * resolver.ts's `ResolvedRoute.project` — so the lookup must match on the
+ * project's workdir, normalized the same way the config loader does.
+ */
+export function resolveOpenCodeConfig(config: RouterConfig | null, workdir: string): OpenCodeAgentConfig | undefined {
+  const base = config?.agents.opencode
+  if (!base) return undefined
+  const target = resolve(workdir)
+  const project = Object.values(config.projects).find(p => resolve(p.workdir) === target)
+  const override = project?.opencode
+  if (!override) return base
+  return {
+    ...base,
+    nativeV2: override.nativeV2 ?? base.nativeV2,
+    progressCards: override.progressCards ?? base.progressCards,
+    streamText: override.streamText ?? base.streamText,
+    model: override.model ?? base.model,
+  }
 }
 
 /**

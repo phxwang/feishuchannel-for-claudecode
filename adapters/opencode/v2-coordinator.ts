@@ -8,6 +8,7 @@ import type { TextPartSnapshot } from './presentation'
 import { SSEBuffer } from './sse'
 
 export type Delivery = 'steer' | 'queue'
+export interface ModelSelection { model?: { id: string; providerID: string }; variant?: string }
 type Durable = { type: string; durable?: { seq: number }; data: Record<string, any> }
 type Group = { id: string; source: string; inputs: Set<string>; consumed: Set<string>; messages: Set<string>; texts: Map<string, TextPartSnapshot>; taskId: string; started: number; lastProgress: number; failed?: string }
 export interface V2Callbacks {
@@ -42,7 +43,7 @@ export async function v2Request(config: Pick<V2Config, 'baseUrl' | 'requestTimeo
     const response = await fetchImpl(new URL(path, config.baseUrl), { method: body === undefined ? 'GET' : 'POST',
       headers: { 'content-type': 'application/json', ...(password ? { Authorization: `Bearer ${password}` } : {}) },
       body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal })
-    if (!response.ok) throw new V2ProtocolError(`OpenCode v2 HTTP ${response.status}`, response.status)
+    if (!response.ok) throw new V2ProtocolError(`OpenCode v2 HTTP ${response.status} (${path})`, response.status)
     const reader = response.body?.getReader(); let bytes = 0, text = ''; const decoder = new TextDecoder()
     if (reader) try {
       while (true) {
@@ -81,12 +82,52 @@ export class V2SessionCoordinator {
   private lock<T>(fn: () => Promise<T>): Promise<T> {
     const next = this.serial.then(fn); this.serial = next.catch(() => {}); return next
   }
+  /**
+   * `/session/{id}/wait` is documented but returns 503 "Session wait is not
+   * available yet" on the installed 1.18.15 service, so idle proof comes from
+   * `/api/session/active` instead: the endpoint explicitly says sessions absent
+   * from that drain map are inactive. Fails closed if the probe itself errors.
+   */
+  private async sessionActive(signal?: AbortSignal): Promise<boolean> {
+    const active = await this.request('/api/session/active', undefined, signal)
+    if (!active || typeof active.data !== 'object' || active.data === null) throw new V2ProtocolError('会话活跃状态探针不可用')
+    return !!active.data[this.config.sessionId]
+  }
+
+  private async probeIdle(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    const deadline = Date.now() + Math.max(0, timeoutMs)
+    for (;;) {
+      if (signal?.aborted) return false
+      if (!await this.sessionActive(signal)) return true
+      if (Date.now() >= deadline) return false
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
+
+  /**
+   * Applies a per-chat model/variant just before a fresh turn starts. The
+   * model is preserved unless one is explicitly configured; only the variant
+   * is changed when the group asks for a different thinking effort.
+   */
+  private async ensureSelection(selection?: ModelSelection) {
+    const wanted = selection?.model
+    const variant = selection?.variant?.trim() || undefined
+    if (!wanted && !variant) return
+    const info = await this.request(this.path(''))
+    const current = info?.data?.model
+    const model = wanted ?? (current?.id && current?.providerID
+      ? { id: String(current.id), providerID: String(current.providerID) } : undefined)
+    if (!model) throw new V2ProtocolError('会话未配置模型；请在 agents.yaml 的 projects.*.opencode.model 设置 providerID/modelID')
+    if (current?.id === model.id && current?.providerID === model.providerID && (!variant || current?.variant === variant)) return
+    await this.request(this.path('/model'), { model: { ...model, ...(variant ? { variant } : {}) } })
+  }
+
   private async initialize() {
     // Restart recovery is intentionally not inferred. A reused v2 session must be idle.
-    await this.request(this.path('/wait'), {}, undefined, Math.min(this.config.requestTimeoutMs, 1000))
+    if (!await this.probeIdle(Math.min(this.config.requestTimeoutMs, 1000))) throw new V2ProtocolError('会话仍在执行；拒绝自动唤醒')
     const pendingInputs = new Set<string>()
     for (let page = 0; page < 100; page++) {
-      const history = await this.request(this.path(`/history?limit=200&after=${this.cursor}`))
+      const history = await this.request(this.path(`/history?limit=100&after=${this.cursor}`))
       if (!Array.isArray(history?.data)) throw new V2ProtocolError('v2 history contract missing')
       for (const event of history.data) {
         this.cursor = Math.max(this.cursor, event.durable?.seq ?? 0)
@@ -100,12 +141,14 @@ export class V2SessionCoordinator {
     }
     throw new V2ProtocolError('v2 history baseline exceeds bounded scan; no input submitted')
   }
-  submit(source: string, messageId: string, text: string, delivery: Delivery = 'steer') {
+  submit(source: string, messageId: string, text: string, delivery: Delivery = 'steer', selection?: ModelSelection) {
     return this.lock(async () => {
       if (this.suspended) throw new V2ProtocolError('会话已停止或归属异常，待处理输入未删除；需在 OpenCode 核验后重新绑定独立会话')
       this.init ??= this.initialize(); await this.init
       // Resolve idle-vs-insertion at the same serialization boundary as admission.
       if (this.groups.size) await this.settleIdle()
+      // Never mutate model/variant mid-execution; only when starting a fresh group.
+      if (!this.groups.size) await this.ensureSelection(selection)
       const id = nativeInputId(this.config.sessionId, messageId)
       const payload = JSON.stringify({ id, prompt: { text }, delivery, resume: true })
       const previous = this.inputs.get(id)
@@ -210,7 +253,7 @@ export class V2SessionCoordinator {
   }
   private async calibrate(signal?: AbortSignal) {
     for (let page = 0; page < 5; page++) {
-      const history = await this.request(this.path(`/history?limit=200&after=${this.cursor}`), undefined, signal)
+      const history = await this.request(this.path(`/history?limit=100&after=${this.cursor}`), undefined, signal)
       if (!Array.isArray(history?.data)) throw new V2ProtocolError('v2 history contract changed')
       for (const event of history.data as Durable[]) {
         const seq = event.durable?.seq
@@ -240,7 +283,7 @@ export class V2SessionCoordinator {
     throw new V2ProtocolError('Message history exceeds bounded projection budget')
   }
   private async settleIdle(signal?: AbortSignal) {
-    try { await this.request(this.path('/wait'), {}, signal, Math.min(250, this.config.requestTimeoutMs)) } catch { return }
+    if (!await this.probeIdle(Math.min(250, this.config.requestTimeoutMs), signal)) return
     if (!await this.calibrate(signal)) return
     const messages = await this.projections(signal)
     for (const group of [...this.groups.values()]) {

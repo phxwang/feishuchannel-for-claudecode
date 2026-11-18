@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, realpathSync, writeFileSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { loadRouterConfig, RouterConfigError, validateRouterConfig } from './config'
+import { loadRouterConfig, resolveOpenCodeConfig, RouterConfigError, validateRouterConfig } from './config'
 
 function tmpRoot(): string {
   const dir = mkdtempSync(join(tmpdir(), 'agents-cfg-'))
@@ -54,6 +54,41 @@ describe('validateRouterConfig', () => {
     const root = tmpRoot()
     const raw: any = baseConfig(root)
     delete raw.version
+    expect(() => validateRouterConfig(raw, [root])).toThrow(RouterConfigError)
+  })
+
+  test('accepts per-project opencode feature-flag overrides', () => {
+    const root = tmpRoot()
+    const raw: any = baseConfig(root)
+    raw.projects.proj.opencode = { nativeV2: true, progressCards: true, model: 'deepseek/deepseek-flash' }
+    const cfg = validateRouterConfig(raw, [root])
+    expect(cfg.projects.proj.opencode).toEqual({ nativeV2: true, progressCards: true, model: 'deepseek/deepseek-flash' })
+    expect(cfg.projects.proj.allowedAgents).toEqual(['claude', 'opencode'])
+  })
+
+  test('resolves per-project opencode overrides by workdir (routes carry the workdir, not the project key)', () => {
+    const root = tmpRoot()
+    const raw: any = baseConfig(root)
+    raw.agents = { opencode: { type: 'opencode', baseUrl: 'http://127.0.0.1:4096', requestTimeoutSeconds: 30, taskTimeoutSeconds: 600, maxConcurrency: 4, nativeV2: false, progressCards: false } }
+    raw.projects.proj.opencode = { nativeV2: true, progressCards: true, model: 'deepseek/deepseek-flash' }
+    const cfg = validateRouterConfig(raw, [root])
+    for (const workdir of [join(root, 'proj'), join(root, 'proj') + '/']) {
+      const effective = resolveOpenCodeConfig(cfg, workdir)
+      expect(effective?.nativeV2).toBe(true)
+      expect(effective?.progressCards).toBe(true)
+      expect(effective?.streamText).toBe(false)
+      expect(effective?.model).toBe('deepseek/deepseek-flash')
+      expect(effective?.taskTimeoutSeconds).toBe(600)
+    }
+    const globalOnly = resolveOpenCodeConfig(cfg, join(root, 'elsewhere'))
+    expect(globalOnly?.nativeV2).toBe(false)
+    expect(globalOnly?.progressCards).toBe(false)
+  })
+
+  test('rejects non-boolean per-project opencode overrides', () => {
+    const root = tmpRoot()
+    const raw: any = baseConfig(root)
+    raw.projects.proj.opencode = { nativeV2: 'yes' }
     expect(() => validateRouterConfig(raw, [root])).toThrow(RouterConfigError)
   })
 

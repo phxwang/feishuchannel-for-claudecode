@@ -22,12 +22,12 @@ import {
   deleteTmuxSessionId, getTmuxSessionId, markEventProcessed, openDb, PermissionRegistry,
   pruneProcessedEvents, setTmuxSessionId, SqliteBindingStore, wasEventProcessed,
 } from './routing/storage'
-import { loadRouterConfig, RouterConfigError } from './routing/config'
+import { loadRouterConfig, resolveOpenCodeConfig, RouterConfigError } from './routing/config'
 import { resolveRoute } from './routing/resolver'
 import { conversationKey } from './routing/bindings'
 import { evictMissingOpenCodeBinding } from './routing/opencode-recovery'
-import type { AgentPolicy, RouterConfig } from './routing/types'
-import { V2SessionCoordinator, coordinatorKey, nativeInputId, v2Request } from './adapters/opencode/v2-coordinator'
+import type { AgentPolicy, OpenCodeAgentConfig, RouterConfig } from './routing/types'
+import { V2SessionCoordinator, coordinatorKey, nativeInputId, v2Request, type ModelSelection } from './adapters/opencode/v2-coordinator'
 import { ProgressCard, TextDelivery, safeSummary, type TextPartSnapshot } from './adapters/opencode/presentation'
 import { OpenCodeAdapter } from './adapters/opencode/opencode-adapter'
 import type { AgentEvent } from './adapters/agent-adapter'
@@ -428,7 +428,8 @@ async function handleOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRo
     return
   }
 
-  if (openCodeCfg?.nativeV2) return handleNativeOpenCodeTask(route, chatId, messageId, chatType, content)
+  const routeCfg = resolveOpenCodeConfig(infraConfig, route.workdir)
+  if (routeCfg?.nativeV2) return handleNativeOpenCodeTask(route, chatId, messageId, chatType, content, routeCfg)
 
   const key = conversationKey(
     chatType === 'group' ? { kind: 'group', chatId, projectId: route.project } : { kind: 'p2p', userOpenId: chatId, projectId: route.project },
@@ -529,23 +530,37 @@ function nativeCard(line: string) {
     body: { elements: [{ tag: 'markdown', content: line }] } })
 }
 
+/** `providerID/modelID`, e.g. `deepseek/deepseek-flash`. */
+function parseNativeModel(value?: string): { id: string; providerID: string } | undefined {
+  if (!value) return undefined
+  const slash = value.indexOf('/')
+  if (slash <= 0 || slash === value.length - 1) throw new Error(`model "${value}" 格式无效；需要 providerID/modelID`)
+  return { providerID: value.slice(0, slash), id: value.slice(slash + 1) }
+}
+
 async function handleNativeOpenCodeTask(route: NonNullable<ReturnType<typeof resolveRoute>>, chatId: string, messageId: string,
-  chatType: 'p2p' | 'group', content: string) {
-  const cfg = openCodeCfg!
+  chatType: 'p2p' | 'group', content: string, cfg: OpenCodeAgentConfig) {
   const config = { baseUrl: cfg.baseUrl, requestTimeoutMs: cfg.requestTimeoutSeconds * 1000, passwordEnv: cfg.passwordEnv }
   const source = conversationKey(chatType === 'group' ? { kind: 'group', chatId, projectId: route.project }
     : { kind: 'p2p', userOpenId: chatId, projectId: route.project })
   const bindingKey = `${source}:native-v2`
   let pendingInputId: string | undefined
   try {
-    // Session-specific model selection is not silently translated to v2's mutable model endpoint.
-    if (route.agent.model) throw new Error('native v2 暂不支持路由 model 覆盖；请在独立 OpenCode 会话配置模型')
+    // Per-chat overrides win over the project-level default. Variant is the
+    // thinking effort (e.g. deepseek-flash low/high/max), applied when idle.
+    const selection: ModelSelection = {}
+    const model = parseNativeModel(route.agent.model) ?? parseNativeModel(cfg.model)
+    if (model) selection.model = model
+    const variant = route.agent.variant?.trim()
+    if (variant) selection.variant = variant
     let sessionId = openCodeBindings.get(bindingKey)?.agentSessionId
     if (!sessionId) {
       let creation = inFlightSessionCreations.get(bindingKey)
       if (!creation) {
         creation = (async () => {
-          const response = await v2Request(config, '/api/session', { location: { directory: route.workdir } })
+          const createBody: Record<string, unknown> = { location: { directory: route.workdir } }
+          if (selection.model) createBody.model = { ...selection.model, ...(selection.variant ? { variant: selection.variant } : {}) }
+          const response = await v2Request(config, '/api/session', createBody)
           if (!response?.data?.id) throw new Error('v2 会话协议不兼容；未提交任务')
           openCodeBindings.put(createBinding(bindingKey, route.project, 'opencode', null, response.data.id, 'v2', new Date().toISOString()))
           return String(response.data.id)
@@ -622,14 +637,14 @@ async function handleNativeOpenCodeTask(route: NonNullable<ReturnType<typeof res
     if (!prompt.trim()) throw new Error('/queue 后需要任务内容')
     const inputId = nativeInputId(sessionId, messageId); pendingInputId = inputId
     nativeRoots.set(inputId, { chatId, messageId })
-    const receipt = await coordinator.submit(source, messageId, prompt, queue ? 'queue' : 'steer')
+    const receipt = await coordinator.submit(source, messageId, prompt, queue ? 'queue' : 'steer', selection)
     nativeRoots.delete(inputId)
     if (receipt.joined || queue || receipt.status === 'outcome_unknown') await replyText(chatId, messageId,
       receipt.status === 'outcome_unknown' ? '提交结果待核实，正在按原输入 ID 对账；不会自动重复提交。'
         : queue ? '已提交排队任务，等待执行器在空闲边界接收。' : '已提交补充，等待执行器接收；不会中止正在运行的工具。')
   } catch (error) {
     if (pendingInputId) nativeRoots.delete(pendingInputId)
-    dbg(`native opencode: ${error instanceof Error ? error.name : 'request failed'}`)
+    dbg(`native opencode: ${error instanceof Error ? `${error.name}: ${error.message}` : 'request failed'}`)
     await replyText(chatId, messageId, `⚠️ OpenCode 原生插入模式失败：${safeSummary(error instanceof Error ? error.message : '请求失败')}。未自动回退 legacy 或重新提交。`)
   }
 }

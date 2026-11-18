@@ -4,15 +4,25 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 async function until(check: () => boolean) { for (let n = 0; n < 400; n++) { if (check()) return; await sleep(5) }; throw new Error('condition timed out') }
 function fixture(options: { lostAck?: boolean; denied?: boolean; idleTimeoutMs?: number; sse?: boolean; projectionFailsOnce?: boolean } = {}) {
   const history: any[] = [], messages: any[] = [], permissions: any[] = [], posts: any[] = [], started: string[] = [], settled: any[] = [], emitted: any[] = []
-  let busy = false, streams = 0, projectionFailures = options.projectionFailsOnce ? 1 : 0
+  let busy = false, streams = 0, waits = 0, projectionFailures = options.projectionFailsOnce ? 1 : 0
+  let sessionModel: any = { id: 'm1', providerID: 'p1', variant: 'default' }
+  const modelPosts: any[] = []
   let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
   const event = (type: string, data: any = {}) => { history.push({ type: `session.next.${type}`, durable: { seq: history.length + 1 }, data: { sessionID: 'ses_test', ...data } });
     streamController?.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(history.at(-1))}\r\n\r\n`)) }
   const fetcher = (async (input: any, init: any = {}) => {
     const url = new URL(String(input)), path = url.pathname
     if (path.endsWith('/wait')) {
-      if (!busy) return new Response(null, { status: 204 })
-      return new Promise<Response>((_, reject) => { if (init.signal.aborted) reject(new Error('aborted')); else init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }) })
+      // The installed 1.18.15 service exposes this endpoint but it is not ready.
+      waits++
+      return Response.json({ _tag: 'ServiceUnavailableError', message: 'Session wait is not available yet', service: 'session.wait' }, { status: 503 })
+    }
+    if (path === '/api/session/active') return Response.json({ data: busy ? { ses_test: {} } : {} })
+    if (path === '/api/session/ses_test' && (!init.method || init.method === 'GET')) return Response.json({ data: { id: 'ses_test', model: sessionModel } })
+    if (path.endsWith('/model') && init.method === 'POST') {
+      sessionModel = JSON.parse(init.body).model
+      modelPosts.push(sessionModel)
+      return new Response(null, { status: 204 })
     }
     if (path.endsWith('/event')) {
       streams++
@@ -23,7 +33,10 @@ function fixture(options: { lostAck?: boolean; denied?: boolean; idleTimeoutMs?:
         init.signal.addEventListener('abort', () => { streamController = undefined; controller.close() }, {once:true})
       }}), {headers:{'content-type':'text/event-stream'}})
     }
-    if (path.endsWith('/history')) return Response.json({ data: history.filter(e => e.durable.seq > Number(url.searchParams.get('after'))), hasMore: false })
+    if (path.endsWith('/history')) {
+      if (Number(url.searchParams.get('limit')) > 100) return new Response('{}', { status: 400 })
+      return Response.json({ data: history.filter(e => e.durable.seq > Number(url.searchParams.get('after'))), hasMore: false })
+    }
     if (path.endsWith('/message')) { if (projectionFailures-- > 0) return new Response('{}', {status:503}); return Response.json({ data: messages, cursor: {} }) }
     if (path.endsWith('/permission')) return Response.json({ data: permissions })
     if (path.includes('/permission/') && path.endsWith('/reply')) { posts.push(JSON.parse(init.body)); return new Response(null, {status:204}) }
@@ -45,10 +58,40 @@ function fixture(options: { lostAck?: boolean; denied?: boolean; idleTimeoutMs?:
   const consume = (id: string, msg: string) => { event('prompted', { messageID: id }); event('step.started', { assistantMessageID: msg }) }
   const finish = (msg: string, text: string) => { event('text.ended', { assistantMessageID: msg, textID: msg + '-text', text }); event('step.ended', { assistantMessageID: msg });
     messages.push({ id: msg, type: 'assistant', time: { completed: 1 }, finish: 'stop', content: [{ id: msg + '-text', type: 'text', text }] }) }
-  return { coordinator, history, messages, permissions, posts, started, settled, emitted, event, consume, finish, idle: () => { busy = false }, streams: () => streams }
+  return { coordinator, history, messages, permissions, posts, started, settled, emitted, event, consume, finish, idle: () => { busy = false }, streams: () => streams, waits: () => waits, models: () => modelPosts }
 }
 
 describe('native v2 execution groups at actual HTTP/durable boundaries', () => {
+  test('idle proof uses /api/session/active instead of the unavailable /wait endpoint', async () => {
+    const f = fixture()
+    const a = await f.coordinator.submit('chat1', 'A', 'one')
+    expect(a.joined).toBe(false)
+    expect(f.waits()).toBe(0)
+    f.consume(nativeInputId('ses_test', 'A'), 'ma'); f.finish('ma', 'ok'); f.idle()
+    await until(() => f.settled.length === 1)
+  })
+
+  test('per-chat thinking variant is applied to the session before a fresh turn, never mid-execution', async () => {
+    const f = fixture()
+    await f.coordinator.submit('chat1', 'A', 'one', 'steer', { variant: 'high' })
+    expect(f.models()).toEqual([{ id: 'm1', providerID: 'p1', variant: 'high' }])
+    // B steers into the in-flight group: no model/variant mutation mid-run.
+    await f.coordinator.submit('chat1', 'B', 'two', 'steer', { variant: 'low' })
+    expect(f.models()).toHaveLength(1)
+    f.consume(nativeInputId('ses_test', 'A'), 'ma'); f.finish('ma', 'done')
+    f.consume(nativeInputId('ses_test', 'B'), 'mb'); f.finish('mb', 'done'); f.idle()
+    await until(() => f.settled.length === 1)
+    // The next fresh turn picks up the new variant (+ explicit model override).
+    await f.coordinator.submit('chat1', 'C', 'three', 'steer', { model: { id: 'deepseek-flash', providerID: 'deepseek' }, variant: 'max' })
+    expect(f.models().at(-1)).toEqual({ id: 'deepseek-flash', providerID: 'deepseek', variant: 'max' })
+  })
+
+  test('a fresh turn without a variant keeps the session model untouched', async () => {
+    const f = fixture()
+    await f.coordinator.submit('chat1', 'A', 'one')
+    expect(f.models()).toEqual([])
+  })
+
   test('steer B/C joins busy A; one observer/card owner, ordered per-step final text', async () => {
     const f = fixture()
     const a = await f.coordinator.submit('chat1', 'A', 'start')

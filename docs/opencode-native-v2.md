@@ -20,9 +20,40 @@ agents:
     streamText: false
 ```
 
+To enable these for one project only, override them under that project — every other OpenCode group keeps inheriting the global (default-off) values:
+
+```yaml
+projects:
+  qttresearch:
+    workdir: /path/to/qttresearch
+    allowedAgents: [claude, opencode]
+    opencode:
+      nativeV2: true
+      progressCards: true
+      model: deepseek/deepseek-flash   # providerID/modelID; required for a new native session
+      # streamText: true
+```
+
+Project-level values win over `agents.opencode`; unset keys inherit. `agents.yaml` is read at router startup, so restart the router after changing these flags (and don't restart/toggle while that project has an active turn).
+
+Per-chat thinking effort is configured in `access.json` on that chat's agent policy. The model is preserved unless one is supplied; any change is applied only when the session is idle, immediately before a fresh turn — never mid-execution:
+
+```jsonc
+{
+  "groups": {
+    "oc_qttresearch": {
+      "workdir": "/path/to/qttresearch",
+      "agent": { "primary": "opencode", "fallback": null, "variant": "high" }
+    }
+  }
+}
+```
+
+For `deepseek-flash` the available variants are `low`, `high` and `max`. `agent.model` (also `providerID/modelID`) takes precedence over the project-level default.
+
 `nativeV2` selects a separate native API session/coordinator, not a new field on legacy `prompt_async`. Native bindings use the existing conversation key plus `:native-v2`; legacy bindings, session selection and permission handling are untouched. Do not toggle this flag during an active execution. `progressCards` and `streamText` only affect native mode. With streaming off, authoritative final text is still delivered.
 
-Native mode currently deliberately refuses `route.agent.model` overrides rather than silently mutating an active session's model. It creates a fresh v2 session using the backend's default model/agent. It does **not** migrate legacy history or model configuration. Existing attachment prompts continue using the router's existing text/path context; v2 tool-produced data-URI attachments are collected from authoritative message projections. Arbitrary URL/file references are not fetched automatically.
+Native mode resolves its model from the per-chat `agent.model`, then the project-level `opencode.model`; a new session gets that model (and variant) at creation, and a reused session is switched only when idle. It does **not** migrate legacy history or legacy model configuration. Existing attachment prompts continue using the router's existing text/path context; v2 tool-produced data-URI attachments are collected from authoritative message projections. Arbitrary URL/file references are not fetched automatically.
 
 ## User semantics
 
@@ -38,7 +69,7 @@ The coordinator key contains endpoint, realpath directory and session. Only one 
 
 Durable `session.next.prompted` marks input consumption, and the subsequent `session.next.step.started` associates assistant IDs with that execution group. No v2 `parentID` is invented. Unknown external input suspends the coordinator and suppresses that work's output. A new message arriving after proven idle creates a fresh group rather than losing its reply under a stale “absorbed” flag. Queue inputs maintain their own group and manifest.
 
-A single native SSE reader only parses/enqueues bounded durable events; it never awaits Feishu or ownership HTTP. Durable sequence gaps and SSE disconnects are repaired through exclusive `history?after=<seq>&limit=200` pages. A live-but-silent stream is calibrated every 5 seconds too. Polling is serialized (no overlapping reader/poller or duplicate ownership mutation). Native `/wait` calls are short, abortable idle probes, not multi-minute transport requests. Completion additionally requires all inputs consumed and an owned completed assistant projection, with `tool-calls` not considered final.
+A single native SSE reader only parses/enqueues bounded durable events; it never awaits Feishu or ownership HTTP. Durable sequence gaps and SSE disconnects are repaired through exclusive `history?after=<seq>&limit=100` pages (the API rejects larger limits). A live-but-silent stream is calibrated every 5 seconds too. Polling is serialized (no overlapping reader/poller or duplicate ownership mutation). Idle proof uses `/api/session/active` (sessions absent from the drain map are inactive); the installed 1.18.15 build answers `/session/{id}/wait` with 503, so `/wait` is not used. Completion additionally requires all inputs consumed and an owned completed assistant projection, with `tool-calls` not considered final.
 
 Native progress consumes **durable completed text parts**, not speculative token deltas. This provides mid-task explanations without mixing v2 and legacy live-event schemas. Final reconciliation retrieves the paginated ordered native message projection. It filters by owned assistant IDs and ignores reasoning/synthetic/ignored text. The successful legacy task-timeout implementation is unchanged.
 

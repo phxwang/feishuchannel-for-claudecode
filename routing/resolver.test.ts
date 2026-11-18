@@ -24,6 +24,19 @@ const access: LegacyAccess = {
   defaultWorkdir: '/Users/openclaw/Projects/inv',
 }
 
+describe('resolveRoute — per-chat thinking variant', () => {
+  test('forwards a string variant and drops a non-string one', () => {
+    const ok = resolveRoute({ chatType: 'group', chatId: 'oc_variant' }, infra, {
+      groups: { oc_variant: { workdir: '/Users/openclaw/Projects/feishuchannel', agent: { primary: 'opencode', fallback: null, variant: ' high ' } } },
+    })
+    expect(ok?.agent.variant).toBe('high')
+    const bad = resolveRoute({ chatType: 'group', chatId: 'oc_variant' }, infra, {
+      groups: { oc_variant: { workdir: '/Users/openclaw/Projects/feishuchannel', agent: { primary: 'opencode', fallback: null, variant: 42 as any } } },
+    })
+    expect(bad?.agent.variant).toBeUndefined()
+  })
+})
+
 describe('resolveRoute — project always comes from access.json', () => {
   test('group with an explicit agent override uses it (when infra allows it)', () => {
     const r = resolveRoute({ chatType: 'group', chatId: 'oc_opencode_group' }, infra, access)

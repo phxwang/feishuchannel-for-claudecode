@@ -24,11 +24,27 @@ export interface AgentPolicy {
    * effect on an already-running tmux session; ignored outside mode:'tmux'.
    */
   model?: string
+  /**
+   * OpenCode-only: thinking/reasoning variant (`low` | `high` | `max` for
+   * deepseek-flash), applied to the native v2 session when it is idle.
+   */
+  variant?: string
 }
 
 export interface ProjectConfig {
   workdir: string
   allowedAgents: AgentKind[]
+  /** Per-project overrides for the `agents.opencode` feature flags, so an
+   *  experimental route (e.g. native v2 / progress cards) can be enabled
+   *  without changing every other OpenCode group. Unset values inherit from
+   *  `agents.opencode`. */
+  opencode?: {
+    nativeV2?: boolean
+    progressCards?: boolean
+    streamText?: boolean
+    /** Native v2 model as `providerID/modelID`. */
+    model?: string
+  }
 }
 
 export interface ClaudeAgentConfig {
@@ -51,6 +67,8 @@ export interface OpenCodeAgentConfig {
   nativeV2?: boolean
   progressCards?: boolean
   streamText?: boolean
+  /** Native v2 model as `providerID/modelID` (e.g. `deepseek/deepseek-flash`). */
+  model?: string
 }
 
 export type AgentBackendConfig = ClaudeAgentConfig | OpenCodeAgentConfig
