@@ -35,12 +35,11 @@ export interface ProjectConfig {
   workdir: string
   allowedAgents: AgentKind[]
   /** Per-project overrides for the `agents.opencode` feature flags, so an
-   *  experimental route (e.g. native v2 / progress cards) can be enabled
-   *  without changing every other OpenCode group. Unset values inherit from
+   *  experimental route (e.g. native v2) can be enabled without changing
+   *  every other OpenCode group. Unset values inherit from
    *  `agents.opencode`. */
   opencode?: {
     nativeV2?: boolean
-    progressCards?: boolean
     streamText?: boolean
     /** Native v2 model as `providerID/modelID`. */
     model?: string
@@ -63,9 +62,8 @@ export interface OpenCodeAgentConfig {
   /** Absolute cap regardless of progress (seconds). Defaults to 8 hours. */
   taskHardCapSeconds?: number
   maxConcurrency: number
-  /** Native v2 admission/coordinator; opt-in, never migrates legacy bindings. */
+  /** Native v2 admission/coordinator; opt-in, never migrates legacy bindings. Always shows a progress card. */
   nativeV2?: boolean
-  progressCards?: boolean
   streamText?: boolean
   /** Native v2 model as `providerID/modelID` (e.g. `deepseek/deepseek-flash`). */
   model?: string

@@ -580,14 +580,12 @@ async function handleNativeOpenCodeTask(route: NonNullable<ReturnType<typeof res
           const root = nativeRoots.get(groupId)!
           const text = new TextDelivery(async text => { await nativeFeishu(`messages/${encodeURIComponent(root.messageId)}/reply`, 'POST',
             { msg_type: 'text', content: JSON.stringify({ text }), reply_in_thread: false }) }, cfg.streamText)
-          let card: ProgressCard | undefined
-          if (cfg.progressCards) {
-            // Creation once only; ambiguous creation never triggers another create.
-            const ready = nativeFeishu(`messages?receive_id_type=chat_id`, 'POST',
-              { receive_id: root.chatId, msg_type: 'interactive', content: nativeCard('🤔 等待执行进展') })
-              .then(data => data?.message_id).catch(() => undefined)
-            card = new ProgressCard(async line => { const id = await ready; if (id) await nativeFeishu(`messages/${encodeURIComponent(id)}`, 'PATCH', { content: nativeCard(line) }) })
-          }
+          // Native mode always shows a progress card. Creation once only;
+          // ambiguous creation never triggers another create.
+          const ready = nativeFeishu(`messages?receive_id_type=chat_id`, 'POST',
+            { receive_id: root.chatId, msg_type: 'interactive', content: nativeCard('🤔 等待执行进展') })
+            .then(data => data?.message_id).catch(() => undefined)
+          const card = new ProgressCard(async line => { const id = await ready; if (id) await nativeFeishu(`messages/${encodeURIComponent(id)}`, 'PATCH', { content: nativeCard(line) }) })
           displays.set(groupId, { root, text, card, attachments: [] })
         },
         event(groupId, event) {

@@ -16,9 +16,10 @@ agents:
     taskHardCapSeconds: 28800
     maxConcurrency: 4
     nativeV2: false
-    progressCards: false
     streamText: false
 ```
+
+Native mode always shows a progress card; there is no separate flag for it. (`progressCards` was removed; an old config that still sets it loads fine and the key is ignored.)
 
 To enable these for one project only, override them under that project — every other OpenCode group keeps inheriting the global (default-off) values:
 
@@ -29,7 +30,6 @@ projects:
     allowedAgents: [claude, opencode]
     opencode:
       nativeV2: true
-      progressCards: true
       model: deepseek/deepseek-flash   # providerID/modelID; required for a new native session
       # streamText: true
 ```
@@ -51,7 +51,7 @@ Per-chat thinking effort is configured in `access.json` on that chat's agent pol
 
 For `deepseek-flash` the available variants are `low`, `high` and `max`. `agent.model` (also `providerID/modelID`) takes precedence over the project-level default.
 
-`nativeV2` selects a separate native API session/coordinator, not a new field on legacy `prompt_async`. Native bindings use the existing conversation key plus `:native-v2`; legacy bindings, session selection and permission handling are untouched. Do not toggle this flag during an active execution. `progressCards` and `streamText` only affect native mode. With streaming off, authoritative final text is still delivered.
+`nativeV2` selects a separate native API session/coordinator, not a new field on legacy `prompt_async`. Native bindings use the existing conversation key plus `:native-v2`; legacy bindings, session selection and permission handling are untouched. Do not toggle this flag during an active execution. `streamText` only affects native mode. With streaming off, authoritative final text is still delivered.
 
 Native mode resolves its model from the per-chat `agent.model`, then the project-level `opencode.model`; a new session gets that model (and variant) at creation, and a reused session is switched only when idle. It does **not** migrate legacy history or legacy model configuration. Existing attachment prompts continue using the router's existing text/path context; v2 tool-produced data-URI attachments are collected from authoritative message projections. Arbitrary URL/file references are not fetched automatically.
 

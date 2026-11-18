@@ -60,29 +60,38 @@ describe('validateRouterConfig', () => {
   test('accepts per-project opencode feature-flag overrides', () => {
     const root = tmpRoot()
     const raw: any = baseConfig(root)
-    raw.projects.proj.opencode = { nativeV2: true, progressCards: true, model: 'deepseek/deepseek-flash' }
+    raw.projects.proj.opencode = { nativeV2: true, model: 'deepseek/deepseek-flash' }
     const cfg = validateRouterConfig(raw, [root])
-    expect(cfg.projects.proj.opencode).toEqual({ nativeV2: true, progressCards: true, model: 'deepseek/deepseek-flash' })
+    expect(cfg.projects.proj.opencode).toEqual({ nativeV2: true, model: 'deepseek/deepseek-flash' })
     expect(cfg.projects.proj.allowedAgents).toEqual(['claude', 'opencode'])
+  })
+
+  test('progressCards is no longer an option (cards are always on in native mode); an old config that still sets it loads and drops it', () => {
+    const root = tmpRoot()
+    const raw: any = baseConfig(root)
+    raw.agents = { opencode: { type: 'opencode', baseUrl: 'http://127.0.0.1:4096', requestTimeoutSeconds: 30, taskTimeoutSeconds: 600, maxConcurrency: 4, progressCards: false } }
+    raw.projects.proj.opencode = { nativeV2: true, progressCards: true }
+    const cfg = validateRouterConfig(raw, [root])
+    expect(cfg.projects.proj.opencode).toEqual({ nativeV2: true })
+    expect(cfg.agents.opencode).not.toHaveProperty('progressCards')
+    expect(resolveOpenCodeConfig(cfg, join(root, 'proj'))).not.toHaveProperty('progressCards')
   })
 
   test('resolves per-project opencode overrides by workdir (routes carry the workdir, not the project key)', () => {
     const root = tmpRoot()
     const raw: any = baseConfig(root)
-    raw.agents = { opencode: { type: 'opencode', baseUrl: 'http://127.0.0.1:4096', requestTimeoutSeconds: 30, taskTimeoutSeconds: 600, maxConcurrency: 4, nativeV2: false, progressCards: false } }
-    raw.projects.proj.opencode = { nativeV2: true, progressCards: true, model: 'deepseek/deepseek-flash' }
+    raw.agents = { opencode: { type: 'opencode', baseUrl: 'http://127.0.0.1:4096', requestTimeoutSeconds: 30, taskTimeoutSeconds: 600, maxConcurrency: 4, nativeV2: false } }
+    raw.projects.proj.opencode = { nativeV2: true, model: 'deepseek/deepseek-flash' }
     const cfg = validateRouterConfig(raw, [root])
     for (const workdir of [join(root, 'proj'), join(root, 'proj') + '/']) {
       const effective = resolveOpenCodeConfig(cfg, workdir)
       expect(effective?.nativeV2).toBe(true)
-      expect(effective?.progressCards).toBe(true)
       expect(effective?.streamText).toBe(false)
       expect(effective?.model).toBe('deepseek/deepseek-flash')
       expect(effective?.taskTimeoutSeconds).toBe(600)
     }
     const globalOnly = resolveOpenCodeConfig(cfg, join(root, 'elsewhere'))
     expect(globalOnly?.nativeV2).toBe(false)
-    expect(globalOnly?.progressCards).toBe(false)
   })
 
   test('rejects non-boolean per-project opencode overrides', () => {
@@ -133,13 +142,13 @@ projects:
   })
 })
 
-test('native insertion/progress/text require explicit opt-in and accept independent flags', () => {
+test('native insertion and text streaming require explicit opt-in and accept independent flags', () => {
   const root = tmpRoot()
   const raw: any = { ...baseConfig(root), agents: { opencode: { type: 'opencode', baseUrl: 'http://localhost:4096',
     requestTimeoutSeconds: 10, taskTimeoutSeconds: 3600, maxConcurrency: 4 } } }
   const legacy = validateRouterConfig(raw, [root]).agents.opencode!
-  expect([legacy.nativeV2, legacy.progressCards, legacy.streamText]).toEqual([false, false, false])
-  raw.agents.opencode.nativeV2 = true; raw.agents.opencode.progressCards = true
+  expect([legacy.nativeV2, legacy.streamText]).toEqual([false, false])
+  raw.agents.opencode.nativeV2 = true
   const native = validateRouterConfig(raw, [root]).agents.opencode!
-  expect([native.nativeV2, native.progressCards, native.streamText]).toEqual([true, true, false])
+  expect([native.nativeV2, native.streamText]).toEqual([true, false])
 })

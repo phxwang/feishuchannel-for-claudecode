@@ -48,7 +48,9 @@ const routerConfigSchema = z.object({
       taskHardCapSeconds: z.number().positive().optional(),
       maxConcurrency: z.number().int().positive(),
       nativeV2: z.boolean().default(false),
-      progressCards: z.boolean().default(false),
+      // progressCards was removed: native mode always shows a progress
+      // card. Not strict, so an old config still setting it loads and
+      // simply drops the key.
       streamText: z.boolean().default(false),
     }).optional(),
   }).default({}),
@@ -58,7 +60,6 @@ const routerConfigSchema = z.object({
     /** Per-project overrides for agents.opencode feature flags. */
     opencode: z.object({
       nativeV2: z.boolean().optional(),
-      progressCards: z.boolean().optional(),
       streamText: z.boolean().optional(),
       model: z.string().min(1).optional(),
     }).optional(),
@@ -150,7 +151,6 @@ export function resolveOpenCodeConfig(config: RouterConfig | null, workdir: stri
   return {
     ...base,
     nativeV2: override.nativeV2 ?? base.nativeV2,
-    progressCards: override.progressCards ?? base.progressCards,
     streamText: override.streamText ?? base.streamText,
     model: override.model ?? base.model,
   }
