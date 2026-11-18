@@ -46,6 +46,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { createHash, randomUUID } from 'crypto'
+import { backgroundWaitAfterStop, pendingBackgroundTaskIds } from './background-tasks'
 
 const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects')
 
@@ -499,6 +500,8 @@ export interface TmuxClaudeManagerOptions {
   replyTimeoutMs?: number
   /** After the Stop hook fires, how long to keep confirming the transcript has gone quiet before trusting it's really done. */
   postStopQuietMs?: number
+  /** After a Stop where only the transcript (not the footer) reports unfinished background tasks, how long with no transcript growth before giving up on them. A safety net for a task whose end was never recorded; generous because a background agent writes to its own transcript, not this one, while it works. */
+  backgroundIdleCapMs?: number
   /** How long with no transcript growth before checking the pane for a pending interactive dialog (permission prompt, etc.) — shorter than quietMs since this is just "is the CLI blocked on input", not "is the turn over". */
   dialogCheckMs?: number
   /**
@@ -546,6 +549,7 @@ export class TmuxClaudeManager {
   private readonly quietMs: number
   private readonly replyTimeoutMs: number
   private readonly postStopQuietMs: number
+  private readonly backgroundIdleCapMs: number
   private readonly dialogCheckMs: number
   private readonly stuckPaneCheckMs: number
   private readonly stuckPaneCooldownMs: number
@@ -572,6 +576,7 @@ export class TmuxClaudeManager {
     // session, not the expected wait time for an ordinary reply.
     this.replyTimeoutMs = opts.replyTimeoutMs ?? 8 * 60 * 60 * 1000
     this.postStopQuietMs = opts.postStopQuietMs ?? 800
+    this.backgroundIdleCapMs = opts.backgroundIdleCapMs ?? 2 * 60 * 60 * 1000
     this.dialogCheckMs = opts.dialogCheckMs ?? 1_500
     this.stuckPaneCheckMs = opts.stuckPaneCheckMs ?? 90_000
     this.stuckPaneCooldownMs = opts.stuckPaneCooldownMs ?? 5 * 60_000
@@ -587,6 +592,24 @@ export class TmuxClaudeManager {
   private async capturePane(name: string): Promise<string> {
     const r = await runTmux(['capture-pane', '-e', '-p', '-t', name])
     return r.ok ? r.stdout : ''
+  }
+
+  /**
+   * Background tasks the session started and hasn't heard back from yet
+   * (see background-tasks.ts). Reads the whole transcript, not just this
+   * call's new bytes, so a task started during an earlier message to the same
+   * session still counts. Only called once per Stop, so the full read is cheap
+   * enough. An unreadable transcript yields an empty set: the caller still has
+   * the footer's shell count to go on.
+   */
+  private pendingBackgroundTasks(transcriptPath: string | null): Set<string> {
+    if (!transcriptPath || !existsSync(transcriptPath)) return new Set()
+    try {
+      return pendingBackgroundTaskIds(readFileSync(transcriptPath, 'utf8').split('\n'))
+    } catch (e) {
+      this.dbg(`tmux: couldn't read ${transcriptPath} to check for background tasks: ${e}`)
+      return new Set()
+    }
   }
 
   /**
@@ -842,6 +865,8 @@ export class TmuxClaudeManager {
     let lastStuckNotifyMs = 0
     let lastSize = startOffset
     let transcriptPath = transcriptBefore
+    /** True while waiting after a Stop only because the transcript lists unfinished background tasks — see backgroundIdleCapMs. */
+    let waitCappedSinceStop = false
     const collected: string[] = []
 
     // Read as a Buffer and slice by byte offset, not by string index: lastSize/size
@@ -893,7 +918,9 @@ export class TmuxClaudeManager {
       // Stop, a single long active wait could otherwise cross
       // killIdleSessions' own idle threshold and get reaped mid-task.
       this.lastUsedAt.set(workdir, Date.now())
-      if (readGrowth()) continue
+      // Any growth means a turn is running again; it ends in its own Stop,
+      // which re-evaluates what's still pending.
+      if (readGrowth()) { waitCappedSinceStop = false; continue }
       const stopFired = !!signalPath && existsSync(signalPath) && statSync(signalPath).mtimeMs > baselineStopMs
       if (stopFired) {
         // The Stop hook can fire before the final transcript line(s) are
@@ -923,12 +950,30 @@ export class TmuxClaudeManager {
         // whole call's, and keep polling instead of returning now. Any text
         // from that next turn already went out via onTextChunk as it
         // happened, same as this one did — nothing is batched or re-sent.
-        const stillRunning = parseRunningShellCount(stripAnsi(await this.capturePane(sessionNameFor(workdir))))
-        if (stillRunning > 0) {
+        // The footer only reports bash shells ("N shells"); async agents
+        // and the like show up nowhere it can read reliably, so the
+        // transcript's own start/end records are checked as well — found
+        // live: a backgrounded smoke shell plus a review agent showed only
+        // "← 2 agents", this returned early, and the final reply written in
+        // the auto-continued turn never reached Feishu.
+        const pendingTasks = this.pendingBackgroundTasks(transcriptPath)
+        const runningShells = parseRunningShellCount(stripAnsi(await this.capturePane(sessionNameFor(workdir))))
+        const wait = backgroundWaitAfterStop(pendingTasks.size, runningShells)
+        if (wait !== 'done') {
+          this.dbg(`tmux: ${workdir} stopped with background work still running (tasks: ${[...pendingTasks].join(', ') || 'none'}; shells: ${runningShells}) — waiting for its next turn`)
+          waitCappedSinceStop = wait === 'wait-capped'
           // signalPath is guaranteed non-null here — stopFired required it.
           baselineStopMs = statSync(signalPath!).mtimeMs
           continue
         }
+        break
+      }
+      // Only the transcript (not the footer) said background work was
+      // pending at the last Stop, and nothing has been written since for
+      // backgroundIdleCapMs: assume the task's end was never recorded
+      // (e.g. the CLI died mid-task) rather than wait out the full deadline.
+      if (waitCappedSinceStop && isQuietDone(lastChangeMs, Date.now(), this.backgroundIdleCapMs)) {
+        this.dbg(`tmux: ${workdir} — no activity for ${this.backgroundIdleCapMs}ms while waiting on background tasks, treating the reply as finished`)
         break
       }
       // Quiet-period fallback is for when we have no Stop-hook signal to
