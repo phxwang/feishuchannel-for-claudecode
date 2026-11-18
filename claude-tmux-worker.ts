@@ -79,6 +79,19 @@ export function sessionNameFor(workdir: string): string {
   return `feishu-claude-${hash}`
 }
 
+/**
+ * Claude Code's `/clear` (aliases `/reset`, `/new`) switches the CLI to a
+ * brand-new transcript file and never fires a Stop hook for the turn that
+ * sent it. Typed into the pane as ordinary chat, this left collectReply
+ * tailing the old transcript forever — found live in qttresearch: the
+ * stuck-pane screenshot fired every 5 minutes for the rest of the 8-hour
+ * reply timeout. The router treats these as a session restart instead.
+ */
+const SESSION_RESET_COMMANDS = new Set(['/clear', '/reset', '/new'])
+export function isSessionResetCommand(text: string): boolean {
+  return SESSION_RESET_COMMANDS.has(text.trim().toLowerCase())
+}
+
 /** Mirrors how Claude Code CLI names its per-project transcript directory under ~/.claude/projects. */
 export function escapeWorkdirForTranscriptDir(workdir: string): string {
   return workdir.replace(/\//g, '-')
@@ -562,6 +575,8 @@ export class TmuxClaudeManager {
   private queues = new Map<string, Promise<string>>()
   /** workdir -> last time a message was sent to it, for killIdleSessions(). */
   private lastUsedAt = new Map<string, number>()
+  /** workdir -> session epoch, bumped by killSession so an in-flight collectReply for the killed session knows to stop. */
+  private epochs = new Map<string, number>()
 
   constructor(opts: TmuxClaudeManagerOptions = {}) {
     this.dbg = opts.dbg ?? (() => {})
@@ -858,6 +873,8 @@ export class TmuxClaudeManager {
     onDialog?: DialogHandler, onStuckPane?: StuckPaneHandler, onTabSwitched?: TabSwitchedHandler, onProgress?: ProgressHandler, onTextChunk?: TextChunkHandler,
   ): Promise<string> {
     let deadline = beforeSendMs + this.replyTimeoutMs
+    const epoch = this.epochs.get(workdir) ?? 0
+    const sessionKilled = () => (this.epochs.get(workdir) ?? 0) !== epoch
     let lastChangeMs = Date.now()
     let lastDialogCheckMs = Date.now()
     // 0, not Date.now(), so the very first stuck episode of this call is
@@ -912,6 +929,10 @@ export class TmuxClaudeManager {
 
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 400))
+      if (sessionKilled()) {
+        this.dbg(`tmux: ${workdir}'s session was killed/restarted — ending its in-flight reply wait`)
+        break
+      }
       // Refreshed on every poll tick, not just at message-send time: with
       // replyTimeoutMs now able to run up to 8 hours, including through
       // several self-continued turns this loop keeps polling past their own
@@ -936,7 +957,7 @@ export class TmuxClaudeManager {
         // and a short fixed cap here would stop forwarding that activity to
         // onProgress/the status card even though the CLI is still working.
         let lastGrowthMs = Date.now()
-        while (Date.now() < deadline) {
+        while (Date.now() < deadline && !sessionKilled()) {
           await new Promise(r => setTimeout(r, 300))
           if (readGrowth()) { lastGrowthMs = Date.now(); continue }
           if (isQuietDone(lastGrowthMs, Date.now(), this.postStopQuietMs)) break
@@ -1132,6 +1153,13 @@ export class TmuxClaudeManager {
 
   async killSession(workdir: string): Promise<void> {
     const name = sessionNameFor(workdir)
+    // End any in-flight collectReply for this workdir (it polls the epoch)
+    // and free its queue slot now, so a message sent right after a restart
+    // starts its own wait instead of being absorbed into the dead one. Found
+    // live: after /restart the old wait kept screenshotting the *new*
+    // session (same tmux name) every 5 minutes.
+    this.epochs.set(workdir, (this.epochs.get(workdir) ?? 0) + 1)
+    this.queues.delete(workdir)
     this.knownAlive.delete(workdir)
     this.sessionIds.delete(workdir)
     this.lastUsedAt.delete(workdir)

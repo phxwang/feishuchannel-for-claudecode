@@ -1,8 +1,21 @@
 import { describe, expect, test } from 'bun:test'
 import {
-  buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone,
+  buildSettingsOverride, escapeWorkdirForTranscriptDir, isQuietDone, isSessionResetCommand,
   parseAssistantTextLines, parseDialogOptions, parseProgressLines, parseTabBar, rightPressesToReach, sessionNameFor, stopSignalPathFor, stripAnsi,
 } from './claude-tmux-worker'
+
+describe('isSessionResetCommand', () => {
+  test('matches the CLI commands that switch to a fresh transcript', () => {
+    for (const cmd of ['/clear', '/reset', '/new', '  /reset  ', '/CLEAR']) {
+      expect(isSessionResetCommand(cmd)).toBe(true)
+    }
+  })
+  test('ignores other slash commands and ordinary text', () => {
+    for (const text of ['/restart', '/esc', '/model', '/newline', 'please /reset it', 'reset', '']) {
+      expect(isSessionResetCommand(text)).toBe(false)
+    }
+  })
+})
 
 describe('sessionNameFor', () => {
   test('is deterministic for the same workdir', () => {

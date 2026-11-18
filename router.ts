@@ -38,7 +38,7 @@ import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
 import { downloadFeishuResource } from './feishu-download'
 import { renderPaneScreenshot } from './pane-screenshot'
 import { decodeBase64DataUri } from './data-uri'
-import { TmuxClaudeManager, DIALOG_ESCAPE_CHOICE, DIALOG_TIMED_OUT_CHOICE, type Dialog, type ProgressEvent } from './claude-tmux-worker'
+import { TmuxClaudeManager, isSessionResetCommand, DIALOG_ESCAPE_CHOICE, DIALOG_TIMED_OUT_CHOICE, type Dialog, type ProgressEvent } from './claude-tmux-worker'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -970,7 +970,8 @@ async function handleClaudeTmuxTask(
 
   const trimmed = content.trim()
   const selectMatch = trimmed.match(/^\/select\s+(\d+)$/)
-  if (trimmed === '/esc' || trimmed === '/restart' || selectMatch) {
+  const isReset = isSessionResetCommand(trimmed)
+  if (trimmed === '/esc' || trimmed === '/restart' || isReset || selectMatch) {
     // Cancel any dialog this workdir is still awaiting a Feishu click for
     // *before* acting — otherwise a click that arrives after /restart hits
     // a brand-new, unrelated session under the same name (sessionNameFor is
@@ -991,6 +992,15 @@ async function handleClaudeTmuxTask(
   if (trimmed === '/restart') {
     await tmuxClaude.restartSession(workdir, model)
     void replyText(chatId, messageId, '✅ Claude Code (tmux) 已重启')
+    return
+  }
+  if (isReset) {
+    // /clear, /reset, /new: typed into the CLI these move it to a new
+    // transcript with no Stop hook, stranding the reply wait (see
+    // isSessionResetCommand). A fresh session gives the same clean slate
+    // and keeps transcript tracking correct.
+    await tmuxClaude.restartSession(workdir, model)
+    void replyText(chatId, messageId, '✅ 已开始新会话（Claude Code tmux 已重启）')
     return
   }
   if (selectMatch) {
