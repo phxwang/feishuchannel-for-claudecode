@@ -48,6 +48,21 @@ function extractLocalCommandOutput(value: unknown): string | null {
 }
 
 /**
+ * True for the record a local-only slash command leaves when it finishes
+ * (`/model` → "Kept model as X", `/cost` …): no assistant turn and no Stop
+ * hook follow it. Both recorded shapes count — a `system/local_command` line
+ * or a `user` line wrapping the `<local-command-stdout|stderr>` tag.
+ */
+export function isLocalCommandResultLine(line: string): boolean {
+  if (!line.includes('local-command-std')) return false
+  let parsed: TranscriptLine
+  try { parsed = JSON.parse(line) } catch { return false }
+  if (parsed.type === 'system' && parsed.subtype === 'local_command') return LOCAL_COMMAND_OUTPUT_RE.test(String(parsed.content ?? ''))
+  if (parsed.type === 'user') return typeof parsed.message?.content === 'string' && LOCAL_COMMAND_OUTPUT_RE.test(parsed.message.content)
+  return false
+}
+
+/**
  * Extract plain reply text from raw JSONL transcript lines. Invalid or
  * text-less lines are skipped (a partially-flushed last line is expected).
  *
@@ -231,6 +246,7 @@ export const claudeProfile: TmuxCliProfile = {
     return { wait: backgroundWaitAfterStop(pending.size, runningShells) }
   },
 
+  isLocalCommandResult: isLocalCommandResultLine,
   parseText: parseAssistantTextLines,
   parseProgress: parseProgressLines,
   parseDialog: (plainPane: string) => parseDialogOptions(plainPane) ?? parseTabBar(plainPane),

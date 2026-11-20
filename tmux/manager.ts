@@ -127,6 +127,8 @@ export function matchStoppedOwner(ownerTexts: string[], lastUserInput: string | 
 
 /** How long to wait, without any turn ever starting and with the CLI idle, before giving up on a non-slash message (e.g. the hook plugin isn't installed, so no stop signal will ever come). */
 const NO_TURN_IDLE_MS = 20_000
+/** Transcript quiet time after a local slash command's recorded result before its wait ends (see TmuxCliProfile.isLocalCommandResult). */
+const LOCAL_COMMAND_QUIET_MS = 3_000
 
 export class TmuxCliManager {
   readonly profile: TmuxCliProfile
@@ -463,6 +465,7 @@ export class TmuxCliManager {
     /** Owner receiving transcript text — can run ahead of owners[0] when the next queued turn starts before the previous stop is handled. */
     let textOwner: TurnOwner | undefined = owners[0]
     let seenTurnStart = false
+    let sawLocalCommandResult = false
     const advanceTextOwner = () => {
       const idx = textOwner ? owners.indexOf(textOwner) : -1
       const next = owners[idx + 1]
@@ -508,6 +511,7 @@ export class TmuxCliManager {
       // first one seen; every later one moves text to the next queued owner.
       let segment: string[] = []
       for (const line of newLines) {
+        if (profile.isLocalCommandResult?.(line)) sawLocalCommandResult = true
         if (profile.isUserTurnStart?.(line)) {
           deliver(segment)
           segment = []
@@ -609,6 +613,16 @@ export class TmuxCliManager {
       }
       // Quiet-period fallback only when there's no stop signal at all.
       if (!signalPath && anyCollected && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) return
+
+      // A local slash command recorded its result and nothing followed: no
+      // Stop hook will come for it (Claude's /model, /cost …).
+      if (
+        sawLocalCommandResult && owners.length === 1 && owners[0].text.trim().startsWith('/') &&
+        isQuietDone(lastChangeMs, Date.now(), LOCAL_COMMAND_QUIET_MS)
+      ) {
+        this.dbg(`${this.tag()}: ${workdir} — "${owners[0].text.trim()}" recorded its local result with no turn, treating it as done`)
+        return
+      }
 
       const idleLimit = noTurnIdleLimit()
       if (idleLimit !== null && !stopFired()) {

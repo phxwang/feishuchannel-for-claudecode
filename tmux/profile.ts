@@ -66,9 +66,18 @@ export interface TmuxCliProfile {
    * no turn, no transcript step, no stop signal. When set, a delivered
    * `/command` that never starts a turn is considered finished once the pane
    * has shown the ready marker continuously for this long. Omit for CLIs
-   * whose local commands leave a transcript record (Claude Code).
+   * whose local commands leave a transcript record (Claude Code) — those use
+   * `isLocalCommandResult` instead.
    */
   readonly slashCommandIdleMs?: number
+
+  /**
+   * True if this transcript line is the result of a local-only slash command
+   * (Claude Code's `<local-command-stdout>` record for `/model`, `/cost` …).
+   * Such commands never fire the Stop hook, so a delivered `/command` whose
+   * result has been recorded ends the wait once the transcript goes quiet.
+   */
+  isLocalCommandResult?(line: string): boolean
 
   sessionName(workdir: string): string
   /** Called right before spawning a fresh tmux session (e.g. to clear stale signal files). */
