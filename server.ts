@@ -450,7 +450,7 @@ function scheduleReminder(pr: PendingReply) {
     mcp.notification({
       method: 'notifications/claude/channel',
       params: {
-        content: `[提醒 ${attempt}/3] 用户在 ${elapsed} 分钟前发了消息，还没有回复，请尽快处理。\n原始消息: "${pr.content.slice(0, 200)}"`,
+        content: `[Reminder ${attempt}/3] The user sent a message ${elapsed} minutes ago and hasn't had a reply yet. Please respond soon.\nOriginal message: "${pr.content.slice(0, 200)}"`,
         meta: {
           chat_id: pr.chatId,
           message_id: `reminder-${Date.now()}`,
