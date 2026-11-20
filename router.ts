@@ -887,7 +887,7 @@ async function handleInbound(data: any) {
   if (!content) return
 
   const workdir = route.workdir
-  const ocContent = atts.length ? `${content}\n\n(注意: OpenCode 当前不支持附件，已忽略)` : content
+  const ocContent = atts.length ? `${content}\n\n(Note: attachments are not supported by OpenCode yet and were ignored.)` : content
 
   if (route.agent.primary === 'opencode') {
     dbg(`routing ${chatId} (${chatType}) → ${workdir} via OpenCode`)

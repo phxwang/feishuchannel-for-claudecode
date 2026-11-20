@@ -288,10 +288,10 @@ export function createTmuxRouting(deps: TmuxRouteDeps) {
     for (const att of input.attachments) {
       try {
         const path = await downloadFeishuResource(api, deps.attachmentDir, input.messageId, att.fileKey, att.type, att.fileName)
-        notes.push(`[附件已保存: ${path}]`)
+        notes.push(`[Attachment saved: ${path}]`)
       } catch (e) {
         dbg(`${tag}: attachment download failed (${att.fileKey}): ${e}`)
-        notes.push(`[附件下载失败: ${att.fileName}]`)
+        notes.push(`[Attachment download failed: ${att.fileName}]`)
       }
     }
     return `${input.content}\n\n${notes.join('\n')}`
