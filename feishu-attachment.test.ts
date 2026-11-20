@@ -9,12 +9,22 @@ let dir: string
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'feishu-attachment-test-')) })
 afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
+/**
+ * Read the upload stream to the end, as the real Feishu SDK does. Left
+ * unread, createReadStream opens the file lazily — after afterEach has
+ * already deleted the temp dir — and its ENOENT surfaced as an unhandled
+ * error that intermittently failed whichever test file ran next.
+ */
+async function drain(stream: AsyncIterable<unknown> | undefined) {
+  if (stream) for await (const _ of stream) { /* discard */ }
+}
+
 function fakeApiClient(overrides: Partial<{ image_key: string; file_key: string; message_id: string }> = {}) {
   const calls: { method: string; args: any }[] = []
   const client = {
     im: {
-      image: { create: async (args: any) => { calls.push({ method: 'image.create', args }); return { image_key: overrides.image_key ?? 'img_1' } } },
-      file: { create: async (args: any) => { calls.push({ method: 'file.create', args }); return { file_key: overrides.file_key ?? 'file_1' } } },
+      image: { create: async (args: any) => { calls.push({ method: 'image.create', args }); await drain(args.data.image); return { image_key: overrides.image_key ?? 'img_1' } } },
+      file: { create: async (args: any) => { calls.push({ method: 'file.create', args }); await drain(args.data.file); return { file_key: overrides.file_key ?? 'file_1' } } },
       message: { create: async (args: any) => { calls.push({ method: 'message.create', args }); return { message_id: overrides.message_id ?? 'msg_1' } } },
     },
   }
