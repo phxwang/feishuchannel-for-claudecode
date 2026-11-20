@@ -11,6 +11,8 @@ A Feishu (Lark) channel plugin for Claude Code using the MCP Channel protocol. P
   - **Channel mode**: direct Feishu WebSocket connection (fallback if router fails to start)
   - **Passive mode**: no remote connection (non-channel Claude instances)
 - **router.ts** — Central hub. Single Feishu WebSocket, routes messages to workers by workdir. Auto-spawned by the first worker that starts
+- **tmux/** — generic "interactive CLI in tmux" manager shared by Claude Code (`agent.mode: tmux`) and Antigravity (`agent.primary: agy`); per-CLI differences live in `tmux/profiles/*`. Feishu-side UI in `tmux-route.ts`
+- **agy-plugin/** — agy hooks plugin (turn-completion signal for router-spawned agy sessions)
 - **bin/claude-feishu** — Shortcut for `claude --dangerously-load-development-channels plugin:feishu@feishu-local`
 
 ## Key Design Decisions

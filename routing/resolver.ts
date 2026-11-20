@@ -106,7 +106,14 @@ function sanitizeAgentPolicy(requested: AgentPolicy, infra: RouterConfig | null,
   const fallbackOk = requested.fallback === null || project.allowedAgents.includes(requested.fallback)
   // access.json is operator-edited and not schema-validated, so drop a
   // non-string variant instead of forwarding garbage to the OpenCode API.
-  const { variant, ...rest } = requested as AgentPolicy & { variant?: unknown }
-  const cleanVariant = typeof variant === 'string' && variant.trim() ? variant.trim() : undefined
-  return { ...rest, fallback: fallbackOk ? requested.fallback : null, ...(cleanVariant ? { variant: cleanVariant } : {}) }
+  const { variant, effort, ...rest } = requested as AgentPolicy & { variant?: unknown; effort?: unknown }
+  const clean = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined
+  const cleanVariant = clean(variant)
+  const cleanEffort = clean(effort)
+  return {
+    ...rest,
+    fallback: fallbackOk ? requested.fallback : null,
+    ...(cleanVariant ? { variant: cleanVariant } : {}),
+    ...(cleanEffort ? { effort: cleanEffort } : {}),
+  }
 }

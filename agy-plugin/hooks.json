@@ -1,0 +1,13 @@
+{
+  "feishu-router": {
+    "SessionStart": [
+      { "type": "command", "command": "sh ./hook.sh SessionStart", "timeout": 5 }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "sh ./hook.sh PostToolUse", "timeout": 5 }] }
+    ],
+    "Stop": [
+      { "type": "command", "command": "sh ./hook.sh Stop", "timeout": 5 }
+    ]
+  }
+}

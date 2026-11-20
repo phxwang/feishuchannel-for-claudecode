@@ -3,7 +3,7 @@
  * See docs/multi-agent-router-design.md for the full design.
  */
 
-export type AgentKind = 'claude' | 'opencode'
+export type AgentKind = 'claude' | 'opencode' | 'agy'
 
 export interface AgentPolicy {
   primary: AgentKind
@@ -29,6 +29,12 @@ export interface AgentPolicy {
    * deepseek-flash), applied to the native v2 session when it is idle.
    */
   variant?: string
+  /**
+   * agy-only: reasoning effort passed as `--effort` when the tmux session is
+   * spawned. Overrides `projects.<id>.agy.effort` / `agents.agy.effort`;
+   * unset uses agy's own default.
+   */
+  effort?: string
 }
 
 export interface ProjectConfig {
@@ -44,6 +50,27 @@ export interface ProjectConfig {
     /** Native v2 model as `providerID/modelID`. */
     model?: string
   }
+  /** Per-project overrides for `agents.agy`. Unset values inherit. */
+  agy?: AgySpawnSettings
+}
+
+export const AGY_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export const AGY_PERMISSION_MODES = ['accept-edits', 'auto', 'plan'] as const
+
+/** agy spawn-time flags. Every field is optional: unset = agy's own default. */
+export interface AgySpawnSettings {
+  model?: string
+  effort?: (typeof AGY_EFFORTS)[number]
+  permissionMode?: (typeof AGY_PERMISSION_MODES)[number]
+}
+
+/**
+ * Antigravity CLI (`agy`) run interactively in tmux. The whole block is
+ * optional — a project only has to list `agy` in allowedAgents.
+ */
+export interface AgyAgentConfig extends AgySpawnSettings {
+  /** Binary path; default resolves `agy` from PATH, then ~/.local/bin/agy. */
+  bin?: string
 }
 
 export interface ClaudeAgentConfig {
@@ -69,7 +96,7 @@ export interface OpenCodeAgentConfig {
   model?: string
 }
 
-export type AgentBackendConfig = ClaudeAgentConfig | OpenCodeAgentConfig
+export type AgentBackendConfig = ClaudeAgentConfig | OpenCodeAgentConfig | AgyAgentConfig
 
 export interface FallbackConfig {
   enabled: boolean
@@ -105,7 +132,7 @@ export interface RouterConfig {
   // Keyed per-agent-kind (not Partial<Record<AgentKind, AgentBackendConfig>>) so
   // `agents.opencode` narrows to OpenCodeAgentConfig instead of the union —
   // matches routing/config.ts's zod schema shape field-for-field.
-  agents: { claude?: ClaudeAgentConfig; opencode?: OpenCodeAgentConfig }
+  agents: { claude?: ClaudeAgentConfig; opencode?: OpenCodeAgentConfig; agy?: AgyAgentConfig }
   projects: Record<string, ProjectConfig>
   fallback: FallbackConfig
 }

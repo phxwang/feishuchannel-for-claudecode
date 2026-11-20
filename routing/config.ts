@@ -14,11 +14,19 @@
 import { existsSync, readFileSync, realpathSync } from 'fs'
 import { isAbsolute, resolve } from 'path'
 import { z } from 'zod'
-import type { OpenCodeAgentConfig, RouterConfig } from './types'
+import { AGY_EFFORTS, AGY_PERMISSION_MODES, type AgySpawnSettings, type OpenCodeAgentConfig, type RouterConfig } from './types'
+
+const AGENT_KINDS = ['claude', 'opencode', 'agy'] as const
+
+const agySpawnSchema = z.object({
+  model: z.string().min(1).optional(),
+  effort: z.enum(AGY_EFFORTS).optional(),
+  permissionMode: z.enum(AGY_PERMISSION_MODES).optional(),
+}).strict()
 
 const agentPolicySchema = z.object({
-  primary: z.enum(['claude', 'opencode']),
-  fallback: z.enum(['claude', 'opencode']).nullable().default(null),
+  primary: z.enum(AGENT_KINDS),
+  fallback: z.enum(AGENT_KINDS).nullable().default(null),
   policy: z.literal('pre_execution_only').optional(),
   mode: z.enum(['socket', 'tmux']).optional(),
   model: z.string().optional(),
@@ -53,16 +61,19 @@ const routerConfigSchema = z.object({
       // simply drops the key.
       streamText: z.boolean().default(false),
     }).optional(),
+    agy: agySpawnSchema.extend({ bin: z.string().min(1).optional() }).strict().optional(),
   }).default({}),
   projects: z.record(z.string(), z.object({
     workdir: z.string().min(1),
-    allowedAgents: z.array(z.enum(['claude', 'opencode'])).min(1),
+    allowedAgents: z.array(z.enum(AGENT_KINDS)).min(1),
     /** Per-project overrides for agents.opencode feature flags. */
     opencode: z.object({
       nativeV2: z.boolean().optional(),
       streamText: z.boolean().optional(),
       model: z.string().min(1).optional(),
     }).optional(),
+    /** Per-project overrides for agents.agy spawn flags. */
+    agy: agySpawnSchema.optional(),
   })),
   fallback: z.object({
     enabled: z.boolean().default(true),
@@ -154,6 +165,26 @@ export function resolveOpenCodeConfig(config: RouterConfig | null, workdir: stri
     streamText: override.streamText ?? base.streamText,
     model: override.model ?? base.model,
   }
+}
+
+/**
+ * Effective agy spawn flags for one workdir: per-chat (access.json
+ * `agent.model` / `agent.effort`) over `projects.<id>.agy` over `agents.agy`.
+ * Keys left undefined everywhere are omitted, so agy uses its own default.
+ */
+export function resolveAgySpawnOptions(
+  config: RouterConfig | null, workdir: string, chat: { model?: string; effort?: string },
+): AgySpawnSettings {
+  const base = config?.agents.agy ?? {}
+  const target = resolve(workdir)
+  const project = config ? Object.values(config.projects).find(p => resolve(p.workdir) === target) : undefined
+  const override = project?.agy ?? {}
+  const merged: Record<string, string | undefined> = {
+    model: chat.model ?? override.model ?? base.model,
+    effort: chat.effort ?? override.effort ?? base.effort,
+    permissionMode: override.permissionMode ?? base.permissionMode,
+  }
+  return Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined)) as AgySpawnSettings
 }
 
 /**

@@ -64,6 +64,23 @@ try {
   // plugin already installed — continue
 }
 
+// ── Antigravity (agy) router hooks — optional ──────────────────────────────
+// Lets the router run agy in tmux (agent.primary: "agy"). The plugin's hook
+// is a no-op unless FEISHU_AGY_SIGNAL_DIR is set, which only router-spawned
+// sessions have, so it doesn't affect other agy use. Skipped if agy isn't
+// installed.
+
+try {
+  execSync('which agy', { stdio: 'ignore' })
+  try {
+    run(`agy plugin install "${join(INSTALL_DIR, 'agy-plugin')}"`)
+  } catch {
+    console.warn('  (agy plugin install failed — agy routing will not detect turn completion until it is installed)')
+  }
+} catch {
+  // agy not installed — nothing to do
+}
+
 // ── Done ───────────────────────────────────────────────────────────────────
 
 console.log(`

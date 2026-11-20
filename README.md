@@ -60,6 +60,8 @@ Map Feishu groups to project directories in `~/.claude/channels/feishu/access.js
 - **Claude → OpenCode fallback (opt-in)** — If no Claude Code worker is connected, or Claude Code just hit its usage rate limit, hand that message to OpenCode instead of dropping it (pre-execution cases only, see [Fallback to OpenCode](#fallback-to-opencode))
 - **Long OpenCode turns that don't get cut off** — Turns run asynchronously and are observed by polling, so a multi-minute/multi-step turn isn't killed by an HTTP transport timeout (see [OpenCode Backend](#opencode-backend))
 - **Claude via tmux (experimental)** — Keystroke-based delivery mode with live progress cards, streaming replies, and interactive dialog cards (see [Claude via tmux](#claude-via-tmux-experimental))
+- **Antigravity (agy) backend (experimental)** — Route a chat to the Antigravity CLI running in tmux, with the same progress cards, streaming, permission/model-picker cards and session commands as Claude via tmux; zero config by default, per-directory model/effort/mode overrides (see [Antigravity (agy) via tmux](#antigravity-agy-via-tmux-experimental))
+- **Configurable pre-execution fallback** — `agent.fallback` can be `opencode`, `agy` or `claude`; it only fires when the message provably never reached the primary backend
 - **Direct messages** — Chat with Claude through Feishu DMs
 - **Group chats** — Add the bot to group chats with @mention support
 - **Access control** — Pairing-based onboarding, allowlists, and per-group policies
@@ -435,6 +437,46 @@ Not every slash command produces a real assistant turn at all — a repeat `/mod
 - Idle tmux sessions are killed after an hour of no messages (`TMUX_IDLE_MS` in `router.ts`).
 - The `claude` binary is resolved once at startup (`Bun.which`, then `~/.local/bin/claude` and a couple of other common install paths) rather than trusting PATH inside the spawned tmux pane — found the hard way when a launchd service's stripped PATH didn't include it, see `claude-tmux-worker.ts`'s `resolveClaudeBin`.
 
+## Antigravity (agy) via tmux (experimental)
+
+Routes a group/DM to the [Antigravity CLI](https://antigravity.google) running interactively in a detached tmux session per workdir, through the same machinery as Claude via tmux: live status card, streamed replies, permission/picker cards, `/esc` `/restart` `/select`, stuck-pane screenshots, and pre-delivery fallback.
+
+```yaml
+# agents.yaml — the only required change: allow agy for the project
+projects:
+  myproj:
+    workdir: /path/to/myproj
+    allowedAgents: [claude, opencode, agy]
+```
+
+```jsonc
+// access.json
+"oc_groupA": { "workdir": "/path/to/myproj", "agent": { "primary": "agy", "fallback": "opencode" } }
+```
+
+**One-time setup:** `agy plugin install ./agy-plugin` (done by `bin/install.js` when `agy` is on PATH). The plugin's hooks tell the router when a turn ends; they do nothing outside router-spawned sessions (gated on `FEISHU_AGY_SIGNAL_DIR`).
+
+**Optional settings** (unset = agy's own defaults), most specific wins: access.json `agent.model` / `agent.effort` → `projects.<id>.agy` → `agents.agy`:
+
+```yaml
+agents:
+  agy: { bin: agy, model: gemini-3.8-flash-high, effort: high, permissionMode: accept-edits }  # permissionMode: accept-edits | auto | plan
+projects:
+  myproj:
+    agy: { model: claude-opus-4-6-thinking }
+```
+
+These are spawn-time flags — `/restart` applies a change. `/model` in chat changes the live session through a picker card.
+
+**Behavior differences from Claude via tmux:**
+- A message sent mid-turn is **queued** by agy and answered as its own turn (its card shows `⏳ 已排队` until its turn starts), instead of being absorbed into the running turn.
+- `/restart` keeps the conversation (`agy --conversation <id>`); `/clear` `/reset` `/new` start a fresh one. Idle sessions are killed after an hour but resume the same conversation on the next message.
+- agy's default agent mode is `auto`: edits and safe commands are approved without a card; irreversible actions still ask.
+- A quota/spend-cap error marks agy unavailable for that workdir for 30 minutes; new messages go to the fallback.
+- `agent.fallback: "agy"` also works from a Claude route (socket or tmux), under the same pre-execution-only rule as OpenCode.
+
+Design notes and live-verified CLI behavior: [docs/agy-integration-plan.md](docs/agy-integration-plan.md).
+
 ## Access Management
 
 All access commands are run in your Claude Code terminal via `/feishu:access`.
@@ -512,7 +554,7 @@ Groups are off by default. The bot must be added to the group by a group admin f
 ~/.claude/channels/feishu/
 ├── .env              # App credentials (FEISHU_APP_ID, FEISHU_APP_SECRET)
 ├── access.json       # Access control + chat->project/agent mapping (auto-managed)
-├── agents.yaml        # Optional backend/infra config for OpenCode (see OpenCode Backend)
+├── agents.yaml        # Optional backend/infra config: OpenCode, agy, per-project overrides, fallback
 ├── approved/         # Pairing approval signals (transient)
 ├── inbox/            # Downloaded attachments
 ├── debug.log         # Worker (server.ts) debug log
@@ -520,6 +562,13 @@ Groups are off by default. The bot must be added to the group by a group admin f
 ├── router.sock       # Unix socket workers connect to
 ├── router.db         # SQLite: conversation bindings, tmux session-id pins, permission callbacks, processed-event dedup
 └── router.lock/       # Router singleton lock (prevents duplicate router processes)
+```
+
+Antigravity (agy) routing also uses:
+
+```
+~/.gemini/config/plugins/feishu-router/   # Router hook plugin (installed from ./agy-plugin)
+$TMPDIR/feishu-agy-tmux/<session>/         # Per-session hook signals (Stop.json, last.json)
 ```
 
 ## Environment Variables

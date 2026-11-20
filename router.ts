@@ -22,11 +22,11 @@ import {
   deleteTmuxSessionId, getTmuxSessionId, markEventProcessed, openDb, PermissionRegistry,
   pruneProcessedEvents, setTmuxSessionId, SqliteBindingStore, wasEventProcessed,
 } from './routing/storage'
-import { loadRouterConfig, resolveOpenCodeConfig, RouterConfigError } from './routing/config'
+import { loadRouterConfig, resolveAgySpawnOptions, resolveOpenCodeConfig, RouterConfigError } from './routing/config'
 import { resolveRoute } from './routing/resolver'
 import { conversationKey } from './routing/bindings'
 import { evictMissingOpenCodeBinding } from './routing/opencode-recovery'
-import type { AgentPolicy, OpenCodeAgentConfig, RouterConfig } from './routing/types'
+import type { AgentKind, AgentPolicy, OpenCodeAgentConfig, RouterConfig } from './routing/types'
 import { V2SessionCoordinator, coordinatorKey, nativeInputId, v2Request, type ModelSelection } from './adapters/opencode/v2-coordinator'
 import { ProgressCard, TextDelivery, safeSummary, type TextPartSnapshot } from './adapters/opencode/presentation'
 import { OpenCodeAdapter } from './adapters/opencode/opencode-adapter'
@@ -34,11 +34,16 @@ import type { AgentEvent } from './adapters/agent-adapter'
 import { createBinding } from './routing/bindings'
 import { chunkText, MAX_CHUNK } from './chunk-text'
 import { DegradedTracker } from './routing/degraded'
+import { chooseFallback } from './routing/fallback'
 import { MAX_ATTACHMENT_BYTES, sendFeishuFile } from './feishu-attachment'
 import { downloadFeishuResource } from './feishu-download'
 import { renderPaneScreenshot } from './pane-screenshot'
 import { decodeBase64DataUri } from './data-uri'
-import { TmuxClaudeManager, isSessionResetCommand, DIALOG_ESCAPE_CHOICE, DIALOG_TIMED_OUT_CHOICE, type Dialog, type ProgressEvent } from './claude-tmux-worker'
+import { TmuxClaudeManager } from './claude-tmux-worker'
+import { TmuxCliManager } from './tmux/manager'
+import { createAgyProfile } from './tmux/profiles/agy'
+import { AGY_QUOTA_COOLDOWN_MS, isAgyQuotaError } from './tmux/agy-errors'
+import { createTmuxRouting, TMUX_BACKEND_NAMES, type AttachmentRef } from './tmux-route'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -129,6 +134,22 @@ const tmuxSessionStore = {
   delete: (workdir: string) => deleteTmuxSessionId(db, workdir),
 }
 const tmuxClaude = new TmuxClaudeManager({ dbg, persistence: tmuxSessionStore })
+
+/**
+ * Antigravity (agy) via tmux — agent.primary: 'agy'. Same tmux_sessions
+ * table, keys prefixed so a Claude-tmux and an agy session on one workdir
+ * never share an id. agy reuses the persisted conversation id on respawn
+ * (`--conversation`), so an idle-killed session keeps its context.
+ */
+const AGY_SESSION_KEY_PREFIX = 'agy:'
+const tmuxAgy = new TmuxCliManager(createAgyProfile({ bin: infraConfig?.agents.agy?.bin }), {
+  dbg,
+  persistence: {
+    get: (workdir: string) => getTmuxSessionId(db, AGY_SESSION_KEY_PREFIX + workdir),
+    set: (workdir: string, sessionId: string) => setTmuxSessionId(db, AGY_SESSION_KEY_PREFIX + workdir, sessionId, new Date().toISOString()),
+    delete: (workdir: string) => deleteTmuxSessionId(db, AGY_SESSION_KEY_PREFIX + workdir),
+  },
+})
 
 // ── Access control ──────────────────────────────────────────────────────────
 
@@ -664,479 +685,100 @@ function pruneOldTmuxAttachments() {
   if (pruned) dbg(`claude-tmux: pruned ${pruned} old attachment file(s)`)
 }
 
+const tmuxRouting = createTmuxRouting({ api: apiClient, dbg, describeApiError, replyText, attachmentDir: TMUX_ATTACHMENT_DIR })
+
+/** Everything a backend needs to run (or take over) one inbound message. */
+interface TaskContext {
+  route: NonNullable<ReturnType<typeof resolveRoute>>
+  chatId: string
+  messageId: string
+  chatKind: 'p2p' | 'group'
+  content: string
+  /** OpenCode variant of `content` (attachments aren't forwarded to OpenCode). */
+  ocContent: string
+  attachments: AttachmentRef[]
+  /** Deliver to the Claude socket worker; false if no worker took it (or it's rate-limited). */
+  socketDeliver: () => boolean
+}
+
+const BACKEND_DISPLAY: Record<AgentKind, string> = {
+  claude: 'Claude Code',
+  opencode: 'OpenCode',
+  agy: TMUX_BACKEND_NAMES.agy.short,
+}
+
 /**
- * `number: -2` is the "explicitly cancelled" sentinel for cancelPendingTmuxDialogs
- * (used by `/esc`/`/restart`, which have already dealt with the session their
- * own way) — distinct from claude-tmux-worker.ts's own DIALOG_TIMED_OUT_CHOICE
- * (-1, used below when a card's own timer fires with no click at all) so it
- * can tell the two apart and only send an automatic Escape for a genuine
- * timeout, not a redundant one on top of what /esc/`/restart` already did.
+ * Design doc §7 pre-execution fallback, shared by every primary: only ever
+ * called when the message provably never reached the primary backend, so
+ * there's no side effect to reconcile. Starts the route's configured
+ * fallback (never the primary itself, never a second hop) and returns its
+ * display name, or null when none applies.
  */
-const TMUX_DIALOG_CANCELLED = -2
-const TMUX_DIALOG_TIMEOUT_MS = 30 * 60 * 1000
-const TMUX_PENDING_DIALOGS = new Map<string, { workdir: string; resolve: (choice: number) => void }>()
-
-/** Cancel any dialog(s) still awaiting a Feishu click for this workdir — e.g. before `/restart` kills the session the eventual click would otherwise hit, or `/esc` dismisses the CLI's own menu directly instead. Without this, the stale sendAndAwaitReply call for the old dialog would sit in its per-workdir queue forever, blocking every later message to this workdir. */
-function cancelPendingTmuxDialogs(workdir: string) {
-  for (const [code, entry] of TMUX_PENDING_DIALOGS) {
-    if (entry.workdir !== workdir) continue
-    TMUX_PENDING_DIALOGS.delete(code)
-    entry.resolve(TMUX_DIALOG_CANCELLED)
+function startFallback(from: AgentKind, ctx: TaskContext, notice?: string): string | null {
+  const choice = chooseFallback(from, ctx.route.agent, { enabled: !!infraConfig?.fallback.enabled, openCodeConfigured: !!openCodeAdapter })
+  if (!choice) return null
+  const fromName = from === 'claude' && ctx.route.agent.mode === 'tmux' ? TMUX_BACKEND_NAMES.claude.long : BACKEND_DISPLAY[from]
+  let started: string | null = null
+  if (choice.kind === 'opencode') {
+    void handleOpenCodeTask(ctx.route, ctx.chatId, ctx.messageId, ctx.chatKind, ctx.ocContent)
+    started = BACKEND_DISPLAY.opencode
+  } else if (choice.kind === 'agy') {
+    void runAgyTask(ctx, false)
+    started = BACKEND_DISPLAY.agy
+  } else if (choice.via === 'tmux') {
+    void runClaudeTmuxTask(ctx, false)
+    started = TMUX_BACKEND_NAMES.claude.long
+  } else if (ctx.socketDeliver()) {
+    started = BACKEND_DISPLAY.claude
   }
+  if (!started) return null
+  dbg(`${ctx.chatId}: ${fromName} unavailable for ${ctx.route.workdir}, falling back to ${started} (pre-execution, no side effect)`)
+  void replyText(ctx.chatId, ctx.messageId, notice ?? `⚠️ ${fromName} 当前不可用，已切换到 ${started} 处理本次任务。`)
+  return started
 }
 
-/** True while a permission/tab-switch dialog card is still awaiting a click for this workdir — the "thinking…" status card must not patch itself while one of those is up, both because the CLI isn't actually making progress (it's blocked on the user) and to avoid two unrelated cards fighting for the chat's attention at once. */
-function hasPendingDialogFor(workdir: string): boolean {
-  for (const entry of TMUX_PENDING_DIALOGS.values()) {
-    if (entry.workdir === workdir) return true
-  }
-  return false
-}
-
-function buildTmuxDialogCard(dialog: Dialog, code: string): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { wide_screen_mode: true },
-    header: { title: { tag: 'plain_text', content: '❓ Claude 需要你选择' }, template: 'orange' },
-    body: {
-      elements: [
-        { tag: 'markdown', content: dialog.question },
-        { tag: 'hr' },
-        // Schema 2.0 dropped the old `tag: 'action'` button-row wrapper
-        // (confirmed live: Feishu returns a 400 "unsupported tag action" for
-        // it) — each button is now its own full-width column_set row, which
-        // also stacks cleanly regardless of how many options there are.
-        //
-        // A fixed "just press Escape instead" row follows the real options,
-        // since this is a best-effort scrape of a terminal UI — always leave
-        // a safe way out even if none of the parsed options are what the
-        // user wants.
-        // For a 'tabs' dialog, dialog.currentNumber marks the tab believed
-        // to be focused right now (see claude-tmux-worker.ts) — highlight
-        // that one instead of always the first option, and label it so the
-        // card itself shows which tab a repeat click will start switching
-        // from.
-        ...[...dialog.options.map(o => {
-          const isCurrent = dialog.kind === 'tabs' ? o.number === dialog.currentNumber : o.number === '1'
-          return { number: o.number, label: `${o.number}. ${o.label}${isCurrent ? ' 📍当前' : ''}`, type: isCurrent ? 'primary' : 'default' }
-        }), { number: String(DIALOG_ESCAPE_CHOICE), label: '🚪 Esc', type: 'danger' }].map(({ number, label, type }) => ({
-          tag: 'column_set',
-          columns: [{
-            tag: 'column',
-            width: 'weighted',
-            weight: 1,
-            elements: [{
-              tag: 'button',
-              text: { tag: 'plain_text', content: label },
-              type,
-              value: { code, action: 'tmux_dialog_choice', number },
-              width: 'fill',
-            }],
-          }],
-        })),
-      ],
-    },
+/**
+ * Claude via tmux (agent.mode: 'tmux') — keystrokes into a persistent
+ * `claude` CLI session; see claude-tmux-worker.ts and tmux-route.ts.
+ */
+function runClaudeTmuxTask(ctx: TaskContext, allowFallback = true): Promise<void> {
+  return tmuxRouting.handleTmuxTask(tmuxClaude, {
+    workdir: ctx.route.workdir, chatId: ctx.chatId, messageId: ctx.messageId,
+    content: ctx.content, attachments: ctx.attachments,
+    spawn: { model: ctx.route.agent.model },
+    fallback: () => allowFallback ? startFallback('claude', ctx) : null,
   })
 }
 
-/**
- * Builds the onDialog callback TmuxClaudeManager calls when a session is
- * stuck on an interactive menu (permission prompt, etc.) — sends a Feishu
- * card with one button per option and resolves once handleCardAction routes
- * a click back here via TMUX_PENDING_DIALOGS. The resulting keypress is sent
- * by claude-tmux-worker.ts itself; this only has to supply the choice.
- *
- * Bounded by TMUX_DIALOG_TIMEOUT_MS: an unanswered card would otherwise
- * leave sendAndAwaitReply's per-workdir queue stuck forever (every later
- * message to this workdir piles up behind it) and leak this Map entry for
- * the life of the process.
- */
-function makeTmuxDialogHandler(workdir: string, chatId: string, messageId: string) {
-  return async (dialog: Dialog): Promise<number> => {
-    const code = randomBytes(5).toString('hex')
-    dbg(`claude-tmux: dialog detected ("${dialog.question}"), sending choice card ${code}`)
-    try {
-      await (apiClient as any).im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: { receive_id: chatId, msg_type: 'interactive', content: buildTmuxDialogCard(dialog, code) },
-      })
-    } catch (e) { dbg(`claude-tmux: dialog card send failed: ${describeApiError(e)}`) }
-    return new Promise<number>(resolve => {
-      const timer = setTimeout(() => {
-        if (!TMUX_PENDING_DIALOGS.delete(code)) return  // already resolved by a real click
-        dbg(`claude-tmux: dialog ${code} for ${workdir} timed out waiting for a Feishu click`)
-        void replyText(chatId, messageId, '⚠️ 等待选择超时，已取消本次操作，可以重新发送消息。')
-        resolve(DIALOG_TIMED_OUT_CHOICE)
-      }, TMUX_DIALOG_TIMEOUT_MS)
-      TMUX_PENDING_DIALOGS.set(code, {
-        workdir,
-        resolve: (choice) => { clearTimeout(timer); resolve(choice) },
-      })
-    })
-  }
-}
+const agyDegradedKey = (workdir: string) => `agy:${resolve(workdir)}`
+const STOP_ERROR_MAX_LEN = 300
 
 /**
- * Builds the onStuckPane callback: renders the ANSI pane capture to a PNG
- * (pane-screenshot.ts) and sends it as an image — for a stuck state
- * parseDialogOptions can't turn into a card (a `/status`-style tab panel,
- * for instance, whose "currently selected" state is color-only and whose
- * tabs cycle circularly with no numbered jump target, so there's no way to
- * compute "click this button to land on that tab" from plain text alone).
- * Silently does nothing if no cached Chromium build is available on this
- * machine (see renderPaneScreenshot) — this is a nice-to-have, not core
- * functionality worth erroring the whole task over.
+ * Antigravity via tmux (agent.primary: 'agy'). Spawn flags come from
+ * access.json agent.model/effort > agents.yaml projects.<id>.agy > agents.agy,
+ * all optional (unset = agy's own defaults). A quota/spend-cap stop marks agy
+ * unavailable for this workdir for AGY_QUOTA_COOLDOWN_MS, so later messages
+ * go to the fallback (pre-delivery) instead of failing one by one.
  */
-/** Shared by onStuckPane and onTabSwitched — both just need "render this pane capture and send it as an image", differing only in when claude-tmux-worker.ts decides to call them. */
-async function sendPaneScreenshot(chatId: string, paneAnsiText: string, dbgTag: string): Promise<void> {
-  const png = await renderPaneScreenshot(paneAnsiText)
-  if (!png) { dbg(`${dbgTag}: screenshot unavailable (no cached Chromium build)`); return }
-  const pngPath = join(tmpdir(), `claude-tmux-pane-${Date.now()}-${Math.random().toString(36).slice(2)}.png`)
-  try {
-    writeFileSync(pngPath, png)
-    await sendFeishuFile(apiClient, chatId, pngPath, 'claude-session.png')
-  } finally {
-    try { unlinkSync(pngPath) } catch (e) { dbg(`${dbgTag}: failed to clean up pane screenshot ${pngPath}: ${e}`) }
-  }
-}
-
-function makeStuckPaneHandler(chatId: string) {
-  return (paneAnsiText: string) => sendPaneScreenshot(chatId, paneAnsiText, 'claude-tmux: stuck-pane')
-}
-
-/**
- * Builds the onTabSwitched callback: after claude-tmux-worker.ts presses
- * Right the approximated number of times for a tab choice, sends a
- * screenshot of wherever that actually landed — since parseTabBar can't
- * confirm which tab is now focused from plain text alone (see its "assumed
- * leftmost tab" caveat), this is the only way for the user to see whether
- * the switch landed where they expected. A fresh choice card for the same
- * tabs follows automatically once the still-visible tab bar is re-detected
- * on claude-tmux-worker.ts's next poll — no action needed here for that.
- */
-function makeTabSwitchedHandler(chatId: string) {
-  return (paneAnsiText: string) => sendPaneScreenshot(chatId, paneAnsiText, 'claude-tmux: tab-switched')
-}
-
-/** Must carry `config.update_multi: true` — without it, `im.message.patch` below rejects the update entirely (that flag is the opt-in that allows a card already delivered to a chat to be edited in place at all). */
-function buildStatusCard(line: string): string {
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    header: { title: { tag: 'plain_text', content: 'Claude' }, template: 'blue' },
-    body: { elements: [{ tag: 'markdown', content: line }] },
-  })
-}
-
-async function patchStatusCard(messageId: string, line: string, dbgTag: string): Promise<void> {
-  try {
-    await (apiClient as any).im.message.patch({
-      path: { message_id: messageId },
-      data: { content: buildStatusCard(line) },
-    })
-  } catch (e) { dbg(`${dbgTag}: status card patch failed: ${describeApiError(e)}`) }
-}
-
-const STATUS_CARD_PATCH_COOLDOWN_MS = 1_500
-
-/**
- * How often the status card re-patches itself with an elapsed-time tick even
- * when no new tool_use event has arrived. A single long-running tool call
- * (a multi-minute bash/pytest run, say) produces exactly one progress event
- * at its start and nothing else until it finishes — without this, the card
- * would sit on that one line, unchanged, for the whole duration, which reads
- * as "stuck" even though the CLI is still working.
- */
-const STATUS_CARD_HEARTBEAT_MS = 15_000
-
-function formatElapsed(startMs: number): string {
-  const s = Math.floor((Date.now() - startMs) / 1000)
-  if (s < 60) return `${s}秒`
-  return `${Math.floor(s / 60)}分${s % 60}秒`
-}
-
-/**
- * Creates a "🤔 思考中…" card for one claude-tmux task and returns a
- * controller claude-tmux-worker.ts's `onProgress` feeds tool_use events
- * into, plus `finalize()` to call once the task is done.
- *
- * Patches are throttled to at most one every STATUS_CARD_PATCH_COOLDOWN_MS:
- * onProgress can fire on every ~400ms transcript poll, far more often than
- * Feishu needs to see (patch is rate-limited server-side too) — each patch
- * always carries the *latest* known line, never a queued backlog, since
- * only the current state is worth showing.
- *
- * Paused entirely while a permission/tab-switch dialog card is pending for
- * this workdir (see hasPendingDialogFor): the CLI isn't making progress
- * then, it's blocked on the user, and that dialog card is already the
- * thing asking for their attention — two unrelated cards fighting for the
- * same chat's focus would be worse than just staying quiet.
- */
-function makeStatusCardController(chatId: string, workdir: string) {
-  let messageId: string | null = null
-  let latestLine = '🤔 思考中…'
-  let lastPatchMs = 0
-  let pendingTimer: ReturnType<typeof setTimeout> | null = null
-  let finalized = false
-  const startMs = Date.now()
-
-  const ready: Promise<string | null> = (async () => {
-    try {
-      const r = await (apiClient as any).im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: { receive_id: chatId, msg_type: 'interactive', content: buildStatusCard(latestLine) },
-      })
-      return r?.data?.message_id ?? r?.message_id ?? null
-    } catch (e) {
-      dbg(`claude-tmux: status card create failed: ${describeApiError(e)}`)
-      return null
-    }
-  })().then(id => { messageId = id; return id })
-
-  async function flush() {
-    if (finalized) return
-    await ready
-    if (!messageId || hasPendingDialogFor(workdir)) return
-    lastPatchMs = Date.now()
-    await patchStatusCard(messageId, `${latestLine} ⏱ ${formatElapsed(startMs)}`, 'claude-tmux: status card')
-  }
-
-  function scheduleFlush() {
-    if (pendingTimer || finalized) return
-    const wait = Math.max(0, lastPatchMs + STATUS_CARD_PATCH_COOLDOWN_MS - Date.now())
-    pendingTimer = setTimeout(() => { pendingTimer = null; void flush() }, wait)
-  }
-
-  // Ticks the card even without any new progress event — see
-  // STATUS_CARD_HEARTBEAT_MS's doc comment. Cleared in finalize(), so a
-  // short-lived task (well under one heartbeat interval) never triggers an
-  // extra patch at all.
-  const heartbeatTimer: ReturnType<typeof setInterval> = setInterval(() => void flush(), STATUS_CARD_HEARTBEAT_MS)
-
-  return {
-    onProgress(events: ProgressEvent[]) {
-      if (finalized || !events.length || hasPendingDialogFor(workdir)) return
-      const last = events[events.length - 1]
-      latestLine = last.summary ? `🔧 ${last.tool}: ${last.summary}` : `🔧 ${last.tool}`
-      if (Date.now() - lastPatchMs >= STATUS_CARD_PATCH_COOLDOWN_MS) void flush()
-      else scheduleFlush()
-    },
-    async finalize(line: string) {
-      finalized = true
-      if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null }
-      clearInterval(heartbeatTimer)
-      const id = await ready
-      if (!id) return
-      await patchStatusCard(id, line, 'claude-tmux: status card')
-    },
-  }
-}
-
-/**
- * Claude via tmux (agent.mode: 'tmux') — delivers the message as literal
- * terminal keystrokes to a persistent `claude` CLI session instead of the
- * socket-worker protocol. See claude-tmux-worker.ts's header comment for
- * the known gaps (heuristic turn-completion, etc.) before relying on this
- * in a group.
- *
- * Attachments: unlike the socket-worker path, there's no MCP channel plugin
- * loaded for the tmux CLI to call download_attachment with, so the router
- * downloads them itself and embeds the local path in the message text —
- * the CLI reads them with its own Read tool. Files are left in place (not
- * cleaned up after the task) since the CLI may read them later in the
- * conversation, not necessarily during this exact turn.
- *
- * `/esc` and `/restart` are intercepted here as session-management
- * commands rather than sent into the CLI as chat text — see their own
- * comments below.
- *
- * `tmuxClaude.sendAndAwaitReply` throwing is, by contract (see its own
- * doc comment in claude-tmux-worker.ts), always a *pre-delivery* failure —
- * the message never reached the CLI (tmux new-session or send-keys/
- * paste-buffer itself failed) — so it's provably safe to fall back to
- * OpenCode here, the same "no side effect" guarantee the socket-worker
- * path requires before falling back (see handleInbound's own fallback
- * branch below). A failure *after* delivery is swallowed inside
- * sendAndAwaitReply itself and never reaches this catch.
- */
-async function handleClaudeTmuxTask(
-  route: NonNullable<ReturnType<typeof resolveRoute>>, chatId: string, messageId: string, chatType: 'p2p' | 'group',
-  content: string, ocContent: string,
-  attDownloads: { fileKey: string; type: 'file' | 'image'; fileName: string }[],
-) {
-  const workdir = route.workdir
-  const model = route.agent.model
-  dbg(`routing ${chatId} → ${workdir} via Claude-tmux`)
-
-  const trimmed = content.trim()
-  const selectMatch = trimmed.match(/^\/select\s+(\d+)$/)
-  const isReset = isSessionResetCommand(trimmed)
-  if (trimmed === '/esc' || trimmed === '/restart' || isReset || selectMatch) {
-    // Cancel any dialog this workdir is still awaiting a Feishu click for
-    // *before* acting — otherwise a click that arrives after /restart hits
-    // a brand-new, unrelated session under the same name (sessionNameFor is
-    // deterministic), and after /esc or /select the old sendAndAwaitReply
-    // call would sit forever waiting for a click answering a menu that's
-    // already been dismissed/answered directly, blocking every later
-    // message to this workdir.
-    cancelPendingTmuxDialogs(workdir)
-  }
-  if (trimmed === '/esc') {
-    // Manual recovery: a session stuck on a modal (e.g. /status, or any
-    // dialog this code failed to detect) ignores all normal input, so this
-    // bypasses sendAndAwaitReply entirely and sends a bare Escape directly.
-    await tmuxClaude.sendEscape(workdir)
-    void replyText(chatId, messageId, '✅ 已发送 Esc')
-    return
-  }
-  if (trimmed === '/restart') {
-    await tmuxClaude.restartSession(workdir, model)
-    void replyText(chatId, messageId, '✅ Claude Code (tmux) 已重启')
-    return
-  }
-  if (isReset) {
-    // /clear, /reset, /new: typed into the CLI these move it to a new
-    // transcript with no Stop hook, stranding the reply wait (see
-    // isSessionResetCommand). A fresh session gives the same clean slate
-    // and keeps transcript tracking correct.
-    await tmuxClaude.restartSession(workdir, model)
-    void replyText(chatId, messageId, '✅ 已开始新会话（Claude Code tmux 已重启）')
-    return
-  }
-  if (selectMatch) {
-    // Manual fallback for a dialog whose layout parseDialogOptions/
-    // parseTabBar doesn't recognize yet, so no Feishu card ever got sent —
-    // types the option number and presses Enter directly, same as clicking
-    // option N on a card would have.
-    const sent = await tmuxClaude.selectOption(workdir, selectMatch[1])
-    void replyText(chatId, messageId, sent ? `✅ 已选择选项 ${selectMatch[1]}` : '⚠️ 没有存活的会话，未发送')
-    return
-  }
-
-  let effectiveContent = content
-  if (attDownloads.length > 0) {
-    const notes: string[] = []
-    for (const att of attDownloads) {
-      try {
-        const path = await downloadFeishuResource(apiClient, TMUX_ATTACHMENT_DIR, messageId, att.fileKey, att.type, att.fileName)
-        notes.push(`[附件已保存: ${path}]`)
-      } catch (e) {
-        dbg(`claude-tmux: attachment download failed (${att.fileKey}): ${e}`)
-        notes.push(`[附件下载失败: ${att.fileName}]`)
+function runAgyTask(ctx: TaskContext, allowFallback = true): Promise<void> {
+  const workdir = ctx.route.workdir
+  return tmuxRouting.handleTmuxTask(tmuxAgy, {
+    workdir, chatId: ctx.chatId, messageId: ctx.messageId,
+    content: ctx.content, attachments: ctx.attachments,
+    spawn: resolveAgySpawnOptions(infraConfig, workdir, { model: ctx.route.agent.model, effort: ctx.route.agent.effort }),
+    fallback: () => allowFallback ? startFallback('agy', ctx) : null,
+    unavailableReason: () => degraded.isDegraded(agyDegradedKey(workdir)) ? 'Antigravity 已达到使用限额，冷却中' : null,
+    onStopError: (error) => {
+      const shown = error.length > STOP_ERROR_MAX_LEN ? `${error.slice(0, STOP_ERROR_MAX_LEN)}…` : error
+      if (isAgyQuotaError(error)) {
+        degraded.markDegraded(agyDegradedKey(workdir), Date.now() + AGY_QUOTA_COOLDOWN_MS)
+        dbg(`agy: ${workdir} hit a quota/rate limit, unavailable for ${AGY_QUOTA_COOLDOWN_MS / 60_000} min: ${shown}`)
+        void replyText(ctx.chatId, ctx.messageId, `⚠️ Antigravity 已达到使用限额：${shown}\n接下来 ${AGY_QUOTA_COOLDOWN_MS / 60_000} 分钟内的新消息${ctx.route.agent.fallback && infraConfig?.fallback.enabled ? `将切换到 ${BACKEND_DISPLAY[ctx.route.agent.fallback]}` : '会直接提示失败'}。`)
+      } else {
+        void replyText(ctx.chatId, ctx.messageId, `⚠️ Antigravity 本回合出错：${shown}`)
       }
-    }
-    effectiveContent = `${content}\n\n${notes.join('\n')}`
-  }
-  // A message that's about to be absorbed into an already-in-flight reply
-  // (see sendAndAwaitReply's doc comment) doesn't get its own "thinking"
-  // card at all — that card would just flash up and immediately flip to
-  // "已并入", a second card the chat didn't need. isBusy() is advisory (the
-  // in-flight call can settle in the gap before sendAndAwaitReply's own
-  // check), so the rare race still gets a real card below once we learn the
-  // call wasn't actually absorbed after all.
-  let statusCard = tmuxClaude.isBusy(workdir) ? null : makeStatusCardController(chatId, workdir)
-  // Lazily backfills statusCard for the rare isBusy() miss — called from
-  // both the "turned out not absorbed" and the catch branch below, since
-  // either can be the first to discover the call was never absorbed.
-  function ensureStatusCard() {
-    if (!statusCard) statusCard = makeStatusCardController(chatId, workdir)
-    return statusCard
-  }
-  let absorbed = false
-  // True once at least one chunk has gone out via onTextChunk, so the final
-  // "nothing came of this" warning (below) isn't shown for a message that
-  // actually did produce text — just not through the no-longer-used `reply`
-  // return value, since every chunk is now sent live as it's written
-  // instead of being batched until the whole call finishes.
-  let anyTextSent = false
-  // Serializes the replyText calls onTextChunk makes so two chunks arriving
-  // close together can't have their Feishu sends race and land out of
-  // order (each is awaited individually inside an async call, so without
-  // this a slower chunk-N request completing after a faster chunk-N+1 one
-  // would reorder them in the chat).
-  let sendChain: Promise<void> = Promise.resolve()
-  try {
-    const reply = await tmuxClaude.sendAndAwaitReply(workdir, effectiveContent, {
-      model,
-      onDialog: makeTmuxDialogHandler(workdir, chatId, messageId),
-      onStuckPane: makeStuckPaneHandler(chatId),
-      onTabSwitched: makeTabSwitchedHandler(chatId),
-      onProgress: (events) => statusCard?.onProgress(events),
-      // This message arrived while a reply for the same workdir was still
-      // in flight — Claude Code absorbs it into that turn itself (see
-      // sendAndAwaitReply's doc comment), so the in-flight call's result
-      // already answers this message too; don't send it again as a
-      // separate reply here.
-      onAbsorbed: () => { absorbed = true },
-      // Forwarded the moment it's written to the transcript, independent of
-      // Stop/turn boundaries — see TextChunkHandler's doc comment. Not
-      // gated on `absorbed`: an absorbed message's text is the same ongoing
-      // conversation's text, so it still belongs in the chat.
-      onTextChunk: (text) => {
-        anyTextSent = true
-        sendChain = sendChain.then(async () => {
-          for (const chunk of chunkText(text, MAX_CHUNK)) await replyText(chatId, messageId, chunk)
-        }).catch(e => {
-          // Fire-and-forget from this function's perspective (sendChain is
-          // never awaited below) — logged here instead of becoming a
-          // silent unhandled rejection.
-          dbg(`claude-tmux: text-chunk send for ${workdir} failed: ${e}`)
-        })
-      },
-    })
-    // sendAndAwaitReply resolving only means collectReply itself is done —
-    // onTextChunk's own sends onto sendChain are scheduled, not awaited, so
-    // without this the status card could finalize (or this function could
-    // return) while the last chunk(s) are still in flight.
-    await sendChain
-    if (absorbed) {
-      if (statusCard) await statusCard.finalize('↪️ 已并入上一条消息的回复')
-      else void replyText(chatId, messageId, '↪️ 已并入上一条消息的回复')
-      return
-    }
-    // isBusy() guessed this would absorb but it didn't (the in-flight call
-    // settled first) — there's no card yet for what turned out to be a real
-    // standalone turn. Every progress tick during the call above was
-    // silently dropped (onProgress found statusCard still null), so the
-    // card created here goes straight to its final state with no ticks to
-    // show for it.
-    statusCard = ensureStatusCard()
-    if (anyTextSent || reply) {
-      await statusCard.finalize('✅ 已回复')
-    } else {
-      await statusCard.finalize('⚠️ 未产生文本回复')
-      dbg(`claude-tmux: ${workdir} produced no text reply for ${messageId}`)
-    }
-  } catch (e) {
-    // Same as the try block above — any chunk sent before the failure
-    // should land before whatever this catch sends next. sendChain's own
-    // internal .catch means awaiting it here never throws.
-    await sendChain
-    // This message was absorbed into the in-flight call (onAbsorbed already
-    // fired above) and that same call is what just threw — the primary
-    // message's own catch handles the failure (error reply, OpenCode
-    // fallback, etc). Without this check we'd duplicate all of that here
-    // too, for a message that was never its own turn.
-    if (absorbed) {
-      if (statusCard) await statusCard.finalize('↪️ 已并入上一条消息的回复')
-      else void replyText(chatId, messageId, '↪️ 已并入上一条消息的回复')
-      return
-    }
-    statusCard = ensureStatusCard()
-    if (route.agent.fallback === 'opencode' && infraConfig?.fallback.enabled && openCodeAdapter) {
-      // Don't finalize as "failed" here — OpenCode is about to take over and
-      // may well deliver a working reply right after, which would otherwise
-      // leave a contradictory "执行失败" card sitting next to a real answer.
-      await statusCard.finalize('⚠️ 已切换到 OpenCode 处理')
-      dbg(`claude-tmux: ${workdir} unavailable (${e}), falling back to OpenCode (pre-delivery, no side effect)`)
-      void replyText(chatId, messageId, '⚠️ Claude Code (tmux) 当前不可用，已切换到 OpenCode 处理本次任务。')
-      void handleOpenCodeTask(route, chatId, messageId, chatType, ocContent)
-      return
-    }
-    await statusCard.finalize('⚠️ 执行失败')
-    dbg(`claude-tmux: task for ${workdir} failed: ${e}`)
-    void replyText(chatId, messageId, `⚠️ Claude (tmux) 执行失败：${e}`)
-  }
+    },
+  })
 }
 
 async function handleInbound(data: any) {
@@ -1258,16 +900,9 @@ async function handleInbound(data: any) {
     return
   }
 
-  if (route.agent.mode === 'tmux') {
-    markEventProcessed(db, messageId, new Date().toISOString())
-    void handleClaudeTmuxTask(route, chatId, messageId, chatKind, content, ocContent, attDownloads)
-    return
-  }
-
-  dbg(`routing ${chatId} (${chatType}) → ${workdir}${parentId ? ' (reply)' : ''}`)
-  const rateLimited = degraded.isDegraded(resolve(workdir))
-  if (rateLimited) dbg(`${chatId}: ${workdir} is rate-limited, skipping Claude Code attempt`)
-  const delivered = !rateLimited && routeToWorkdir(workdir, {
+  // Socket-worker delivery, also used when Claude is another backend's fallback.
+  const isClaudeRateLimited = () => degraded.isDegraded(resolve(workdir))
+  const socketDeliver = () => !isClaudeRateLimited() && routeToWorkdir(workdir, {
     type: 'channel_message',
     content,
     meta: {
@@ -1281,22 +916,40 @@ async function handleInbound(data: any) {
       ...(atts.length ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
     },
   })
+  const ctx: TaskContext = { route, chatId, messageId, chatKind, content, ocContent, attachments: attDownloads, socketDeliver }
+
+  if (route.agent.primary === 'agy') {
+    markEventProcessed(db, messageId, new Date().toISOString())
+    void runAgyTask(ctx)
+    return
+  }
+
+  if (route.agent.mode === 'tmux') {
+    markEventProcessed(db, messageId, new Date().toISOString())
+    void runClaudeTmuxTask(ctx)
+    return
+  }
+
+  dbg(`routing ${chatId} (${chatType}) → ${workdir}${parentId ? ' (reply)' : ''}`)
+  const rateLimited = isClaudeRateLimited()
+  if (rateLimited) dbg(`${chatId}: ${workdir} is rate-limited, skipping Claude Code attempt`)
+  const delivered = socketDeliver()
   if (delivered) {
     markEventProcessed(db, messageId, new Date().toISOString())
-  } else if (route.agent.fallback === 'opencode' && infraConfig?.fallback.enabled && openCodeAdapter) {
-    // Design doc §7's strictest allowed-fallback case: the task was never
-    // delivered to Claude at all — either no worker was connected, or the
-    // worker reported itself rate-limited (see worker-link.ts sendDegraded) —
-    // so there is provably no side effect and no risk of duplicate execution.
-    // Any richer trigger (Claude accepted the task but then failed/hung) is
-    // deliberately NOT handled here — that needs real task-state tracking,
-    // which isn't wired up yet.
-    dbg(`${chatId}: Claude unavailable for ${workdir} (${rateLimited ? 'rate-limited' : 'no worker connected'}), falling back to OpenCode (pre-execution, no side effect)`)
+    return
+  }
+  // Design doc §7's strictest allowed-fallback case: the task was never
+  // delivered to Claude at all — no worker connected, or the worker reported
+  // itself rate-limited (worker-link.ts sendDegraded) — so there is provably
+  // no side effect and no risk of duplicate execution. A worker accepting the
+  // task and then failing is deliberately NOT handled (needs task-state
+  // tracking that isn't wired up yet).
+  const fallbackNotice = (target: string) => rateLimited
+    ? `⚠️ Claude Code 当前已达到使用限额，已切换到 ${target} 处理本次任务。`
+    : `⚠️ Claude Code 当前不可用，已切换到 ${target} 处理本次任务。`
+  const target = route.agent.fallback
+  if (target && target !== 'claude' && startFallback('claude', ctx, fallbackNotice(BACKEND_DISPLAY[target]))) {
     markEventProcessed(db, messageId, new Date().toISOString())
-    void replyText(chatId, messageId, rateLimited
-      ? '⚠️ Claude Code 当前已达到使用限额，已切换到 OpenCode 处理本次任务。'
-      : '⚠️ Claude Code 当前不可用，已切换到 OpenCode 处理本次任务。')
-    void handleOpenCodeTask(route, chatId, messageId, chatKind, ocContent)
   } else {
     const hint = rateLimited
       ? `⚠️ Claude Code hit its usage limit for \`${workdir}\` and hasn't reset yet. Please retry shortly.`
@@ -1314,27 +967,7 @@ async function handleCardAction(data: any): Promise<Record<string, unknown>> {
   const action = value.action as string | undefined
   if (!code || !action) return {}
 
-  if (action === 'tmux_dialog_choice') {
-    const entry = TMUX_PENDING_DIALOGS.get(code)
-    const number = Number(value.number)
-    if (!entry || !Number.isFinite(number)) {
-      return { toast: { type: 'warning', content: '⚠️ 该选择已失效或已处理' } }
-    }
-    TMUX_PENDING_DIALOGS.delete(code)
-    entry.resolve(number)
-    const label = number === DIALOG_ESCAPE_CHOICE ? '已发送 Esc' : `已选择第 ${value.number} 项`
-    return {
-      toast: { type: 'success', content: label },
-      card: {
-        type: 'raw',
-        data: {
-          schema: '2.0', config: { wide_screen_mode: true },
-          header: { title: { tag: 'plain_text', content: `❓ Claude 需要你选择 — ${label}` }, template: 'green' },
-          body: { elements: [{ tag: 'hr' }, { tag: 'markdown', content: `**${label}**` }] },
-        },
-      },
-    }
-  }
+  if (action === 'tmux_dialog_choice') return tmuxRouting.handleTmuxDialogChoice(code, value.number)
 
   // Route precisely by the code the issuing worker registered (routing/storage.ts
   // PermissionRegistry). chat_id lookup is a defensive fallback only for the rare
@@ -1518,6 +1151,8 @@ setInterval(() => {
 const TMUX_IDLE_MS = 60 * 60 * 1000
 const TMUX_IDLE_SWEEP_MS = 10 * 60 * 1000
 setInterval(() => { void tmuxClaude.killIdleSessions(TMUX_IDLE_MS) }, TMUX_IDLE_SWEEP_MS)
+// agy keeps its conversation id across an idle kill, so the next message resumes it (`--conversation`).
+setInterval(() => { void tmuxAgy.killIdleSessions(TMUX_IDLE_MS) }, TMUX_IDLE_SWEEP_MS)
 setInterval(pruneOldTmuxAttachments, TMUX_IDLE_SWEEP_MS)
 
 // Keep alive
