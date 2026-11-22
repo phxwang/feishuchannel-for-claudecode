@@ -1,0 +1,211 @@
+{
+  "type": "object",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "routerContractVersion": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "ok": {
+          "type": "boolean",
+          "const": true
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string"
+            },
+            "phase": {
+              "type": "string"
+            },
+            "controlVersion": {
+              "type": "integer"
+            },
+            "final": {
+              "type": "boolean"
+            },
+            "executionOutcome": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "turns": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+              }
+            },
+            "evidence": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true
+            },
+            "cleanup": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true
+            },
+            "businessAcceptance": {
+              "type": "string",
+              "const": "not_evaluated"
+            },
+            "lastSeq": {
+              "type": "integer"
+            },
+            "executionAttempts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+              }
+            }
+          },
+          "required": [
+            "taskId",
+            "phase",
+            "controlVersion",
+            "final",
+            "executionOutcome",
+            "turns",
+            "evidence",
+            "cleanup",
+            "businessAcceptance",
+            "lastSeq",
+            "executionAttempts"
+          ],
+          "additionalProperties": true
+        },
+        "error": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "routerContractVersion",
+        "requestId",
+        "replayed",
+        "ok",
+        "data",
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "routerContractVersion": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "ok": {
+          "type": "boolean",
+          "const": false
+        },
+        "data": {
+          "type": "null"
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "INVALID_REQUEST",
+                "INVALID_DIGEST",
+                "REQUEST_TOO_LARGE",
+                "PROJECT_NOT_ALLOWED",
+                "WORKDIR_NOT_ALLOWED",
+                "PEER_NOT_ALLOWED",
+                "TASK_NOT_FOUND",
+                "TURN_NOT_FOUND",
+                "CLIENT_TASK_CONFLICT",
+                "IDEMPOTENCY_CONFLICT",
+                "OPERATION_IN_PROGRESS",
+                "VERSION_CONFLICT",
+                "SCOPE_BUSY",
+                "OWNER_MISMATCH",
+                "OWNER_UNVERIFIED",
+                "TASK_BUSY",
+                "TASK_SEALED",
+                "TASK_NOT_QUIESCENT",
+                "PERMISSION_STALE",
+                "INVALID_OPTION",
+                "UNSUPPORTED_CAPABILITY",
+                "AUTHORIZATION_EXPIRED",
+                "ASSIGNMENT_MISMATCH",
+                "RESULT_NOT_READY",
+                "INVALID_CURSOR",
+                "EVENT_CURSOR_EXPIRED",
+                "RESULT_EXPIRED",
+                "CAPACITY_EXHAUSTED",
+                "BACKEND_UNAVAILABLE",
+                "SERVICE_UNAVAILABLE",
+                "STORAGE_UNAVAILABLE",
+                "RECOVERY_IN_PROGRESS",
+                "INTERNAL_ERROR",
+                "AUTHORIZATION_STALE",
+                "FALLBACK_POLICY_INVALID",
+                "FALLBACK_EXHAUSTED",
+                "FALLBACK_BLOCKED",
+                "CHECKPOINT_INVALID",
+                "EFFECTS_UNVERIFIED"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "sideEffects": {
+              "type": "string",
+              "enum": [
+                "none",
+                "accepted",
+                "unknown"
+              ]
+            },
+            "details": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "sideEffects",
+            "details"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "routerContractVersion",
+        "requestId",
+        "replayed",
+        "ok",
+        "data",
+        "error"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

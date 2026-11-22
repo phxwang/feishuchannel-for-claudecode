@@ -25,6 +25,7 @@
  * crashing the router.
  */
 import type { AgentEvent } from '../agent-adapter'
+import { partIdentity, type RawPart, type TurnEvent } from './turn'
 
 export interface RawOpenCodeEvent {
   type?: string
@@ -84,5 +85,47 @@ export function normalizeOpenCodeEvent(raw: RawOpenCodeEvent, taskId: string): A
     }
   }
 
+  return null
+}
+
+/**
+ * Identity-bearing view of one raw SSE event for task consumers (see
+ * observeTurn's `identity` option): full text snapshots per part, tool
+ * events with message/part/call IDs, permission requests with the blocked
+ * tool call, and proof that our own user message exists. Returns null for
+ * anything else (callers fall back to normalizeOpenCodeEvent).
+ *
+ * `foreign` holds assistant message IDs known to belong to another turn
+ * (their parentID differs); their parts are dropped. Parts of our own user
+ * message (the prompt text) are never reported as output.
+ */
+export function normalizeTurnIdentityEvent(raw: RawOpenCodeEvent, promptId: string, taskId: string, foreign: Set<string>): TurnEvent | null {
+  const p = raw.properties ?? {}
+  if (raw.type === 'message.updated') return messageUpdated(p.info as Record<string, unknown> | undefined, promptId, taskId, foreign)
+  if (raw.type === 'permission.asked') {
+    const base = normalizeOpenCodeEvent(raw, taskId)
+    const callId = (p.tool as { callID?: unknown } | undefined)?.callID
+    return base?.type === 'permission.requested' ? { ...base, ...(typeof callId === 'string' ? { callId } : {}) } : null
+  }
+  if (raw.type !== 'message.part.updated') return null
+  const part = (p.part ?? {}) as RawPart
+  if (typeof part.messageID === 'string' && (part.messageID === promptId || foreign.has(part.messageID))) return null
+  const ids = partIdentity(part)
+  if (part.type === 'text' && typeof part.text === 'string' && ids.partId) {
+    return { type: 'text.snapshot', taskId, messageId: ids.messageId ?? '', partId: ids.partId, text: part.text }
+  }
+  if (part.type !== 'tool') return null
+  const toolName = String(part.tool ?? 'unknown')
+  const status = part.state?.status
+  if (status === 'running' || status === 'pending') return { type: 'tool.started', taskId, toolName, ...ids }
+  if (status === 'completed') return { type: 'tool.completed', taskId, toolName, ...ids }
+  if (status === 'error') return { type: 'tool.failed', taskId, toolName, error: String(part.state?.error ?? 'tool failed'), ...ids }
+  return null
+}
+
+function messageUpdated(info: Record<string, unknown> | undefined, promptId: string, taskId: string, foreign: Set<string>): TurnEvent | null {
+  if (!info || typeof info.id !== 'string') return null
+  if (info.role === 'user' && info.id === promptId) return { type: 'prompt.accepted', taskId, messageId: promptId }
+  if (info.role === 'assistant' && typeof info.parentID === 'string' && info.parentID !== promptId) foreign.add(info.id)
   return null
 }

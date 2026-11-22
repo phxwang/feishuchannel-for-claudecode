@@ -1,0 +1,217 @@
+{
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string"
+    },
+    "clientId": {
+      "type": "string"
+    },
+    "clientTaskId": {
+      "type": "string"
+    },
+    "scopeKey": {
+      "type": "string"
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "projectId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workdirSource": {
+      "type": "string",
+      "enum": [
+        "project",
+        "dynamic"
+      ]
+    },
+    "workdir": {
+      "type": "string"
+    },
+    "backend": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": true
+    },
+    "policy": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": true
+    },
+    "assignment": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": true
+    },
+    "phase": {
+      "type": "string"
+    },
+    "controlVersion": {
+      "type": "integer"
+    },
+    "sealed": {
+      "type": "boolean"
+    },
+    "owner": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "none",
+            "starting",
+            "live",
+            "released",
+            "unknown"
+          ]
+        },
+        "executionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "type": "integer"
+        },
+        "backendSessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "processStartIdentity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "executionId",
+        "generation",
+        "backendSessionId",
+        "pid",
+        "processStartIdentity"
+      ],
+      "additionalProperties": true
+    },
+    "currentTurn": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": true
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "executionOutcome": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "lastSeq": {
+      "type": "integer"
+    },
+    "createdAt": {
+      "type": "string"
+    },
+    "updatedAt": {
+      "type": "string"
+    },
+    "fallbackPlanSha256": {
+      "type": "string"
+    },
+    "selectedCandidateIndex": {
+      "type": "integer"
+    },
+    "actualBackend": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": true
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "currentExecutionAttemptId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "executionAttemptCount": {
+      "type": "integer"
+    },
+    "fallbackState": {
+      "type": "string"
+    },
+    "pendingAuthorization": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": true
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "taskId",
+    "clientId",
+    "clientTaskId",
+    "scopeKey",
+    "correlation",
+    "projectId",
+    "workdirSource",
+    "workdir",
+    "backend",
+    "policy",
+    "assignment",
+    "phase",
+    "controlVersion",
+    "sealed",
+    "owner",
+    "currentTurn",
+    "executionOutcome",
+    "lastSeq",
+    "createdAt",
+    "updatedAt",
+    "fallbackPlanSha256",
+    "selectedCandidateIndex",
+    "actualBackend",
+    "currentExecutionAttemptId",
+    "executionAttemptCount",
+    "fallbackState",
+    "pendingAuthorization"
+  ],
+  "additionalProperties": true
+}

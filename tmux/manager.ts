@@ -90,6 +90,30 @@ export interface TmuxManagerOptions {
   }
 }
 
+export interface EnsureSessionOptions {
+  /** Key for the tmux session name, maps and persistence; default = the workdir (chat). */
+  sessionKey?: string
+  /** Throw StartupTimeoutError when the ready marker never shows (default: proceed anyway). */
+  requireReady?: boolean
+}
+
+/** Which step of a paste failed: 'no_session' / 'buffer' = nothing reached the pane; later stages are ambiguous. */
+export type TmuxSendStage = 'no_session' | 'buffer' | 'paste' | 'enter'
+
+export class TmuxSendError extends Error {
+  constructor(readonly stage: TmuxSendStage, message: string) {
+    super(message)
+    this.name = 'TmuxSendError'
+  }
+}
+
+export class StartupTimeoutError extends Error {
+  constructor(readonly sessionName: string, readonly timeoutMs: number) {
+    super(`tmux session ${sessionName} did not become ready within ${timeoutMs}ms`)
+    this.name = 'StartupTimeoutError'
+  }
+}
+
 interface TurnOwner {
   text: string
   opts: SendAndAwaitReplyOptions
@@ -250,30 +274,40 @@ export class TmuxCliManager {
   /**
    * Ensure a live tmux session running the CLI exists for this workdir;
    * spawns one if missing. Spawn options only apply to a fresh spawn.
+   *
+   * `opts.sessionKey` (default: `workdir`) keys the tmux session name, the
+   * in-memory maps and persistence, while `workdir` stays the start
+   * directory — so a task-owned manager can host several sessions per
+   * workdir (one per execution attempt). Every other per-session method
+   * (killSession, sendEscape, selectOption, sendText …) takes that key as
+   * its first argument; for chat callers the key is the workdir.
+   * `opts.requireReady` turns a startup timeout into a thrown
+   * StartupTimeoutError instead of proceeding anyway.
    */
-  async ensureSession(workdir: string, spawn: SpawnOptions = {}): Promise<string> {
-    const name = this.profile.sessionName(workdir)
-    if (this.knownAlive.has(workdir) && await this.hasSession(name)) return name
+  async ensureSession(workdir: string, spawn: SpawnOptions = {}, opts: EnsureSessionOptions = {}): Promise<string> {
+    const key = opts.sessionKey ?? workdir
+    const name = this.profile.sessionName(key)
+    if (this.knownAlive.has(key) && await this.hasSession(name)) return name
 
     if (await this.hasSession(name)) {
-      this.knownAlive.add(workdir)
+      this.knownAlive.add(key)
       // Reattaching after a router restart: recover the session id so
       // transcript tailing targets the exact file.
-      if (!this.sessionIds.has(workdir)) {
-        const persisted = this.persistence?.get(workdir)
+      if (!this.sessionIds.has(key)) {
+        const persisted = this.persistence?.get(key)
         if (persisted) {
-          this.dbg(`${this.tag()}: reattached to ${workdir}'s live session, recovered session-id ${persisted}`)
-          this.sessionIds.set(workdir, persisted)
+          this.dbg(`${this.tag()}: reattached to ${key}'s live session, recovered session-id ${persisted}`)
+          this.sessionIds.set(key, persisted)
         }
       }
       return name
     }
 
-    const resumeId = this.profile.resumable ? this.persistence?.get(workdir) : undefined
-    this.dbg(`${this.tag()}: no live session for ${workdir}, spawning ${name}${spawn.model ? ` (model: ${spawn.model})` : ''}${resumeId ? ` (resuming ${resumeId})` : ''}`)
-    this.profile.prepareSpawn?.(workdir)
+    const resumeId = this.profile.resumable ? this.persistence?.get(key) : undefined
+    this.dbg(`${this.tag()}: no live session for ${key}, spawning ${name}${spawn.model ? ` (model: ${spawn.model})` : ''}${resumeId ? ` (resuming ${resumeId})` : ''}`)
+    this.profile.prepareSpawn?.(key)
     const spawnStartMs = Date.now()
-    const plan = this.profile.planSpawn(workdir, spawn, resumeId)
+    const plan = this.profile.planSpawn(workdir, spawn, resumeId, key)
     const envArgs = Object.entries(plan.env).flatMap(([k, v]) => ['-e', `${k}=${v}`])
     const r = await runTmux([
       'new-session', '-d', '-s', name, '-c', workdir, '-x', String(this.cols), '-y', String(this.rows),
@@ -281,11 +315,12 @@ export class TmuxCliManager {
     ])
     if (!r.ok) throw new Error(`tmux new-session failed: ${r.stderr || r.stdout}`)
     const sessionId = plan.sessionId ?? resumeId
-    if (sessionId) this.rememberSessionId(workdir, sessionId)
-    else { this.sessionIds.delete(workdir); this.persistence?.delete(workdir) }
+    if (sessionId) this.rememberSessionId(key, sessionId)
+    else { this.sessionIds.delete(key); this.persistence?.delete(key) }
 
-    await this.waitForStartup(name, spawnStartMs)
-    this.knownAlive.add(workdir)
+    const ready = await this.waitForStartup(name, spawnStartMs)
+    if (!ready && opts.requireReady) throw new StartupTimeoutError(name, this.startupTimeoutMs)
+    this.knownAlive.add(key)
     return name
   }
 
@@ -294,15 +329,16 @@ export class TmuxCliManager {
    * died during boot (e.g. binary not found) — that's still pre-delivery,
    * so the caller may fall back. A slow-but-alive boot just proceeds.
    */
-  private async waitForStartup(name: string, spawnStartMs: number): Promise<void> {
+  private async waitForStartup(name: string, spawnStartMs: number): Promise<boolean> {
     const deadline = spawnStartMs + this.startupTimeoutMs
     while (Date.now() < deadline) {
       const r = await runTmux(['capture-pane', '-p', '-t', name])
       if (!r.ok && !(await this.hasSession(name))) throw new Error(`${this.profile.label} exited during startup (tmux session ${name} is gone)`)
-      if (r.ok && this.profile.isReady(r.stdout)) return
+      if (r.ok && this.profile.isReady(r.stdout)) return true
       await new Promise(res => setTimeout(res, 200))
     }
     this.dbg(`${this.tag()}: startup wait timed out for session ${name}, proceeding anyway`)
+    return false
   }
 
   /**
@@ -315,11 +351,40 @@ export class TmuxCliManager {
     // once could otherwise paste each other's text.
     const buffer = `feishu-${randomUUID()}`
     const set = await runTmux(['set-buffer', '-b', buffer, '--', text])
-    if (!set.ok) throw new Error(`tmux set-buffer failed: ${set.stderr || set.stdout}`)
+    if (!set.ok) throw new TmuxSendError('buffer', `tmux set-buffer failed: ${set.stderr || set.stdout}`)
     const paste = await runTmux(['paste-buffer', '-b', buffer, '-d', '-t', name, '-p'])
-    if (!paste.ok) throw new Error(`tmux paste-buffer failed: ${paste.stderr || paste.stdout}`)
+    if (!paste.ok) throw new TmuxSendError('paste', `tmux paste-buffer failed: ${paste.stderr || paste.stdout}`)
     const enter = await runTmux(['send-keys', '-t', name, 'Enter'])
-    if (!enter.ok) throw new Error(`tmux send-keys (Enter) failed: ${enter.stderr || enter.stdout}`)
+    if (!enter.ok) throw new TmuxSendError('enter', `tmux send-keys (Enter) failed: ${enter.stderr || enter.stdout}`)
+  }
+
+  /** tmux session name for a session key (the workdir, for chat callers). */
+  sessionNameFor(sessionKey: string): string {
+    return this.profile.sessionName(sessionKey)
+  }
+
+  /** True if the key's tmux session exists right now (no cached answer). */
+  async hasLiveSession(sessionKey: string): Promise<boolean> {
+    return this.hasSession(this.profile.sessionName(sessionKey))
+  }
+
+  /**
+   * Low-level delivery for callers that run their own observation loop (the
+   * task service): paste `text` into the key's existing session and press
+   * Enter. No reply wait, no queueing. Throws TmuxSendError; stage 'buffer'
+   * (or 'no_session') means nothing reached the pane.
+   */
+  async sendText(sessionKey: string, text: string): Promise<void> {
+    const name = this.profile.sessionName(sessionKey)
+    if (!(await this.hasSession(name))) throw new TmuxSendError('no_session', `tmux session ${name} does not exist`)
+    this.lastUsedAt.set(sessionKey, Date.now())
+    await this.sendKeys(name, text)
+  }
+
+  /** ANSI-stripped capture of the key's pane; null when it can't be captured (e.g. no session). */
+  async capturePlainPane(sessionKey: string): Promise<string | null> {
+    const r = await runTmux(['capture-pane', '-p', '-t', this.profile.sessionName(sessionKey)])
+    return r.ok ? stripAnsi(r.stdout) : null
   }
 
   /**
@@ -738,7 +803,7 @@ export class TmuxCliManager {
   }
 
   /**
-   * Kill the workdir's tmux session and end any in-flight wait on it.
+   * Kill the session key's (workdir's, for chat) tmux session and end any in-flight wait on it.
    * `forget: false` keeps the persisted session id so a resumable profile
    * can pick the same conversation back up on the next spawn.
    */

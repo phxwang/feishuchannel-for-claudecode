@@ -1,0 +1,3 @@
+#!/bin/sh
+# stdio MCP server for the router task service (docs/router-task-mcp-design.md §7.4).
+exec bun "$(dirname "$0")/../mcp/task-mcp.ts" --stdio "$@"

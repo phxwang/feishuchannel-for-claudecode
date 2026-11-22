@@ -135,6 +135,8 @@ export interface RouterConfig {
   agents: { claude?: ClaudeAgentConfig; opencode?: OpenCodeAgentConfig; agy?: AgyAgentConfig }
   projects: Record<string, ProjectConfig>
   fallback: FallbackConfig
+  /** Router task MCP block, validated by task-service/config.ts. */
+  taskService?: import('../task-service/config').TaskServiceConfigInput
 }
 
 // ── Conversation binding ─────────────────────────────────────────────────

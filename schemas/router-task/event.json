@@ -1,0 +1,62 @@
+{
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string"
+    },
+    "seq": {
+      "type": "integer"
+    },
+    "type": {
+      "type": "string"
+    },
+    "at": {
+      "type": "string"
+    },
+    "executionId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "turnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "executionAttemptId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "candidateIndex": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "data": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "taskId",
+    "seq",
+    "type",
+    "at",
+    "executionId",
+    "turnId",
+    "executionAttemptId",
+    "candidateIndex",
+    "data"
+  ],
+  "additionalProperties": true
+}

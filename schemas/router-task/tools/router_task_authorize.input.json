@@ -1,0 +1,111 @@
+{
+  "type": "object",
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "pattern": "^[\\x21-\\x7e]{1,128}$"
+    },
+    "expectedControlVersion": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "expectedOwner": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "executionId": {
+              "type": "string"
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "executionId",
+            "generation"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "transitionRequestId": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "authorization": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string"
+            },
+            "expiresAt": {
+              "type": "string",
+              "minLength": 20,
+              "maxLength": 40
+            },
+            "promptSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "contractSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "fallbackPlanSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "transitionSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "required": [
+            "revision",
+            "expiresAt",
+            "promptSha256",
+            "contractSha256",
+            "fallbackPlanSha256",
+            "transitionSha256"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "taskId",
+    "idempotencyKey",
+    "expectedControlVersion",
+    "expectedOwner",
+    "transitionRequestId",
+    "decision",
+    "authorization"
+  ],
+  "additionalProperties": false
+}

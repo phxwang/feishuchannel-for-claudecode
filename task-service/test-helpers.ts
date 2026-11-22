@@ -27,8 +27,10 @@ export interface Harness {
   data: (tool: string, args: Record<string, unknown>) => Promise<any>
 }
 
+/** Short temp roots: Unix socket paths are limited to 104 bytes on macOS. */
 export function tempRoot(prefix = 'rtask-'): string {
-  return realpathSync(mkdtempSync(join(tmpdir(), prefix)))
+  const base = process.platform === 'darwin' ? '/tmp' : tmpdir()
+  return realpathSync(mkdtempSync(join(base, prefix)))
 }
 
 export function makeHarness(opts: { dir?: string; fake?: FakeBackend; backends?: TaskBackend[]; clock?: Clock; config?: Record<string, unknown>; releaseGraceMs?: number } = {}): Harness {
@@ -73,7 +75,7 @@ export function fallbackPolicy(candidates: string[], extra: Record<string, unkno
   const enabled = candidates.length > 1 || Boolean(extra.enabled)
   return {
     enabled,
-    candidates: candidates.map(model => ({ kind: 'fake', mode: 'exec', model, variant: null })),
+    candidates: candidates.map(model => ({ kind: 'fake' as const, mode: 'exec' as const, model, variant: null })),
     triggerOn: [],
     maxSwitches: 0,
     startupRetriesPerCandidate: 0,

@@ -15,6 +15,7 @@ import { existsSync, readFileSync, realpathSync } from 'fs'
 import { isAbsolute, resolve } from 'path'
 import { z } from 'zod'
 import { AGY_EFFORTS, AGY_PERMISSION_MODES, type AgySpawnSettings, type OpenCodeAgentConfig, type RouterConfig } from './types'
+import { taskServiceConfigSchema } from '../task-service/config'
 
 const AGENT_KINDS = ['claude', 'opencode', 'agy'] as const
 
@@ -83,6 +84,8 @@ const routerConfigSchema = z.object({
     cooldownSeconds: z.number().min(0).default(300),
     notifyUser: z.boolean().default(true),
   }).default({}),
+  /** Router task MCP (docs/router-task-mcp-design.md §6). Optional; inert unless enabled. */
+  taskService: taskServiceConfigSchema.optional(),
 })
 
 export class RouterConfigError extends Error {}

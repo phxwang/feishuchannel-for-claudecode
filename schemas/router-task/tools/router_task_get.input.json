@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "taskId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "taskId"
+  ],
+  "additionalProperties": false
+}

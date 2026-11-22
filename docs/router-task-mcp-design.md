@@ -135,7 +135,7 @@ The server name is **`router-task`**, and the domain contract version is `router
 | CLI binary resolution | `tmux/profile.ts` `resolveBin` | Used for `claude`, `codex` and `agy` under launchd's reduced PATH. |
 | Rate-limit reset parsing | `rate-limit-reset.ts` | Used only to emit diagnostics in phase 1. Same-owner reset resume is still not advertised. |
 
-New dependency: `canonicalize` (an RFC 8785 JCS implementation) for operation fingerprints and policy digests. The domain contains no floating-point fields, so it can be swapped for a small in-house JCS if review prefers no new package.
+No new dependency: operation fingerprints and policy digests use a small in-house RFC 8785 JCS (`task-service/jcs.ts`). The domain contains no floating-point fields, so JCS reduces to sorted-key `JSON.stringify` over safe integers, strings, booleans, null, arrays and plain objects; anything else is rejected.
 
 ---
 
@@ -1180,3 +1180,25 @@ To verify during implementation (no owner input needed):
   - If any task in the DB is not CLOSED (including UNKNOWN), the service still starts, but in **drain mode**: prepare and start are rejected with `SERVICE_UNAVAILABLE`, while queries, seal, cancel, close, permission replies, authorization replies and recovery keep working, so those tasks can finish. Startup logs the blocking task IDs. The socket goes away on the first restart after every task is CLOSED.
 - **Rollback**: revert the branch. `task-service/task-service.db` is independent of `router.db`, so deleting the `task-service/` directory removes all task state without affecting chat routing.
 - Full procedures live in `docs/router-task-mcp-operations.md` (deliverable of step 12).
+
+---
+
+## 20. Implementation notes (as built)
+
+These record where the implementation made a concrete choice that the sections above leave open, or where it simplified them.
+
+- **Storage layout.** Each row stores its record as a JSON document (`doc`), alongside only the columns that need SQL constraints:
+  - `tasks`: unique `(client_id, client_task_id)` and a partial unique index on the active scope
+  - `operations`: the idempotency primary key
+  - `attempts`: unique `(task_id, ordinal)`
+  - `events`: primary key `(task_id, seq)`
+
+  Permissions, grants, pending transition requests and deadlines live inside the task document instead of separate tables. Every change still commits in one `BEGIN IMMEDIATE` transaction (`core/commit.ts`).
+- **One outer transaction per mutation.** `core/operations.ts` wraps the operation row and the handler's own commits (which become SQLite savepoints) in one transaction. A non-retryable domain rejection is recorded under the key, so a retry replays the same decision. Retryable rejections are not recorded.
+- **Budgets.** Deadlines are persisted wall-clock values (prepared expiry, aggregate run deadline, idle, permission, quiescent, retry wake, transition-request expiry, cumulative recovery budget), and one timer per task fires for the earliest of them (`core/timers.ts`). A restart recomputes from the persisted values and never renews them. If the wall clock is seen to go backwards by more than 5 s relative to the last write, the task fails closed (sealed and finalized). The separate monotonic-remaining bookkeeping described in §10.3 was not needed for this.
+- **Pre-decision.** When a turn ends failed, or an attempt fails before delivery, the engine first runs the pure `decide()` as if the owner were already settled:
+  - If no switch or retry is possible, a delivered attempt goes to QUIESCENT, so the client can inspect the result and close. An undelivered one goes to FINALIZING and then CLOSED.
+  - Only when a switch or retry is possible does the task enter FALLBACK_PENDING, release the previous owner, and decide for real.
+- **Startup grant reuse.** A `before_delivery` switch reuses the start grant only if it is still valid and unexpired, with a 2 s margin, when dispatch happens. Otherwise the engine raises `authorization.required`. A grant is marked consumed only when input is actually handed to a backend; a not-sent failure puts it back.
+- **Recovery for not-sent attempts.** After a restart, an attempt whose input was provably never handed off is closed as `not_started`, and a fresh attempt on the same candidate is planned behind `authorization.required` (trigger `recovery_restart`), so old grants never authorize input after a restart.
+- **Socket path length.** Unix socket paths are limited to 104 bytes on macOS. The service refuses paths longer than 103 bytes with a clear error. The default `~/.claude/channels/feishu/task-service/task.sock` is far below that.

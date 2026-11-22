@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "afterTurnId": {
+      "type": "string"
+    },
+    "afterExecutionAttemptId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "taskId"
+  ],
+  "additionalProperties": false
+}

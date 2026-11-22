@@ -70,9 +70,15 @@ export class Engine implements TimerHost {
       this.deps.log(`task-service: step for ${taskId} failed: ${e instanceof Error ? e.message : String(e)}`)
     } finally {
       this.busy.delete(taskId)
-      const latest = this.deps.store.getTask(taskId)
-      if (latest) armTimer(this, latest)
-      if (this.again.delete(taskId)) this.kick(taskId)
+      if (!this.stopped) {
+        try {
+          const latest = this.deps.store.getTask(taskId)
+          if (latest) armTimer(this, latest)
+        } catch (e) {
+          this.deps.log(`task-service: re-arming timer for ${taskId} failed: ${e instanceof Error ? e.message : String(e)}`)
+        }
+        if (this.again.delete(taskId)) this.kick(taskId)
+      }
     }
   }
 
@@ -262,8 +268,12 @@ export class Engine implements TimerHost {
 
   updateHandle(taskId: string, attemptId: string, handle: BackendHandle): void {
     this.commitForAttempt(taskId, attemptId, (t, a) => {
-      const next = { ...a, owner: { ...a.owner, ...ownerFacts(handle) } }
-      return { task: { ...t, owner: { ...ownerFor(next, t.owner.state) } }, attempts: [next] }
+      const next = { ...a, owner: { ...a.owner, ...ownerFacts(handle), extra: { ...a.owner.extra, ...handle.extra } } }
+      const tu = t.currentTurnId ? this.deps.store.getTurn(t.currentTurnId) : undefined
+      const turns = tu && handle.backendTurnId && handle.backendTurnId !== tu.backendTurnId
+        ? [{ ...tu, backendTurnId: handle.backendTurnId, evidence: { ...tu.evidence, backendTurnId: handle.backendTurnId, backendSessionId: handle.backendSessionId ?? tu.evidence.backendSessionId } }]
+        : []
+      return { task: { ...t, owner: { ...ownerFor(next, t.owner.state) } }, attempts: [next], turns }
     })
   }
 
@@ -335,8 +345,7 @@ export class Engine implements TimerHost {
       attemptId: attempt.executionAttemptId,
       turnId: turn.turnId,
       abort: new AbortController(),
-      streams: restoreStreams(this.deps.store, task.taskId, turn.turnId),
-      activeTools: new Set(),
+      ...restoreTurnState(this.deps.store, task.taskId, turn.turnId),
       lastActivityCommitMs: 0,
       caps: null,
     }
@@ -386,9 +395,12 @@ function notSentFrom(code: NotSent['code'], e: unknown, settled = true): NotSent
   return { kind: 'not_sent', code, detail: e instanceof Error ? e.message : String(e), ownerSettled: settled }
 }
 
-function restoreStreams(store: TaskStore, taskId: string, turnId: string): TextStreams {
+/** Rebuild per-turn observation state from committed events, so a re-attached observer never duplicates them. */
+function restoreTurnState(store: TaskStore, taskId: string, turnId: string): Pick<Runtime, 'streams' | 'activeTools' | 'seenTools'> {
   const streams = new TextStreams()
   const texts = new Map<string, string>()
+  const seenTools = new Set<string>()
+  const activeTools = new Set<string>()
   let after = 0
   for (;;) {
     const page = store.readEvents(taskId, after, 500, 8 * 1024 * 1024)
@@ -398,9 +410,14 @@ function restoreStreams(store: TaskStore, taskId: string, turnId: string): TextS
       const id = String(e.data.streamId ?? '')
       if (e.type === 'text.reset') texts.set(id, '')
       if (e.type === 'text.delta') texts.set(id, (texts.get(id) ?? '') + String(e.data.text ?? ''))
+      if (e.type.startsWith('tool.')) {
+        const call = String(e.data.toolCallId ?? '')
+        seenTools.add(`${call}:${e.data.status}`)
+        if (e.data.status === 'started') activeTools.add(call); else activeTools.delete(call)
+      }
     }
     after = page[page.length - 1].seq
   }
   for (const [id, text] of texts) streams.restore(id, text)
-  return streams
+  return { streams, activeTools, seenTools }
 }

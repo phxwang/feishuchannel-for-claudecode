@@ -40,6 +40,11 @@ export interface AgentTask {
    * don't use it (e.g. Claude).
    */
   directory?: string
+  /**
+   * Caller-chosen backend message ID for this turn's prompt (OpenCode: the
+   * user message `messageID`). When absent the adapter generates one.
+   */
+  messageId?: string
 }
 
 export type PermissionBehavior = 'allow' | 'deny'

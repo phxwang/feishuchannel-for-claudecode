@@ -1,0 +1,363 @@
+{
+  "type": "object",
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "pattern": "^[\\x21-\\x7e]{1,128}$"
+    },
+    "clientId": {
+      "type": "string"
+    },
+    "clientTaskId": {
+      "type": "string"
+    },
+    "scopeKey": {
+      "type": "string"
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+      }
+    },
+    "projectId": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "workdir": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "backend": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "opencode",
+            "claude",
+            "codex",
+            "agy",
+            "fake"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "http_sse",
+            "tmux",
+            "print",
+            "acp",
+            "exec"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "variant": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "mode",
+        "model",
+        "variant"
+      ],
+      "additionalProperties": false
+    },
+    "assignment": {
+      "type": "object",
+      "properties": {
+        "inputKind": {
+          "type": "string",
+          "enum": [
+            "text",
+            "native_goal"
+          ]
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "contractSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+          }
+        }
+      },
+      "required": [
+        "inputKind",
+        "prompt",
+        "contractSha256"
+      ],
+      "additionalProperties": false
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "inputMode": {
+          "type": "string",
+          "enum": [
+            "single_turn",
+            "same_primary"
+          ]
+        },
+        "fallback": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "candidates": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "opencode",
+                      "claude",
+                      "codex",
+                      "agy",
+                      "fake"
+                    ]
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "http_sse",
+                      "tmux",
+                      "print",
+                      "acp",
+                      "exec"
+                    ]
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "variant": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "mode",
+                  "model",
+                  "variant"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1,
+              "maxItems": 8
+            },
+            "triggerOn": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "enum": [
+                      "backend_unavailable",
+                      "capability_unavailable",
+                      "authentication_invalid",
+                      "startup_failed",
+                      "rate_limited",
+                      "quota_exhausted",
+                      "provider_unavailable",
+                      "model_unavailable",
+                      "context_exhausted",
+                      "execution_failed",
+                      "idle_timeout",
+                      "run_timeout"
+                    ]
+                  },
+                  "stage": {
+                    "type": "string",
+                    "enum": [
+                      "before_delivery",
+                      "clean_failure",
+                      "checkpoint_handoff"
+                    ]
+                  },
+                  "fromCandidateIndexes": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 7
+                    },
+                    "minItems": 1,
+                    "maxItems": 8
+                  },
+                  "toCandidateIndexes": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 7
+                    },
+                    "minItems": 1,
+                    "maxItems": 8
+                  }
+                },
+                "required": [
+                  "code",
+                  "stage"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 64
+            },
+            "maxSwitches": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 7
+            },
+            "startupRetriesPerCandidate": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "retryDelaySeconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 60
+            },
+            "maxRecoverySeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 43200
+            },
+            "onExhausted": {
+              "type": "string",
+              "const": "fail"
+            },
+            "sameOwnerReset": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "maxWaitSeconds": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 43200
+                },
+                "maxResumeActions": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "required": [
+                "enabled",
+                "maxWaitSeconds",
+                "maxResumeActions"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "enabled",
+            "candidates",
+            "triggerOn",
+            "maxSwitches",
+            "startupRetriesPerCandidate",
+            "retryDelaySeconds",
+            "maxRecoverySeconds",
+            "onExhausted",
+            "sameOwnerReset"
+          ],
+          "additionalProperties": false
+        },
+        "permissionMode": {
+          "type": "string",
+          "enum": [
+            "broker",
+            "backend_policy"
+          ]
+        },
+        "runTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 43200
+        },
+        "idleTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 3600
+        },
+        "permissionTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 7200
+        },
+        "quiescentTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400
+        }
+      },
+      "required": [
+        "inputMode",
+        "fallback",
+        "permissionMode",
+        "runTimeoutSeconds",
+        "idleTimeoutSeconds",
+        "permissionTimeoutSeconds",
+        "quiescentTimeoutSeconds"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "idempotencyKey",
+    "clientId",
+    "clientTaskId",
+    "scopeKey",
+    "projectId",
+    "workdir",
+    "backend",
+    "assignment",
+    "policy"
+  ],
+  "additionalProperties": false
+}

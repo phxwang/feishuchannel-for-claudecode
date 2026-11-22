@@ -21,6 +21,8 @@ export interface Runtime {
   abort: AbortController
   streams: TextStreams
   activeTools: Set<string>
+  /** `${toolCallId}:${status}` already recorded for this turn (dedupes replays after re-attach). */
+  seenTools: Set<string>
   lastActivityCommitMs: number
   caps: BackendCapabilities | null
 }
@@ -74,6 +76,9 @@ export function applyBackendEvent(engine: Engine, taskId: string, rt: Runtime, e
     }
 
     case 'tool': {
+      const key = `${ev.toolCallId}:${ev.status}`
+      if (rt.seenTools.has(key)) return false
+      rt.seenTools.add(key)
       if (ev.status === 'started') rt.activeTools.add(ev.toolCallId)
       else rt.activeTools.delete(ev.toolCallId)
       engine.commitForAttempt(taskId, rt.attemptId, (t, a) => ({

@@ -27,6 +27,11 @@
  * `apiPaths` stays overridable in case a different OpenCode version's
  * layout drifts from what was verified here.
  *
+ * The turn is split into submitPrompt() + observeTurn() so the task service
+ * (task-service/backends/opencode.ts) can persist the message ID before
+ * submitting and re-attach observation after a restart. send() composes
+ * the two with the chat watchdog on, exactly as before.
+ *
  * Wired into router.ts. Contract-tested here against a local mock
  * server (opencode-adapter.test.ts) built to match the verified shapes.
  */
@@ -35,8 +40,17 @@ import type {
   ConversationContext, FileDiff, FinalMessage, HealthStatus, PermissionDecision,
 } from '../agent-adapter'
 import type { AgentKind } from '../../routing/types'
+import type { OpenCodeModel } from './model'
 import { SSEBuffer } from './sse'
-import { belongsToSession, errorMessage, normalizeOpenCodeEvent } from './normalize'
+import { belongsToSession, normalizeOpenCodeEvent, normalizeTurnIdentityEvent, type RawOpenCodeEvent } from './normalize'
+import {
+  classifyTurn, finalizeTurn, hasPromptMessage, isSessionBusy,
+  type RawMessage, type RawPart, type StatusMap, type TurnEvent,
+} from './turn'
+import { describeTaskTimeout, TurnWatchdog, type TimeoutSnapshot } from './watchdog'
+
+export { describeTaskTimeout, formatTaskDuration, type TaskTimeoutKind } from './watchdog'
+export type { RawMessage, StatusMap, TurnEvent } from './turn'
 
 export class OpenCodeError extends Error {
   constructor(message: string, readonly status?: number, readonly path?: string) { super(message) }
@@ -88,56 +102,36 @@ export interface OpenCodeAdapterConfig {
   onWarn?: (msg: string) => void
 }
 
-type RawAttachment = { type?: string; mime?: string; url?: string; filename?: string }
-type RawPart = { type?: string; text?: string; tool?: string; state?: { status?: string; error?: string; attachments?: RawAttachment[] } }
-type RawEvent = { type?: string; properties?: Record<string, unknown> }
-type RawMessage = {
-  info?: { id?: string; role?: string; parentID?: string; time?: { created?: number; completed?: number }; error?: unknown; finish?: string }
-  parts?: RawPart[]
+/** Outcome of the single prompt_async POST. `ambiguous`/`aborted` mean the server may have accepted it. */
+export type SubmitPromptResult =
+  | { kind: 'accepted' }
+  | { kind: 'http_error'; status: number; reason: 'rate_limited' | 'capacity_exhausted' | 'session_missing' | 'rejected'; detail: string }
+  | { kind: 'ambiguous'; detail: string }
+  | { kind: 'aborted' }
+
+export interface ObserveTurnOptions {
+  /** Chat no-progress/hard-cap watchdog. The task path passes false: the task engine owns time limits. */
+  watchdog: boolean
+  /** Label for emitted events' `taskId`; defaults to the message ID. */
+  taskId?: string
+  /** Emit text.snapshot, tool part identity, permission callId and prompt.accepted. Only sound for a session that runs this turn alone. */
+  identity?: boolean
+  /** End with task.failed `observation_lost` after this many consecutive failed polls (unset = keep polling). */
+  maxConsecutivePollFailures?: number
 }
-type SessionStatus = { type?: string }
+
+export type TurnLocation = 'absent' | 'running' | 'ended' | 'missing' | 'unreachable'
 
 const DEFAULT_POLL_INTERVAL_MS = 1000
 const DEFAULT_TASK_HARD_CAP_SECONDS = 8 * 60 * 60
 const STATUS_PATH = '/session/status'
-
-/** Coarse, human-readable duration for timeout diagnostics (Chinese, matching user-facing replies). */
-export function formatTaskDuration(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000))
-  if (seconds < 60) return `${seconds}秒`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}分${seconds % 60}秒`
-  return `${Math.floor(minutes / 60)}小时${minutes % 60}分`
-}
-
-export type TaskTimeoutKind = 'idle' | 'hard_cap'
-
-/** Builds the `detail` shown next to a task_timeout failure. */
-export function describeTaskTimeout(opts: {
-  kind: TaskTimeoutKind
-  elapsedMs: number
-  idleMs: number
-  hardCapMs: number
-  lastActivity?: string
-}): string {
-  const parts: string[] = []
-  if (opts.kind === 'hard_cap') {
-    parts.push(`已达最长运行上限 ${formatTaskDuration(opts.hardCapMs)}`)
-    parts.push(`已运行 ${formatTaskDuration(opts.elapsedMs)}`)
-  } else {
-    parts.push(`已运行 ${formatTaskDuration(opts.elapsedMs)}`)
-    parts.push(`已 ${formatTaskDuration(opts.idleMs)} 无新进展`)
-  }
-  if (opts.lastActivity) parts.push(`最后活动：${opts.lastActivity}`)
-  return parts.join('；')
-}
 
 // Match OpenCode v1.18.15's ascending message identifier: a six-byte
 // timestamp/counter prefix plus 14 random base62 characters. Arbitrary UUIDs
 // can sort before historical turns in OpenCode's message history.
 let promptTimestamp = 0
 let promptCounter = 0
-function nextPromptId(): string {
+export function nextPromptId(): string {
   const now = Date.now()
   if (now !== promptTimestamp) { promptTimestamp = now; promptCounter = 0 }
   const timestamp = BigInt(now) * 0x1000n + BigInt(++promptCounter)
@@ -146,11 +140,18 @@ function nextPromptId(): string {
   return `msg_${prefix}${suffix}`
 }
 
-// Never infer turn identity from wall-clock time: concurrent/stale turns can
-// share timestamps. OpenCode honors the caller-provided user message ID.
-function selectTurnMessages(messages: RawMessage[], promptId: string): RawMessage[] {
-  return messages.filter(m => m.info?.role === 'assistant' && m.info.parentID === promptId)
-    .sort((a, b) => (a.info?.time?.created ?? 0) - (b.info?.time?.created ?? 0))
+/** Mutable per-observation bookkeeping, local to one observeLoop() call. */
+interface LoopState {
+  readonly sessionId: string
+  readonly directory: string | undefined
+  readonly promptId: string
+  readonly taskId: string
+  readonly identity: boolean
+  readonly watchdog: TurnWatchdog | undefined
+  readonly permissions: Set<string>
+  readonly foreign: Set<string>
+  promptSeen: boolean
+  pollFailures: number
 }
 
 export class OpenCodeAdapter implements AgentAdapter {
@@ -214,15 +215,18 @@ export class OpenCodeAdapter implements AgentAdapter {
   }
 
   async createSession(ctx: ConversationContext): Promise<AgentSession> {
-    // `directory` scopes the session to the right project workdir (confirmed
-    // query param on POST /session in the live OpenAPI doc).
-    const json = await this.requestJson(this.url(this.paths.createSession, { directory: ctx.workdir }), {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    return { sessionId: await this.createSessionIn(ctx.workdir), agent: 'opencode' }
+  }
+
+  /** Creates a new session scoped to `directory` (confirmed query param on POST /session in the live OpenAPI doc). */
+  async createSessionIn(directory: string, signal?: AbortSignal): Promise<string> {
+    const json = await this.requestJson(this.url(this.paths.createSession, { directory }), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal,
     })
     const sessionId = json.id
     if (!sessionId) throw new OpenCodeError(`createSession response had no id field: ${JSON.stringify(json)}`)
-    this.directories.set(String(sessionId), ctx.workdir)
-    return { sessionId: String(sessionId), agent: 'opencode' }
+    this.directories.set(String(sessionId), directory)
+    return String(sessionId)
   }
 
   async resumeSession(sessionId: string, directory?: string): Promise<AgentSession> {
@@ -240,166 +244,240 @@ export class OpenCodeAdapter implements AgentAdapter {
     // prompt_async accepts our own user-message id. Every assistant message the
     // turn produces has parentID === this id, so finalization can pick out
     // exactly this turn's messages even when earlier turns share the session.
-    const promptId = nextPromptId()
+    const promptId = task.messageId ?? nextPromptId()
     const run = new AbortController()
     const stopTurn = () => { void this.abort(task.sessionId, task.taskId).catch(() => {}) }
     const onAbort = () => { run.abort(); stopTurn() }
     if (signal.aborted) { yield { type: 'task.aborted', taskId: task.taskId }; return }
     signal.addEventListener('abort', onAbort)
+    // Armed before the POST so a hung prompt request is also bounded by the task deadline.
+    const watchdog = this.newWatchdog(run, stopTurn)
+    watchdog.start()
+    try {
+      const submitted = await this.submitPrompt(task.sessionId, directory, promptId, task.prompt, undefined, run.signal)
+      if (submitted.kind === 'aborted') {
+        yield signal.aborted ? { type: 'task.aborted', taskId: task.taskId } : this.timeoutEvent(task.taskId, false, watchdog.snapshot())
+        return
+      }
+      if (submitted.kind === 'http_error') {
+        yield { type: 'task.failed', taskId: task.taskId, reason: submitted.reason === 'rejected' ? 'backend_unavailable' : submitted.reason }
+        return
+      }
+      // Lost acknowledgement is ambiguous: the server may have accepted the
+      // prompt. Observe this exact message ID, never POST the prompt twice.
+      if (submitted.kind === 'ambiguous') this.config.onWarn?.(`opencode: prompt acknowledgement unavailable; observing ${promptId}: ${submitted.detail}`)
+      const opts = { watchdog: true, taskId: task.taskId, identity: false }
+      for await (const event of this.observeLoop(task.sessionId, directory, promptId, signal, run, opts, watchdog)) {
+        if (event.type !== 'prompt.accepted') yield event
+      }
+    } finally {
+      watchdog.stop()
+      signal.removeEventListener('abort', onAbort)
+      run.abort()
+    }
+  }
 
-    // A fixed wall-clock deadline kills legitimate long turns (observed live:
-    // a 75+-step verification turn still making progress at the 1-hour mark).
-    // taskTimeoutSeconds is therefore a *no-progress* timeout: any observed
-    // tool/text/permission activity re-arms it. taskHardCapSeconds remains an
-    // absolute ceiling so a session that keeps emitting events forever still
-    // eventually gets reclaimed.
-    const startedAt = Date.now()
+  /**
+   * The single prompt_async POST for `messageId`. Never retried here: an
+   * `ambiguous` result must be resolved by observing the message ID.
+   */
+  async submitPrompt(
+    sessionId: string, directory: string | undefined, messageId: string, text: string,
+    model: OpenCodeModel | undefined, signal: AbortSignal,
+  ): Promise<SubmitPromptResult> {
+    const body = {
+      messageID: messageId,
+      ...(model ? { model: { providerID: model.providerID, modelID: model.modelID } } : {}),
+      parts: [{ type: 'text', text }],
+    }
+    try {
+      await this.requestJson(this.paths.promptAsync(sessionId), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal,
+      }, { directory })
+      return { kind: 'accepted' }
+    } catch (error) {
+      if (signal.aborted) return { kind: 'aborted' }
+      if (!(error instanceof OpenCodeError)) return { kind: 'ambiguous', detail: String(error) }
+      const status = error.status ?? 0
+      const reason = isMissingOpenCodeSession(error) && await this.sessionMissing(sessionId, signal, directory) ? 'session_missing'
+        : status === 429 ? 'rate_limited' : status === 503 ? 'capacity_exhausted' : 'rejected'
+      return { kind: 'http_error', status, reason, detail: error.message }
+    }
+  }
+
+  /**
+   * Observes the turn started by `messageId` to its end: SSE (progress,
+   * permissions) + `/permission` + `/session/status` polling + message-list
+   * finalization. A caller abort only stops observing — it never aborts the
+   * session (send() does that itself); only the chat watchdog does.
+   */
+  async *observeTurn(
+    sessionId: string, directory: string | undefined, messageId: string, signal: AbortSignal, opts: ObserveTurnOptions,
+  ): AsyncGenerator<TurnEvent> {
+    const taskId = opts.taskId ?? messageId
+    if (signal.aborted) { yield { type: 'task.aborted', taskId }; return }
+    const run = new AbortController()
+    const onAbort = () => run.abort()
+    signal.addEventListener('abort', onAbort, { once: true })
+    const watchdog = opts.watchdog
+      ? this.newWatchdog(run, () => { void this.abortSession(sessionId, directory).catch(() => {}) })
+      : undefined
+    watchdog?.start()
+    try {
+      yield* this.observeLoop(sessionId, directory, messageId, signal, run, opts, watchdog)
+    } finally {
+      watchdog?.stop()
+      signal.removeEventListener('abort', onAbort)
+      run.abort()
+    }
+  }
+
+  private newWatchdog(run: AbortController, onExpire: () => void): TurnWatchdog {
     const idleTimeoutMs = this.config.taskTimeoutSeconds * 1000
     const hardCapMs = (this.config.taskHardCapSeconds ?? DEFAULT_TASK_HARD_CAP_SECONDS) * 1000
-    let lastProgressAt = startedAt
-    let lastActivity: string | undefined
-    let timeoutKind: TaskTimeoutKind | undefined
-    let watchdog: ReturnType<typeof setTimeout> | undefined
+    return new TurnWatchdog(idleTimeoutMs, hardCapMs, run, onExpire)
+  }
 
-    const timeoutSnapshot = () => ({
-      kind: timeoutKind ?? 'idle' as TaskTimeoutKind,
-      elapsedMs: Date.now() - startedAt,
-      idleMs: Date.now() - lastProgressAt,
-      hardCapMs,
-      lastActivity,
-    })
-
-    function checkDeadline() {
-      if (run.signal.aborted) return
-      const now = Date.now()
-      if (now - startedAt >= hardCapMs) {
-        timeoutKind = 'hard_cap'
-        run.abort(); stopTurn(); return
-      }
-      if (now - lastProgressAt >= idleTimeoutMs) {
-        timeoutKind = 'idle'
-        run.abort(); stopTurn(); return
-      }
-      armWatchdog()
+  private async *observeLoop(
+    sessionId: string, directory: string | undefined, promptId: string, signal: AbortSignal,
+    run: AbortController, opts: ObserveTurnOptions, watchdog: TurnWatchdog | undefined,
+  ): AsyncGenerator<TurnEvent> {
+    const st: LoopState = {
+      sessionId, directory, promptId, taskId: opts.taskId ?? promptId, identity: !!opts.identity, watchdog,
+      permissions: new Set(), foreign: new Set(), promptSeen: false, pollFailures: 0,
     }
-
-    function armWatchdog() {
-      if (run.signal.aborted) return
-      clearTimeout(watchdog)
-      const now = Date.now()
-      const idleIn = lastProgressAt + idleTimeoutMs - now
-      const hardIn = startedAt + hardCapMs - now
-      watchdog = setTimeout(checkDeadline, Math.max(1, Math.min(idleIn, hardIn)))
-    }
-
-    /** Any turn activity postpones the idle timeout; only real progress should call this. */
-    function markProgress(label: string) {
-      lastProgressAt = Date.now()
-      lastActivity = label
-      armWatchdog()
-    }
-
-    armWatchdog()
     const pollInterval = this.config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
     let sseConnected = false
-    const events = this.openEventStream(task, run.signal, () => { sseConnected = true }, directory)
+    const sse = new AbortController()
+    const stopSse = () => sse.abort()
+    run.signal.addEventListener('abort', stopSse, { once: true })
+    const events = this.openEventStream(sessionId, sse.signal, () => { sseConnected = true }, directory)
     // Exactly one read remains pending across poll ticks. Racing a new next()
     // each tick queues reads in the generator and silently consumes events.
-    let pendingEvent: Promise<IteratorResult<AgentEvent>> | undefined
+    let pendingEvent: Promise<IteratorResult<RawOpenCodeEvent>> | undefined
     let exhausted = false
-    const permissions = new Set<string>()
     let tickTimer: ReturnType<typeof setTimeout> | undefined
     let tick: Promise<'poll'> | undefined
     const cancellation = new Promise<'cancel'>(resolve => {
+      if (run.signal.aborted) resolve('cancel')
       run.signal.addEventListener('abort', () => resolve('cancel'), { once: true })
     })
     try {
-      try {
-        await this.requestJson(this.paths.promptAsync(task.sessionId), {
-          method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ messageID: promptId, parts: [{ type: 'text', text: task.prompt }] }),
-          signal: run.signal,
-        }, { directory })
-      } catch (error) {
-        if (run.signal.aborted) {
-          yield signal.aborted ? { type: 'task.aborted', taskId: task.taskId } : this.timeoutEvent(task, sseConnected, timeoutSnapshot())
-          return
-        }
-        if (error instanceof OpenCodeError) {
-          const reason = isMissingOpenCodeSession(error) && await this.sessionMissing(task.sessionId, run.signal, directory) ? 'session_missing'
-            : error.status === 429 ? 'rate_limited' : error.status === 503 ? 'capacity_exhausted' : 'backend_unavailable'
-          yield { type: 'task.failed', taskId: task.taskId, reason }; return
-        }
-        // Lost acknowledgement is ambiguous: the server may have accepted the
-        // prompt. Observe this exact message ID, never POST the prompt twice.
-        this.config.onWarn?.(`opencode: prompt acknowledgement unavailable; observing ${promptId}: ${error}`)
-      }
       while (!run.signal.aborted) {
         if (!exhausted && !pendingEvent) pendingEvent = events.next().catch(() => ({ done: true, value: undefined }))
         if (!tick) tick = new Promise(resolve => { tickTimer = setTimeout(() => resolve('poll'), pollInterval) })
-        const result = await Promise.race([
-          ...(pendingEvent ? [pendingEvent] : []), tick, cancellation,
-        ])
+        const result = await Promise.race([...(pendingEvent ? [pendingEvent] : []), tick, cancellation])
         if (result === 'cancel') break
         if (result !== 'poll') {
           pendingEvent = undefined
           if (result.done) { exhausted = true; continue }
-          const event = result.value
-          // Liveness only (these are not forwarded to the router yet): any
-          // tool/text activity in this directory-scoped stream proves the turn
-          // is still moving, so the no-progress timeout must not fire. Events
-          // from other turns in the same session can only make the timeout more
-          // lenient here, never terminate our turn early.
-          if (event.type === 'tool.started') markProgress(`工具 ${event.toolName}`)
-          else if (event.type === 'tool.completed') markProgress(`工具 ${event.toolName} 完成`)
-          else if (event.type === 'tool.failed') markProgress(`工具 ${event.toolName} 失败`)
-          else if (event.type === 'text.delta') markProgress('文本输出')
-          // Session-wide idle/error events have no turn identity. The message
-          // list plus idle status, not these potentially stale events, decides completion.
-          if (event.type === 'permission.requested' && !permissions.has(event.requestId)) {
-            markProgress(`授权请求：${event.toolName}`)
-            permissions.add(event.requestId)
-            if (directory) this.permissionDirectories.set(event.requestId, directory)
-            yield event
-          }
+          yield* this.fromSse(result.value, st)
           continue
         }
         tick = undefined
-        // Permission polling also recovers requests missed before SSE connected
-        // or during a dropped stream. Older servers may not offer /permission.
-        try {
-          const pending = await this.requestJson('/permission', { signal: run.signal }, { directory })
-          for (const raw of Array.isArray(pending) ? pending : []) {
-            if (raw.sessionID !== task.sessionId || permissions.has(raw.id)) continue
-            const event = normalizeOpenCodeEvent({ type: 'permission.asked', properties: raw }, task.taskId)
-            if (event?.type !== 'permission.requested') continue
-            markProgress(`授权请求：${event.toolName}`)
-            permissions.add(event.requestId)
-            if (directory) this.permissionDirectories.set(event.requestId, directory)
-            yield event
-          }
-        } catch { /* supplementary endpoint; status/message polling remains authoritative */ }
-        try {
-          const status = await this.requestJson(STATUS_PATH, { signal: run.signal }, { directory }) as Record<string, SessionStatus | undefined>
-          if (!status?.[task.sessionId] || status[task.sessionId]?.type === 'idle') {
-            const finalized = await this.finalizeFromMessages(task, directory, promptId, run.signal)
-            if (finalized && !run.signal.aborted) { yield* finalized; return }
-          }
-        } catch (error) {
-          if (isMissingOpenCodeSession(error) && error instanceof OpenCodeError && error.path === this.paths.messages(task.sessionId) && await this.sessionMissing(task.sessionId, run.signal, directory)) {
-            yield { type: 'task.failed', taskId: task.taskId, reason: 'session_missing' }; return
-          }
-          this.config.onWarn?.(`opencode adapter: polling ${task.sessionId} failed: ${error}`)
-        }
+        yield* this.permissionPoll(st, run.signal)
+        const terminal = yield* this.statusPoll(st, run.signal, opts.maxConsecutivePollFailures)
+        if (terminal) return
       }
-      yield signal.aborted ? { type: 'task.aborted', taskId: task.taskId } : this.timeoutEvent(task, sseConnected, timeoutSnapshot())
+      yield signal.aborted || !watchdog
+        ? { type: 'task.aborted', taskId: st.taskId }
+        : this.timeoutEvent(st.taskId, sseConnected, watchdog.snapshot())
     } finally {
-      clearTimeout(watchdog)
       clearTimeout(tickTimer)
-      signal.removeEventListener('abort', onAbort)
-      run.abort()
+      sse.abort()
+      run.signal.removeEventListener('abort', stopSse)
       await events.return?.(undefined).catch(() => {})
-      for (const id of permissions) this.permissionDirectories.delete(id)
+      for (const id of st.permissions) this.permissionDirectories.delete(id)
+    }
+  }
+
+  /** Turns one SSE event into loop output. Chat only forwards permissions; identity mode adds snapshots/tools/acceptance. */
+  private *fromSse(raw: RawOpenCodeEvent, st: LoopState): Generator<TurnEvent> {
+    const event = normalizeOpenCodeEvent(raw, st.taskId)
+    // Liveness: any tool/text activity in this directory-scoped stream proves
+    // the turn is still moving, so the no-progress timeout must not fire.
+    // Session-wide idle/error events have no turn identity; the message list
+    // plus idle status, not these potentially stale events, decides completion.
+    if (event?.type === 'tool.started') st.watchdog?.markProgress(`工具 ${event.toolName}`)
+    else if (event?.type === 'tool.completed') st.watchdog?.markProgress(`工具 ${event.toolName} 完成`)
+    else if (event?.type === 'tool.failed') st.watchdog?.markProgress(`工具 ${event.toolName} 失败`)
+    else if (event?.type === 'text.delta') st.watchdog?.markProgress('文本输出')
+    const identified = st.identity ? normalizeTurnIdentityEvent(raw, st.promptId, st.taskId, st.foreign) : null
+    if (identified?.type === 'prompt.accepted') {
+      if (!st.promptSeen) { st.promptSeen = true; yield identified }
+      return
+    }
+    if (identified && identified.type !== 'permission.requested') { yield identified; return }
+    const permission = identified ?? event
+    if (permission?.type === 'permission.requested') yield* this.newPermission(permission, st)
+  }
+
+  private *newPermission(event: Extract<TurnEvent, { type: 'permission.requested' }>, st: LoopState): Generator<TurnEvent> {
+    if (st.permissions.has(event.requestId)) return
+    st.watchdog?.markProgress(`授权请求：${event.toolName}`)
+    st.permissions.add(event.requestId)
+    if (st.directory) this.permissionDirectories.set(event.requestId, st.directory)
+    yield event
+  }
+
+  /** Permission polling also recovers requests missed before SSE connected or during a dropped stream. */
+  private async *permissionPoll(st: LoopState, signal: AbortSignal): AsyncGenerator<TurnEvent> {
+    let pending: unknown
+    try {
+      pending = await this.requestJson('/permission', { signal }, { directory: st.directory })
+    } catch { return /* supplementary endpoint (older servers lack it); status/message polling remains authoritative */ }
+    for (const raw of Array.isArray(pending) ? pending : []) {
+      if (raw?.sessionID !== st.sessionId || st.permissions.has(raw.id)) continue
+      const asRaw = { type: 'permission.asked', properties: raw }
+      const event = st.identity ? normalizeTurnIdentityEvent(asRaw, st.promptId, st.taskId, st.foreign) : normalizeOpenCodeEvent(asRaw, st.taskId)
+      if (event?.type === 'permission.requested') yield* this.newPermission(event, st)
+    }
+  }
+
+  /** One status/message poll. Returns true once a terminal event has been yielded. */
+  private async *statusPoll(st: LoopState, signal: AbortSignal, maxFailures: number | undefined): AsyncGenerator<TurnEvent, boolean> {
+    try {
+      const status = await this.requestJson(STATUS_PATH, { signal }, { directory: st.directory }) as StatusMap
+      const busy = isSessionBusy(status, st.sessionId)
+      // Chat only reads messages once idle; identity mode also looks for its own prompt message while busy.
+      if (busy && !(st.identity && !st.promptSeen)) { st.pollFailures = 0; return false }
+      const messages = await this.fetchMessagesForPoll(st, signal)
+      if (!messages) return yield* this.pollFailed(st, maxFailures, 'message list unavailable')
+      st.pollFailures = 0
+      if (st.identity && !st.promptSeen && hasPromptMessage(messages, st.promptId)) {
+        st.promptSeen = true
+        yield { type: 'prompt.accepted', taskId: st.taskId, messageId: st.promptId }
+      }
+      if (busy) return false
+      const finalized = finalizeTurn(messages, st.promptId, st.taskId, st.identity)
+      if (!finalized || signal.aborted) return false
+      yield* finalized
+      return true
+    } catch (error) {
+      if (isMissingOpenCodeSession(error) && error instanceof OpenCodeError && error.path === this.paths.messages(st.sessionId) && await this.sessionMissing(st.sessionId, signal, st.directory)) {
+        yield { type: 'task.failed', taskId: st.taskId, reason: 'session_missing' }
+        return true
+      }
+      this.config.onWarn?.(`opencode adapter: polling ${st.sessionId} failed: ${error}`)
+      return yield* this.pollFailed(st, maxFailures, String(error))
+    }
+  }
+
+  private async *pollFailed(st: LoopState, maxFailures: number | undefined, detail: string): AsyncGenerator<TurnEvent, boolean> {
+    st.pollFailures++
+    if (!maxFailures || st.pollFailures < maxFailures) return false
+    yield { type: 'task.failed', taskId: st.taskId, reason: 'observation_lost', detail }
+    return true
+  }
+
+  /** Message list for a poll; null on a transient failure. A missing session is rethrown. */
+  private async fetchMessagesForPoll(st: LoopState, signal: AbortSignal): Promise<RawMessage[] | null> {
+    try {
+      return await this.listMessages(st.sessionId, st.directory, signal)
+    } catch (e) {
+      if (isMissingOpenCodeSession(e)) throw e
+      this.config.onWarn?.(`opencode adapter: fetching messages for ${st.sessionId} failed: ${e}`)
+      return null
     }
   }
 
@@ -410,91 +488,25 @@ export class OpenCodeAdapter implements AgentAdapter {
     } catch (error) { return isMissingOpenCodeSession(error) }
   }
 
-  private timeoutEvent(
-    task: AgentTask,
-    sseConnected: boolean,
-    timeout: { kind: TaskTimeoutKind; elapsedMs: number; idleMs: number; hardCapMs: number; lastActivity?: string },
-  ): AgentEvent {
+  private timeoutEvent(taskId: string, sseConnected: boolean, timeout: TimeoutSnapshot): AgentEvent {
     // Preserve the diagnostic distinguishing unavailable SSE; pending
     // permissions are additionally recovered through short /permission polls.
     // `detail` tells the user *why* the turn was reclaimed (no progress vs the
     // absolute ceiling) and what it was doing last, instead of a bare reason.
     return {
       type: 'task.failed',
-      taskId: task.taskId,
+      taskId,
       reason: sseConnected ? 'task_timeout' : 'task_timeout_no_event_stream',
       detail: describeTaskTimeout(timeout),
     }
   }
 
-  /**
-   * Once the session is idle, the whole turn's result lives in the message
-   * list — a multi-step turn creates several assistant messages sharing one
-   * `parentID` (the user message id we supplied), and each carries its own
-   * tool parts/attachments. Merging them is what makes earlier steps (e.g. a
-   * screenshot taken before the final text summary) visible; the final text
-   * specifically comes from the LAST assistant message so the user sees the
-   * summary rather than intermediate reasoning.
-   *
-   * Returns null when the turn's messages aren't available yet (caller keeps
-   * polling), and a task.failed event if the turn ended in an error.
-   */
-  private async finalizeFromMessages(
-    task: AgentTask,
-    directory: string | undefined,
-    promptId: string,
-    signal: AbortSignal,
-  ): Promise<AgentEvent[] | null> {
-    let messages: RawMessage[]
-    try {
-      messages = await this.requestJson(this.paths.messages(task.sessionId), { signal }, { directory }) as RawMessage[]
-    } catch (e) {
-      if (isMissingOpenCodeSession(e)) throw e
-      this.config.onWarn?.(`opencode adapter: fetching messages for ${task.sessionId} failed: ${e}`)
-      return null
-    }
-    const turn = selectTurnMessages(Array.isArray(messages) ? messages : [], promptId)
-    if (!turn.length) return null
-
-    const lastMessage = turn[turn.length - 1]
-    const errored = turn.map(m => m.info?.error).find(Boolean)
-    if (!errored && (typeof lastMessage.info?.time?.completed !== 'number' || lastMessage.info.finish === 'tool-calls')) return null
-    const out: AgentEvent[] = []
-
-    for (const part of turn.flatMap(m => m.parts ?? [])) {
-      if (part?.type !== 'tool') continue
-      const toolName = String(part.tool ?? 'unknown')
-      const completed = part.state?.status === 'completed'
-      if (completed) out.push({ type: 'tool.completed', taskId: task.taskId, toolName })
-      else if (part.state?.status === 'error') out.push({ type: 'tool.failed', taskId: task.taskId, toolName, error: String(part.state.error ?? 'tool failed') })
-      if (!completed) continue // a failed tool's attachments (if any) may be partial/garbage — don't forward them
-      // Tools that produce a file (e.g. a browser screenshot MCP tool) attach it
-      // as a `data:` URI on the tool's own state — confirmed against a real
-      // opencode serve response; there's no separate top-level `file` message
-      // part the way the OpenAPI FilePart schema might suggest.
-      for (const att of part.state?.attachments ?? []) {
-        if (att?.type === 'file' && typeof att.mime === 'string' && typeof att.url === 'string' && att.url.startsWith('data:')) {
-          out.push({ type: 'attachment.completed', taskId: task.taskId, mime: att.mime, dataUrl: att.url, filename: att.filename })
-        }
-      }
-    }
-
-    // Already completed tool artifacts remain useful even if a later model
-    // step failed; let the router flush them before reporting the error.
-    if (errored) return [...out, { type: 'task.failed', taskId: task.taskId, reason: errorMessage(errored) }]
-    const last = turn[turn.length - 1]
-    const text = (last.parts ?? []).filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text as string).join('')
-    if (text) out.push({ type: 'text.completed', taskId: task.taskId, text })
-    out.push({ type: 'session.idle', taskId: task.taskId })
-    return out
-  }
-
   private async *openEventStream(
-    task: AgentTask,
+    sessionId: string,
     signal: AbortSignal,
     onConnected: () => void,
     directory: string | undefined,
-  ): AsyncGenerator<AgentEvent> {
+  ): AsyncGenerator<RawOpenCodeEvent> {
     let res: Response
     try {
       // /event is directory-scoped: without ?directory= it silently never
@@ -511,30 +523,62 @@ export class OpenCodeAdapter implements AgentAdapter {
         const { done, value } = await reader.read()
         if (done) return
         for (const raw of buf.push(decoder.decode(value, { stream: true }))) {
-          const rawEvent = raw as RawEvent
-          if (!belongsToSession(rawEvent, task.sessionId)) continue
-          const normalized = normalizeOpenCodeEvent(rawEvent, task.taskId)
-          if (normalized) yield normalized
+          const rawEvent = raw as RawOpenCodeEvent
+          if (belongsToSession(rawEvent, sessionId)) yield rawEvent
         }
       }
     } catch {
-      // reader aborted (task finished/aborted) or connection dropped — send()'s
+      // reader aborted (turn finished/aborted) or connection dropped — the
       // status poll is the authoritative completion path in either case.
     } finally {
       reader.cancel().catch(() => {})
     }
   }
 
+  /** GET /session/{id}/message. Throws OpenCodeError (404/410 = missing session) or a network error. */
+  async listMessages(sessionId: string, directory: string | undefined, signal?: AbortSignal): Promise<RawMessage[]> {
+    const messages = await this.requestJson(this.paths.messages(sessionId), { signal }, { directory })
+    return Array.isArray(messages) ? messages as RawMessage[] : []
+  }
+
+  /** GET /session/status for `directory`: sessionId -> status; sessions absent from the map are idle. */
+  async sessionStatus(directory: string | undefined, signal?: AbortSignal): Promise<StatusMap> {
+    const status = await this.requestJson(STATUS_PATH, { signal }, { directory })
+    return status && typeof status === 'object' ? status as StatusMap : {}
+  }
+
+  /** Where is the turn started by `messageId`? Read-only; never sends input. */
+  async locateTurn(sessionId: string, directory: string | undefined, messageId: string, signal?: AbortSignal): Promise<TurnLocation> {
+    try {
+      await this.requestJson(this.paths.session(sessionId), { signal }, { directory })
+      const messages = await this.listMessages(sessionId, directory, signal)
+      const status = await this.sessionStatus(directory, signal)
+      return classifyTurn(messages, messageId, isSessionBusy(status, sessionId))
+    } catch (error) {
+      return isMissingOpenCodeSession(error) ? 'missing' : 'unreachable'
+    }
+  }
+
   async abort(sessionId: string, _taskId: string): Promise<void> {
-    await this.requestJson(this.paths.abort(sessionId), { method: 'POST' }, { directory: this.directories.get(sessionId) })
+    await this.abortSession(sessionId, this.directories.get(sessionId))
+  }
+
+  /** POST /session/{id}/abort for exactly this session. */
+  async abortSession(sessionId: string, directory: string | undefined): Promise<void> {
+    await this.requestJson(this.paths.abort(sessionId), { method: 'POST' }, { directory })
   }
 
   async respondPermission(requestId: string, decision: PermissionDecision): Promise<void> {
+    await this.replyPermission(requestId, decision.behavior === 'allow' ? 'once' : 'reject', this.permissionDirectories.get(requestId))
+  }
+
+  /** POST /permission/{id}/reply. Throws on a non-2xx response or a network error. */
+  async replyPermission(requestId: string, reply: 'once' | 'reject', directory: string | undefined): Promise<void> {
     await this.requestJson(this.paths.respondPermission(requestId), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ reply: decision.behavior === 'allow' ? 'once' : 'reject' }),
-    }, { directory: this.permissionDirectories.get(requestId) })
+      body: JSON.stringify({ reply }),
+    }, { directory })
   }
 
   async getFinalMessage(sessionId: string, taskId: string): Promise<FinalMessage> {

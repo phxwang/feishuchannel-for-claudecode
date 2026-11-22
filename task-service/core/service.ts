@@ -50,7 +50,7 @@ export class TaskService {
       store: o.store, committer: this.committer, clock: o.clock, registry: o.registry, runRoot: o.runRoot, log: o.log,
       releaseGraceMs: o.releaseGraceMs ?? 5000, reconcileRetryMs: o.reconcileRetryMs ?? 30_000, maxConcurrentTasks: o.maxConcurrentTasks,
     })
-    this.committer.onCommitted = task => armTimer(this.engine, task)
+    this.committer.onCommitted = task => { if (!this.stopped) armTimer(this.engine, task) }
     this.ops = new OperationRunner(o.store, o.clock)
     this.queries = new Queries(o.store, this.notifier)
     let id = o.store.getMeta('router_instance_id')
@@ -63,7 +63,9 @@ export class TaskService {
     try { await startupRecovery(this.engine) } finally { this.recovering = false }
   }
 
-  stop(): void { this.engine.stop() }
+  private stopped = false
+
+  stop(): void { this.stopped = true; this.engine.stop() }
 
   /** Tasks not CLOSED (including UNKNOWN) keep the router from idling out. */
   hasLiveWork(): boolean {

@@ -164,7 +164,7 @@ describe('permissions', () => {
     await waitFor(() => eventTypes(h, task.taskId).includes('permission.resolved'))
     expect(h.fake.log.permissionReplies).toEqual([{ backendRequestId: 'req-1', decision: 'allow_once' }])
     const again = await h.call('router_permission_reply', { ...base, idempotencyKey: 'p3', optionId: 'allow_once', expectedOwner: owner })
-    expect(['PERMISSION_STALE', 'VERSION_CONFLICT']).toContain(again.error?.code)
+    expect(['PERMISSION_STALE', 'VERSION_CONFLICT']).toContain(again.error?.code ?? '')
     await waitPhase(h, task.taskId, 'QUIESCENT')
     expect(h.fake.log.permissionReplies).toHaveLength(1)
   })

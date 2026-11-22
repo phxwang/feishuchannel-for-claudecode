@@ -142,6 +142,12 @@ export interface AgyProfileOptions {
   /** Overrides for tests; default ~/.gemini/antigravity-cli/brain and $TMPDIR/feishu-agy-tmux. */
   brainDir?: string
   signalRoot?: string
+  /** tmux session name for a session key. Default: agySessionNameFor (chat: key = workdir). The task service uses `rtask-<attemptId>`. */
+  sessionName?: (sessionKey: string) => string
+  /** Signal directory (FEISHU_AGY_SIGNAL_DIR) for a session key. Default: <signalRoot>/<chat session name>. */
+  signalDirFor?: (sessionKey: string) => string
+  /** Reuse a persisted conversation id on respawn. Default true (chat); the task service passes false. */
+  resumable?: boolean
 }
 
 export function createAgyProfile(options: AgyProfileOptions = {}): TmuxCliProfile {
@@ -149,17 +155,17 @@ export function createAgyProfile(options: AgyProfileOptions = {}): TmuxCliProfil
     ? options.bin
     : [options.bin ?? resolveBin('agy', [join(homedir(), '.local', 'bin', 'agy'), '/opt/homebrew/bin/agy', '/usr/local/bin/agy'])]
   const brainDir = options.brainDir ?? AGY_BRAIN_DIR
-  const signalDir = (workdir: string) => agySignalDirFor(workdir, options.signalRoot ?? SIGNAL_ROOT)
+  const signalDir = options.signalDirFor ?? ((workdir: string) => agySignalDirFor(workdir, options.signalRoot ?? SIGNAL_ROOT))
   return {
     kind: 'agy',
     label: 'Antigravity',
     midTurn: 'queue',
-    resumable: true,
+    resumable: options.resumable ?? true,
     startupTimeoutMs: 30_000,
     // Verified live: `/model` + Esc leaves no trace except the pane going idle.
     slashCommandIdleMs: 3_000,
 
-    sessionName: agySessionNameFor,
+    sessionName: options.sessionName ?? agySessionNameFor,
 
     /** Fresh signal dir per spawn, so a previous process's last.json/Stop.json can't be mistaken for this one's. */
     prepareSpawn(workdir: string) {
@@ -169,10 +175,10 @@ export function createAgyProfile(options: AgyProfileOptions = {}): TmuxCliProfil
       mkdirSync(dir, { recursive: true, mode: 0o700 })
     },
 
-    planSpawn(workdir: string, opts: SpawnOptions, resumeId?: string): SpawnPlan {
+    planSpawn(workdir: string, opts: SpawnOptions, resumeId?: string, sessionKey?: string): SpawnPlan {
       const [head, ...rest] = binArgv
       const argv = buildAgySpawnArgs(head, workdir, opts, resumeId)
-      return { argv: [argv[0], ...rest, ...argv.slice(1)], env: { [AGY_SIGNAL_ENV]: signalDir(workdir) } }
+      return { argv: [argv[0], ...rest, ...argv.slice(1)], env: { [AGY_SIGNAL_ENV]: signalDir(sessionKey ?? workdir) } }
     },
 
     isReady: (plainPane: string) => READY_RE.test(plainPane),

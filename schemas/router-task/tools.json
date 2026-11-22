@@ -1,0 +1,167 @@
+[
+  {
+    "name": "router_health",
+    "title": "health",
+    "description": "Report whether the task store is readable/writable and the service reachable. Says nothing about backend availability.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "router_capabilities",
+    "title": "capabilities",
+    "description": "List backends/modes with availability, features, permission modes, fallback triggers, and service limits.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "router_task_prepare",
+    "title": "task prepare",
+    "description": "Create a PREPARED task with a frozen assignment and policy. Never creates a backend session or sends input.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "router_task_get",
+    "title": "task get",
+    "description": "Read the current TaskSnapshot.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "router_task_lookup",
+    "title": "task lookup",
+    "description": "Find a task by clientId + clientTaskId (recovery path when a prepare reply was lost).",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "router_task_start",
+    "title": "task start",
+    "description": "Start a PREPARED task under a short-lived authorization. Accepted means durable intent, not backend success.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "router_events_read",
+    "title": "events read",
+    "description": "Read committed task events after a cursor; optional long poll up to 20 s. Never consumes or changes the task.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "router_task_result",
+    "title": "task result",
+    "description": "Read the current result: turns, attempts, evidence and cleanup. businessAcceptance is always not_evaluated.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "router_turn_text_read",
+    "title": "turn text read",
+    "description": "Read a turn's immutable final text by UTF-8 byte offsets.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "router_permission_reply",
+    "title": "permission reply",
+    "description": "Answer one pending permission request for the exact task, turn and owner (allow_once or deny_once).",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "router_task_seal",
+    "title": "task seal",
+    "description": "Forbid any further input or dispatch for this task. Does not interrupt an accepted turn.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "router_task_close",
+    "title": "task close",
+    "description": "Close a QUIESCENT task: release only its exact owner, without sending any prompt.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "router_task_cancel",
+    "title": "task cancel",
+    "description": "Record cancellation intent, interrupt the exact owner and finalize. Accepted is not completion; wait for CLOSED.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "router_task_add_turn",
+    "title": "task add turn",
+    "description": "Future capability (same-primary multi-turn). Returns UNSUPPORTED_CAPABILITY in this version.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "router_task_authorize",
+    "title": "task authorize",
+    "description": "Allow or deny the pending fallback transition request with a fresh grant. Does not select a backend.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  }
+]
