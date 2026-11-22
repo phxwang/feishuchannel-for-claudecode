@@ -5,14 +5,12 @@
 import { chmodSync, existsSync, lstatSync, unlinkSync } from 'fs'
 import { createServer, type Server, type Socket } from 'net'
 import type { TaskService } from '../core/service'
-import { frame, LineBuffer, type IpcRequest, type PermissionAskParams } from './protocol'
+import { frame, LineBuffer, type IpcRequest } from './protocol'
 
 export interface IpcServerOptions {
   socketPath: string
   service: TaskService
   log: (msg: string) => void
-  /** Handler for the Claude permission relay; undefined = method unavailable. */
-  permissionAsk?: (p: PermissionAskParams, signal: AbortSignal) => Promise<unknown>
 }
 
 export class IpcServer {
@@ -86,9 +84,6 @@ export class IpcServer {
         if (r.kind === 'ok') return { resource: r.data }
         return { resourceError: r }
       }
-      case 'permission.ask':
-        if (!this.o.permissionAsk) throw new Error('permission relay unavailable')
-        return this.o.permissionAsk(p as unknown as PermissionAskParams, signal)
       case 'admin.inspect': return svc.adminInspect(String(p.taskId))
       case 'admin.release': return svc.adminRelease(String(p.taskId), String(p.note ?? ''))
       default: throw new Error(`unknown method ${String(req.method)}`)

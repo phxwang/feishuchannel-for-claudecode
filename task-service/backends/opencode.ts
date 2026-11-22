@@ -26,6 +26,12 @@ export interface OpenCodeTaskBackendOptions {
   /** Consecutive failed polls before observe() reports `lost`. Default 120. */
   maxConsecutivePollFailures?: number
   now?: () => number
+  /**
+   * The router's per-workdir session lookup (same binding store chat uses).
+   * When set, tasks on the same workdir reuse that workdir's OpenCode session
+   * instead of creating a new one per attempt.
+   */
+  sessionFor?: (directory: string, signal?: AbortSignal) => Promise<string>
 }
 
 const DEFAULT_HEALTH_TTL_MS = 10_000
@@ -50,19 +56,21 @@ export class OpenCodeTaskBackend implements TaskBackend {
   private readonly releasePollMs: number
   private readonly maxPollFailures: number
   private readonly now: () => number
+  private readonly sessionFor: OpenCodeTaskBackendOptions['sessionFor']
 
   constructor(private readonly adapter: OpenCodeAdapter, opts: OpenCodeTaskBackendOptions = {}) {
     this.healthTtlMs = opts.healthTtlMs ?? DEFAULT_HEALTH_TTL_MS
     this.releasePollMs = opts.releasePollMs ?? DEFAULT_RELEASE_POLL_MS
     this.maxPollFailures = opts.maxConsecutivePollFailures ?? DEFAULT_MAX_POLL_FAILURES
     this.now = opts.now ?? Date.now
+    this.sessionFor = opts.sessionFor
   }
 
   async capabilities(): Promise<BackendCapabilities> {
     const fresh = this.health && this.now() - this.health.atMs < this.healthTtlMs ? this.health : await this.probe()
     return {
       kind: this.kind, mode: this.mode, available: fresh.healthy, availabilityReason: fresh.healthy ? null : (fresh.detail ?? 'unhealthy'),
-      features: { isolatedSession: true, samePrimaryTurns: false, recoverAcceptedTurn: true, permissionReply: true, cancel: true, eventReplay: true },
+      features: { isolatedSession: !this.sessionFor, samePrimaryTurns: false, recoverAcceptedTurn: true, permissionReply: true, cancel: true, eventReplay: true },
       permissionModes: ['broker', 'backend_policy'],
       fallback: {
         orderedFallback: true, supportedFallbackTriggers: TRIGGERS,
@@ -79,7 +87,11 @@ export class OpenCodeTaskBackend implements TaskBackend {
   async open(ctx: AttemptContext, signal: AbortSignal): Promise<OpenResult> {
     const directory = ctx.workdir.canonicalPath
     try {
-      const sessionId = await this.adapter.createSessionIn(directory, signal)
+      const sessionId = this.sessionFor ? await this.sessionFor(directory, signal) : await this.adapter.createSessionIn(directory, signal)
+      // A shared per-workdir session must not take a second input while a turn runs (it would be merged into that turn).
+      if (this.sessionFor && isSessionBusy(await this.adapter.sessionStatus(directory), sessionId)) {
+        return notSent('backend_unavailable', `OpenCode session ${sessionId} for this workdir is busy`, true)
+      }
       const handle: BackendHandle = {
         backendSessionId: sessionId, backendTurnId: nextPromptId(),
         pid: null, pgid: null, processStartIdentity: null, extra: { directory },

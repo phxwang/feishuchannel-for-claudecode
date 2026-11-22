@@ -26,7 +26,7 @@ How to enable, use, observe, disable and roll back the router task service and i
        requireGitWorktree: false
      backends:
        opencode: { models: ["deepseek/deepseek-flash"] }   # endpoint/password from agents.opencode
-       claude:   { models: ["opus", "sonnet"], permissionPromptTool: true }
+       claude:   { models: ["opus", "sonnet"] }
        codex:    { models: ["gpt-5.5-codex"], sandbox: workspace-write }
        agy:      { models: ["<agy model id>"] }
    ```
@@ -105,8 +105,7 @@ UNKNOWN is an attention state. It never means success and never permits a second
    | Backend | What to check |
    |---|---|
    | OpenCode | Session status in `opencode serve` |
-   | Claude / Codex | `ps -p <pid> -o lstart=` matches `processStartIdentity`. `runs/<attempt>/stdout.jsonl` |
-   | agy | `tmux has-session -t rtask-<attempt>` |
+   | Claude / agy / Codex | The workdir's tmux session (`tmux ls`, `tmux capture-pane -p -t <session>`): confirm no turn is still running |
 
 3. Only once you have confirmed that nothing the task owns is still running:
 
@@ -134,12 +133,16 @@ An hourly job does the following:
 
 ## 9. Capability inventory (phase 1)
 
-| kind/mode | permission modes | before-delivery fallback triggers | Notes |
+All backends run through the router's existing execution objects. A task on a workdir uses that workdir's session (the same one chat uses), and a new workdir gets a new session.
+
+| kind/mode | permission modes | fallback triggers (before delivery) | notes |
 |---|---|---|---|
-| `opencode/http_sse` | broker, backend_policy | backend_unavailable, startup_failed, rate_limited, provider_unavailable | Shared `opencode serve`. Each attempt gets a new session. The session is kept after close. |
-| `claude/print` | broker (relay MCP), backend_policy | backend_unavailable, startup_failed | One detached `claude -p` per attempt |
-| `codex/exec` | backend_policy | backend_unavailable, startup_failed | One detached `codex exec --json` per attempt, under the configured sandbox |
-| `agy/tmux` | broker (dialogs), backend_policy | backend_unavailable, startup_failed | Dedicated `rtask-<attempt>` tmux session. Never idle-reaped. |
+| `opencode/http_sse` | broker, backend_policy | backend_unavailable, startup_failed, rate_limited, provider_unavailable | The router's `OpenCodeAdapter`. One session per workdir (`task:workdir:<dir>` binding). A busy session is refused. |
+| `claude/tmux` | broker (menus), backend_policy (auto-deny) | backend_unavailable, startup_failed | The router's `tmuxClaude`, shared with chat. A busy session is refused. |
+| `agy/tmux` | broker (menus), backend_policy (auto-deny) | backend_unavailable, startup_failed | The router's `tmuxAgy`, shared with chat. The quota cooldown is respected. |
+| `codex/tmux` | broker (menus), backend_policy (auto-deny) | backend_unavailable, startup_failed | The Codex profile on the shared tmux manager |
 | `fake/exec` | broker, backend_policy | all | Tests only (`backends.fake.enabled`) |
+
+A tmux turn in flight lives only in router memory. If the router restarts mid-turn, the task becomes UNKNOWN; use `router_task_cancel` or `admin.ts release`. Input is never resent.
 
 Not advertised in phase 1: clean-failure fallback, checkpoint handoff, same-owner reset resume, native `/goal`, multi-turn (`router_task_add_turn` returns `UNSUPPORTED_CAPABILITY`).

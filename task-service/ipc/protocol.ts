@@ -8,7 +8,7 @@
  *   ← {"id": 1, "error": {"message": "..."}}
  */
 
-export const IPC_METHODS = ['ping', 'tool', 'resource.read', 'permission.ask', 'admin.inspect', 'admin.release'] as const
+export const IPC_METHODS = ['ping', 'tool', 'resource.read', 'admin.inspect', 'admin.release'] as const
 export type IpcMethod = (typeof IPC_METHODS)[number]
 
 export interface IpcRequest { id: number; method: IpcMethod; params: Record<string, unknown> }
@@ -38,18 +38,4 @@ export class LineBuffer {
 
 export function frame(obj: unknown): string {
   return JSON.stringify(obj) + '\n'
-}
-
-/** Parameters of the Claude permission relay call (design doc §11.4). */
-export interface PermissionAskParams {
-  executionAttemptId: string
-  relayToken: string
-  toolUseId: string
-  toolName: string
-  input: Record<string, unknown>
-}
-
-export interface PermissionAskResult {
-  behavior: 'allow' | 'deny'
-  message?: string
 }

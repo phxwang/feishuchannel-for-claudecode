@@ -30,8 +30,6 @@ export const taskServiceConfigSchema = z.object({
     claude: z.object({
       bin: z.string().min(1).nullable().optional(),
       models,
-      permissionPromptTool: z.boolean().default(true),
-      strictMcpConfig: z.boolean().default(false),
       maxConcurrentTasks: cap,
     }).strict().optional(),
     codex: z.object({

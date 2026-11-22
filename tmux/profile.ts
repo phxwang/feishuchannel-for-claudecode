@@ -79,12 +79,10 @@ export interface TmuxCliProfile {
    */
   isLocalCommandResult?(line: string): boolean
 
-  /** tmux session name for a session key (the workdir for chat; see TmuxCliManager.ensureSession's sessionKey). */
   sessionName(workdir: string): string
-  /** Called right before spawning a fresh tmux session (e.g. to clear stale signal files). Receives the session key. */
+  /** Called right before spawning a fresh tmux session (e.g. to clear stale signal files). */
   prepareSpawn?(workdir: string): void
-  /** `workdir` is the start directory; `sessionKey` (default = workdir) is what per-session state like signal dirs is keyed by. */
-  planSpawn(workdir: string, opts: SpawnOptions, resumeId?: string, sessionKey?: string): SpawnPlan
+  planSpawn(workdir: string, opts: SpawnOptions, resumeId?: string): SpawnPlan
   /** True once the CLI has booted far enough to accept typed input. */
   isReady(plainPane: string): boolean
 

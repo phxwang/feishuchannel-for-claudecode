@@ -42,8 +42,11 @@ import { decodeBase64DataUri } from './data-uri'
 import { TmuxClaudeManager } from './claude-tmux-worker'
 import { TmuxCliManager } from './tmux/manager'
 import { createAgyProfile } from './tmux/profiles/agy'
+import { resolveBin } from './tmux/profile'
 import { AGY_QUOTA_COOLDOWN_MS, isAgyQuotaError } from './tmux/agy-errors'
 import { createTmuxRouting, TMUX_BACKEND_NAMES, type AttachmentRef } from './tmux-route'
+import { startTaskService, type RunningTaskService } from './task-service'
+import { createTaskBackends } from './task-service/backends/factory'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -265,9 +268,10 @@ const IDLE_GRACE_MS = 10_000  // wait 10s before shutting down
 
 function scheduleIdleShutdown() {
   if (idleTimer) clearTimeout(idleTimer)
-  if (workers.size > 0) return
+  // Machine tasks (task MCP) are live work too: an unplanned exit would turn them UNKNOWN.
+  if (workers.size > 0 || taskService?.hasLiveWork()) return
   idleTimer = setTimeout(() => {
-    if (workers.size === 0) {
+    if (workers.size === 0 && !taskService?.hasLiveWork()) {
       dbg('all workers disconnected, shutting down')
       shutdown()
     }
@@ -1096,6 +1100,46 @@ sockServer.listen(SOCK_PATH, () => {
   dbg(`unix socket listening: ${SOCK_PATH}`)
 })
 
+// ── Router task MCP service (docs/router-task-mcp-design.md) ─────────────────
+// Inert unless agents.yaml sets taskService.enabled (or tasks are left to drain).
+// Fails closed: a task-service error never stops chat routing.
+let taskService: RunningTaskService | null = null
+if (infraConfig?.taskService) {
+  try {
+    taskService = await startTaskService({
+      input: infraConfig.taskService,
+      projects: Object.fromEntries(Object.entries(infraConfig.projects).map(([id, p]) => [id, { workdir: p.workdir, allowedAgents: [...p.allowedAgents] }])),
+      allowedRoots: AGENTS_ALLOWED_ROOTS,
+      stateDir: STATE_DIR,
+      log: dbg,
+      buildBackends: (cfg, paths) => createTaskBackends(cfg, paths, {
+        openCodeAdapter,
+        log: dbg,
+        // Same binding store + creation lock chat uses; keyed by workdir so tasks on one workdir share its session.
+        openCodeSessionFor: (dir) => getOrCreateOpenCodeSession(`task:workdir:${dir}`, { project: dir, workdir: dir } as NonNullable<ReturnType<typeof resolveRoute>>),
+        tmux: {
+          claude: {
+            manager: tmuxClaude,
+            bin: resolveBin('claude', [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude']),
+            spawnFor: (c) => ({ model: c.model }),
+          },
+          agy: {
+            manager: tmuxAgy,
+            bin: infraConfig?.agents.agy?.bin ?? resolveBin('agy', [join(homedir(), '.local', 'bin', 'agy'), '/opt/homebrew/bin/agy', '/usr/local/bin/agy']),
+            spawnFor: (c, workdir) => resolveAgySpawnOptions(infraConfig, workdir, { model: c.model }),
+            unavailableReason: (workdir) => degraded.isDegraded(agyDegradedKey(workdir)) ? 'Antigravity is in a quota cooldown' : null,
+            onStopError: (workdir, error) => {
+              if (isAgyQuotaError(error)) degraded.markDegraded(agyDegradedKey(workdir), Date.now() + AGY_QUOTA_COOLDOWN_MS)
+            },
+          },
+        },
+      }),
+    })
+  } catch (e) {
+    dbg(`task-service failed to start, task MCP unavailable: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
 const wsClient = new lark.WSClient({ appId: APP_ID, appSecret: APP_SECRET, loggerLevel: lark.LoggerLevel.warn })
 const dispatcher = new lark.EventDispatcher({ encryptKey: ENCRYPT_KEY }).register({
   'im.message.receive_v1': async (data: any) => {
@@ -1123,6 +1167,8 @@ let shuttingDown = false
 function shutdown() {
   if (shuttingDown) return; shuttingDown = true
   dbg('shutting down')
+  // Stops admission and closes task.sock; running tasks are reconciled on the next start.
+  try { taskService?.stop() } catch (e) { dbg(`task-service stop failed: ${e}`) }
   sockServer.close()
   try { unlinkSync(SOCK_PATH) } catch {}
   releaseRouterLock(LOCK_DIR)

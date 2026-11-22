@@ -1,6 +1,6 @@
 # Router Task MCP — Design
 
-Status: design draft for review. Nothing described here is implemented yet.
+Status: implemented on this branch. The backend sections (§11.4–11.6) were revised so that every backend reuses the router's own execution objects.
 Branch: `feat/router-task-mcp`. Date: 2026-11-22.
 
 Source requirements:
@@ -741,158 +741,41 @@ The native v2 coordinator (`v2-coordinator.ts`) is **not** used in phase 1, beca
 - It advertises every fallback capability, so the controller's `clean_failure` and `checkpoint_handoff` grant and blocked paths can be exercised. The fake checkpoint is a deterministic digest, not real handoff.
 - It can be enabled only through `taskService.backends.fake.enabled`, which tests set in a temporary `FEISHU_STATE_DIR`.
 
-### 11.4 Claude Code (`claude` / `print`)
+### 11.4 Claude Code, Antigravity and Codex: the router's own tmux sessions
 
-**Process launcher.** `task-service/backends/process-runner.ts` is shared with Codex. For each attempt it creates `task-service/runs/<executionAttemptId>/` (mode 0700) containing:
+Owner direction (2026-11-22): every backend reuses the router's existing execution logic, and the MCP is one more interface on top of it. A separate process model per CLI (for example `claude -p` or `codex exec`) is not used.
 
-- `prompt.txt` (0600)
-- `stdout.jsonl` and `stderr.log`, opened for append
-- `mcp.json`, written only when the permission relay is in use
+`task-service/backends/tmux-shared.ts` (`SharedTmuxBackend`) drives the **router's own `TmuxCliManager` instances**: `tmuxClaude`, `tmuxAgy`, and a Codex manager built from `tmux/profiles/codex.ts`. It calls them through the same `sendAndAwaitReply(workdir, text, options)` that the Feishu path (`tmux-route.ts`) uses. Only the presentation differs: the callbacks feed the task ledger instead of Feishu cards.
 
-It spawns the CLI with `Bun.spawn`. The child runs detached in a new process group, with `cwd` set to the canonical workdir and stdin, stdout and stderr connected to those files rather than to pipes. A router restart therefore cannot break the child's output with SIGPIPE.
+- **Sessions.** Sessions are keyed by workdir, exactly as for chat. A task on a workdir that already has a session reuses it. A task on a different workdir (for example a temporary one) gets its own session, which the manager creates on first use. Close and release never kill a session; they only end the task's own turn.
+- **Spawn options.** These come from the router's own resolution: the Claude model, and `resolveAgySpawnOptions` for agy. They apply only when a session is first spawned, the same as for chat.
+- **Busy sessions.** A busy session is refused before delivery with `not_sent backend_unavailable`, so a task never folds into, or queues behind, someone else's turn. That makes the refusal eligible for the ordered fallback.
+- **Delivery.** By the manager's contract, a throw from `sendAndAwaitReply` means the input never reached the CLI, so it becomes `not_sent startup_failed`. Any callback (text, progress, dialog), or the resolved reply, proves delivery.
+- **Events.** Streamed text chunks become `text` appends. Progress lines become `tool` started events, all completed at turn end. The resolved reply becomes `turn.ended completed` with the reply as final text. A CLI-reported stop error becomes `failed`.
+- **Router state.** The router's own unavailability state is respected: the agy quota cooldown in `DegradedTracker` is checked before dispatch, and a stop error is fed back to it. This is the same as chat.
+- **Dialogs.** The manager's `onDialog` callback is used.
+  - **broker:** a numbered menu with exactly one one-shot allow and one deny becomes `permission.requested`. The client's reply selects that option. Any other menu becomes `interaction.required`, which `router_task_cancel` resolves with Escape.
+  - **backend_policy:** the deny option is chosen automatically, with no prompt to anyone.
+- **Interrupt.** Escape on the workdir's session, which is what `/esc` does in chat.
+- **Restart.** A turn in flight exists only in router memory, so `recoverAcceptedTurn` is false. After a router restart, such a task becomes UNKNOWN (`locate` returns `unreachable`). It is resolved by `router_task_cancel` or by the operator `release`, and the input is never resent.
 
-Before spawning, the runner persists `{pid: null, state: "launching"}`. Right after spawning it persists `pid`, `pgid` and `processStartIdentity`. A crash between the two leaves `launching`, which recovery treats as UNKNOWN unless no process with the run directory's marker environment variable (`ROUTER_TASK_ATTEMPT=<id>`) can be found, as checked with `ps -E`.
+### 11.5 OpenCode: the router's adapter and session binding
 
-The environment is the router's environment minus the Feishu variables (`FEISHU_*`), plus `ROUTER_TASK_ATTEMPT`. The feishu plugin therefore starts in passive mode if it is loaded at all.
+`OpenCodeTaskBackend` wraps the router's `OpenCodeAdapter` (§11.2). It also takes a `sessionFor(directory)` that calls the router's own `getOrCreateOpenCodeSession`, with the same SQLite binding store and in-flight creation lock that chat uses, keyed `task:workdir:<dir>`. Tasks on the same workdir therefore share one OpenCode session, and a busy session is refused before delivery. Release aborts the task's own turn only if it is still running, and never deletes the session.
 
-**Command:**
+### 11.6 Per-backend summary
 
-```
-claude -p --output-format stream-json --verbose --include-partial-messages
-       --session-id <uuid persisted before spawn>
-       --model <candidate.model>
-       --permission-mode default
-       [broker]          --permission-prompts host --permission-prompt-tool mcp__router_task__permission --mcp-config runs/<id>/mcp.json
-       [backend_policy]  --permission-prompts none
-       [strictMcpConfig] --strict-mcp-config
-       < runs/<id>/prompt.txt
-```
+| | OpenCode `http_sse` | Claude / agy / Codex `tmux` |
+|---|---|---|
+| Execution object | router's `OpenCodeAdapter` | router's `TmuxCliManager` (per CLI) |
+| Session | one per workdir (`task:workdir:<dir>` binding) | one per workdir, shared with Feishu chat |
+| Turn identity | prompt `messageID` | `tmux:<executionAttemptId>` (in memory) |
+| Delivery proof | prompt_async 204, or the message found by ID | any manager callback, or the resolved reply |
+| Turn end proof | status idle + completed assistant messages | `sendAndAwaitReply` resolved (Stop hook + transcript, as in chat) |
+| Permissions | broker / backend_policy | broker (numbered menus) / backend_policy (auto-deny) |
+| Release | abort if busy; session kept | turn ended (Escape if needed); session kept |
+| Restart recovery | message lookup by ID | not recoverable: UNKNOWN, then cancel or operator release |
 
-All flag names were checked against `claude --help` on Claude Code 2.1.330. The exact interplay of `--permission-prompts host` with `--permission-prompt-tool` is checked in implementation step 7 before the broker capability is advertised.
-
-**Identity and delivery:**
-
-- `backendSessionId` is the `--session-id` UUID, and `backendTurnId` is the same UUID, since a single-turn attempt has one prompt.
-- Delivery is `accepted` once `stdout.jsonl` contains the `system/init` event for that session ID, because the prompt is read from stdin before init.
-- If the process exits before init with a non-zero code and no API activity, the failure is `startup_failed` with `not_sent`.
-- If the process exits or is killed after the spawn without an init event, delivery is `unknown`.
-
-**Observation:**
-
-- Partial `stream_event` text deltas produce `text.delta` events.
-- `tool_use` and `tool_result` blocks produce `tool.*` events keyed by `tool_use_id`.
-- The turn ends at the `result` event, using its `subtype` (`success` or `error_*`), `is_error`, `result` text and `stop_reason`, and then the process exits.
-- QUIESCENT requires all of the following: a `result` event, process exit, and no `tool_use` left without a `tool_result`.
-
-**Permission relay (broker mode).** `task-service/backends/claude-permission-mcp.ts` is a tiny stdio MCP server, started by Claude through `mcp.json`, exposing one tool, `permission`. On each call it:
-
-1. connects to `task.sock`
-2. sends `permission.ask {attemptId, toolUseId, toolName, inputDigest, redactedSummary}`
-3. blocks until the task service answers with the client's decision, or with `deny` on expiry or cancellation
-4. returns Claude's expected `{behavior: "allow" | "deny", …}`. On allow it passes back the original input unchanged.
-
-The relay is part of the task's owned process tree, and it never decides anything itself. If it loses the socket, it returns `deny`.
-
-**Interrupt:** SIGINT to the process group, then SIGKILL after the grace period (§9.10).
-
-### 11.5 Codex (`codex` / `exec`)
-
-**Command,** using the same process runner as §11.4:
-
-```
-codex exec --json
-       -m <candidate.model>
-       -C <canonical workdir>
-       -s <taskService.backends.codex.sandbox>        # read-only | workspace-write
-       -c approval_policy="never"
-       -o runs/<id>/last-message.txt
-       [non-git workdir] --skip-git-repo-check
-       -                                               # prompt from stdin (prompt.txt)
-```
-
-The flags were checked against `codex exec --help` on codex-cli 0.169.1. Treating `-` as "read the prompt from stdin", and the `approval_policy` key, are confirmed in implementation step 7.
-
-**Identity and delivery:**
-
-- `backendSessionId` is the `thread_id` from the first `thread.started` event, persisted when it is seen. It is not known before spawn, so the run directory and `ROUTER_TASK_ATTEMPT` serve as the identity until then.
-- `backendTurnId` is `<thread_id>:1`.
-- Delivery is `accepted` at `turn.started`.
-- An exit before `thread.started` with a non-zero code is `startup_failed` (`not_sent`). Anything ambiguous is `unknown`.
-
-**Observation:**
-
-- `item.started` and `item.completed` for `command_execution`, `file_change` and `mcp_tool_call` produce `tool.*` events.
-- `agent_message` items produce text.
-- `turn.completed` ends the turn as `completed`. `turn.failed` or a top-level `error` ends it as `failed`.
-- QUIESCENT requires all of the following: a terminal turn event, process exit, and no open item.
-
-**Permissions:** `codex exec` has no channel for answering approvals. The backend therefore advertises `permissionReply: false` and accepts only `permissionMode: "backend_policy"`. The sandbox decides what commands may do. `danger-full-access` and `--dangerously-bypass-approvals-and-sandbox` can never be configured.
-
-A later `codex/app_server` mode (Codex's experimental JSON-RPC app server, which does expose approval requests) is the route to brokered permissions for Codex.
-
-**Interrupt and release:** as in §11.4.
-
-### 11.6 Antigravity (`agy` / `tmux`)
-
-agy reuses the chat's tmux machinery:
-
-- `tmux/manager.ts` `TmuxCliManager`, which handles spawn, readiness, send-keys, reply collection, the dialog callbacks and `killSession`
-- `tmux/profiles/agy.ts`, which handles argv, transcript parsing, dialog parsing and the stop signal
-- `agy-plugin/hook.sh` Stop hooks
-
-It runs as a **separate** manager instance owned by the task service, so chat and task sessions never share a manager, a queue or an idle sweep.
-
-The changes are additive:
-
-1. **Separate key from cwd.** The manager currently uses `workdir` both as the tmux session key and as the start directory. An optional `sessionKey` is added to `ensureSession`, `sendAndAwaitReply` and `killSession`, defaulting to `workdir` so chat behaviour is unchanged. The task service passes `sessionKey = executionAttemptId` and `cwd = canonical workdir`.
-2. **Task profile wrapper.** `createAgyProfile` gets an options hook so the task instance uses:
-   - `sessionName = "rtask-" + executionAttemptId`
-   - a per-attempt signal directory under `task-service/runs/<id>/agy-signal/`, set through the same `FEISHU_AGY_SIGNAL_DIR` variable that `hook.sh` already reads
-   - `resumable = false`, so each attempt always gets a fresh conversation
-
-   `hook.sh` needs no change.
-3. **Persistence:** `{sessionName, conversationId, signalDir}` are stored in the attempt row and not in the chat `tmux_sessions` table.
-4. **Idle reaping:** the task manager instance is **never** added to the router's `killIdleSessions` sweep. Task sessions end only through close, cancel or a time limit.
-
-**Identity and delivery:**
-
-- `backendSessionId` is the tmux session name. The conversation ID is recorded when it is discovered.
-- `backendTurnId` is `<conversationId>:<USER_INPUT step index>`.
-- Delivery is `accepted` when the transcript shows the USER_INPUT step for this prompt (matched through the existing `isUserTurnStart` hook).
-- If the session fails to reach `isReady` before the startup timeout, the failure is `startup_failed` (`not_sent`).
-- If send-keys returned but no USER_INPUT step appears before the observation deadline, delivery is `unknown`.
-
-**Observation:** `parseProgress` and `parseText` produce events. The turn ends when the attempt's own `Stop.json` mtime advances after delivery. `afterStop` provides the reported error, and `tmux/agy-errors.ts` classifies it as a diagnostic only. QUIESCENT requires the Stop signal plus a settled background wait (the existing `background-tasks.ts` `BackgroundWait`).
-
-**Permissions:**
-
-- The manager's existing `onDialog` callback is wired to the task service instead of a Feishu card.
-- A dialog becomes `permission.requested` in broker mode only when it has one option that allows exactly once and one that denies. The answer is sent with the existing `selectOption`.
-- In backend_policy mode, agy runs with the configured `permissionMode` (e.g. `accept-edits` or `plan`), and any dialog that still appears is answered with the deny option and recorded as a `tool.failed` diagnostic.
-
-### 11.7 Per-backend summary
-
-| | OpenCode `http_sse` | Claude `print` | Codex `exec` | agy `tmux` |
-|---|---|---|---|---|
-| Owner | OpenCode session (shared serve is **not** the owner) | child process group | child process group | task tmux session `rtask-<attemptId>` |
-| Turn identity (persisted before submit) | prompt `messageID` | `--session-id` UUID | run dir + `ROUTER_TASK_ATTEMPT`, then `thread_id` | tmux session name, then conversation ID |
-| Delivery proof | prompt_async 204, or the message found by ID | `system/init` event | `turn.started` event | USER_INPUT transcript step |
-| Turn end proof | status idle + completed assistant messages with `parentID` | `result` event + exit | `turn.completed`/`turn.failed` + exit | own Stop signal + settled background wait |
-| Permissions | broker / backend_policy | broker (relay MCP) / backend_policy | backend_policy only | broker (dialog) / backend_policy |
-| Release | abort + status not busy | SIGINT → SIGKILL pgid, verified gone | same as Claude | kill own tmux session, verified gone |
-| Restart recovery | message lookup by ID | PID + start identity, tail output file | same as Claude | tmux has-session + Stop signal + transcript |
-| Exit code in results | `null` | real | real | `null` |
-
-All four backends pass the same contract test suite (`task-service/backends/contract.test.ts`), each run against its fake:
-
-- the existing mock OpenCode server
-- `tmux/test-fixtures/fake-claude.ts`, extended with a stream-json print mode
-- a new `fake-codex.ts` that emits the `exec --json` event shapes
-- `fake-agy.ts`
-
-A backend stays `available: false` in capabilities until its contract suite and its manual smoke test have both passed.
-
----
 
 ## 12. Fallback and recovery controller
 

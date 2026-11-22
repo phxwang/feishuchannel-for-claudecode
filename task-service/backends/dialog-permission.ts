@@ -1,5 +1,5 @@
 /**
- * Classifies a menu parsed off an agy pane for the task service (design doc
+ * Classifies a menu parsed off a tmux CLI pane for the task service (design doc
  * §9.8, §11.6). Only a numbered menu with exactly one one-shot allow option
  * and exactly one deny option is a brokerable permission request; anything
  * else needs a human at the terminal (`interaction.required`).

@@ -15,7 +15,6 @@ import { BackendRegistry } from './backends/registry'
 import { finalizeTaskServiceConfig, type TaskServiceConfig, type TaskServiceConfigInput } from './config'
 import { TaskService } from './core/service'
 import { IpcServer } from './ipc/server'
-import type { PermissionAskParams } from './ipc/protocol'
 import { TaskStore } from './store/task-store'
 import { systemClock } from './time'
 
@@ -27,8 +26,6 @@ export interface StartOptions {
   log: (msg: string) => void
   /** Build backends once the config is finalized (and the socket path is known). */
   buildBackends: (config: TaskServiceConfig, paths: TaskServicePaths) => TaskBackend[]
-  /** Optional permission relay handler (Claude print backend). */
-  permissionAsk?: (p: PermissionAskParams, signal: AbortSignal) => Promise<unknown>
 }
 
 export interface TaskServicePaths {
@@ -82,7 +79,7 @@ export async function startTaskService(o: StartOptions): Promise<RunningTaskServ
   })
   await service.start()
 
-  const ipc = new IpcServer({ socketPath: paths.socketPath, service, log: o.log, permissionAsk: o.permissionAsk })
+  const ipc = new IpcServer({ socketPath: paths.socketPath, service, log: o.log })
   await ipc.listen()
   o.log(`task-service: listening on ${paths.socketPath}${drain ? ' (drain mode)' : ''}`)
 

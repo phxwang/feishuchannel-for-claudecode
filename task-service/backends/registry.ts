@@ -10,7 +10,8 @@ import type { BackendCapabilities, TaskBackend } from './backend'
 
 /** Known combinations that exist in the contract vocabulary but have no task adapter yet. */
 const NOT_IMPLEMENTED: { kind: BackendKind; mode: BackendMode }[] = [
-  { kind: 'claude', mode: 'tmux' },
+  { kind: 'claude', mode: 'print' },
+  { kind: 'codex', mode: 'exec' },
   { kind: 'opencode', mode: 'acp' },
 ]
 
@@ -68,8 +69,8 @@ export class BackendRegistry {
     if (mode === 'broker') return null
     const b = this.config.backends
     switch (c.kind) {
-      case 'codex': return { kind: 'codex', sandbox: b.codex?.sandbox ?? 'workspace-write', approval: 'never' }
-      case 'claude': return { kind: 'claude', permissionPrompts: 'none', permissionMode: 'default' }
+      case 'codex': return { kind: 'codex', sandbox: b.codex?.sandbox ?? 'workspace-write', dialogs: 'deny' }
+      case 'claude': return { kind: 'claude', dialogs: 'deny' }
       case 'agy': return { kind: 'agy', permissionMode: b.agy?.permissionMode ?? null, dialogs: 'deny' }
       case 'opencode': return { kind: 'opencode', permissions: 'reject' }
       case 'fake': return { kind: 'fake' }
