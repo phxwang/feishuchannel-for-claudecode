@@ -1,7 +1,8 @@
 import { afterAll, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { mkdtempSync, realpathSync } from 'fs'
 import { join } from 'path'
-import { TmuxCliManager, type SendAndAwaitReplyOptions } from '../../tmux/manager'
+import { TmuxCliManager, type SendAndAwaitReplyOptions, type WaitEndReason } from '../../tmux/manager'
+import type { GoalState } from '../../tmux/goal'
 import { claudeProfile } from '../../tmux/profiles/claude'
 import type { TmuxCliProfile } from '../../tmux/profile'
 import type { Dialog } from '../../tmux/dialog'
@@ -22,15 +23,17 @@ function ctx(over: Partial<AttemptContext> = {}): AttemptContext {
 }
 
 /** Minimal stand-in for the router's manager: sendAndAwaitReply is scripted per test. */
-function stubManager(script: (opts: SendAndAwaitReplyOptions) => Promise<string>, busy = false) {
+function stubManager(script: (opts: SendAndAwaitReplyOptions) => Promise<string>, busy: boolean | (() => boolean) = false, goals = false) {
   const escapes: string[] = []
+  const lines: string[] = []
   const m = {
-    profile: { sessionName: (w: string) => `claude-${w.replace(/\W/g, '')}` },
-    isBusy: () => busy,
+    profile: { sessionName: (w: string) => `claude-${w.replace(/\W/g, '')}`, ...(goals ? { parseGoalSignal: () => null } : {}) },
+    isBusy: () => (typeof busy === 'function' ? busy() : busy),
     sendEscape: async (w: string) => { escapes.push(w) },
+    sendLine: async (_w: string, text: string) => { lines.push(text); return true },
     sendAndAwaitReply: (_w: string, _t: string, opts: SendAndAwaitReplyOptions) => script(opts),
   }
-  return { manager: m as unknown as TmuxCliManager, escapes }
+  return { manager: m as unknown as TmuxCliManager, escapes, lines }
 }
 
 async function collect(b: SharedTmuxBackend, c: AttemptContext, stopAfter = 50): Promise<BackendEvent[]> {
@@ -52,6 +55,107 @@ describe('SharedTmuxBackend (stub manager)', () => {
     expect(end.outcome).toBe('failed')
     expect(end.protocol.backendFinished).toBe(false)
     expect(end.protocol.stopReason).toContain('session_killed')
+  })
+
+  test('giving up on unconfirmed background subtasks (background_idle) is not a completion', async () => {
+    const { manager } = stubManager(async opts => { opts.onTextChunk?.('main reply'); opts.onWaitEnded?.('background_idle'); return 'main reply' })
+    const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+    const c = ctx({ executionAttemptId: 'xatt_bgidle' })
+    await b.submit(c, (await b.open(c) as any).handle, { inputKind: 'text', prompt: 'hi' })
+    const end = (await collect(b, c)).find(e => e.type === 'turn.ended') as any
+    expect(end.outcome).toBe('failed')
+    expect(end.protocol.backendFinished).toBe(false)
+    expect(end.protocol.stopReason).toContain('background_idle')
+  })
+
+  describe('native /goal', () => {
+    const goalRun = async (end: { reason: WaitEndReason; goal: GoalState }, goals = true) => {
+      const { manager } = stubManager(async opts => { opts.onTextChunk?.('Goal set: x'); opts.onWaitEnded?.(end.reason, { goal: end.goal }); return 'Goal set: x' }, false, goals)
+      const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+      const c = ctx({ executionAttemptId: `xatt_goal_${end.reason}_${end.goal}` })
+      const sub = await b.submit(c, (await b.open(c) as any).handle, { inputKind: 'native_goal', prompt: '/goal x' })
+      return { b, sub, end: sub.kind === 'pending' ? (await collect(b, c)).find(e => e.type === 'turn.ended') as any : null }
+    }
+
+    test('advertised only by profiles that can track goals', async () => {
+      const withGoals = new SharedTmuxBackend({ kind: 'claude', manager: stubManager(async () => '', false, true).manager, spawnFor: () => ({}), available: ok })
+      const without = new SharedTmuxBackend({ kind: 'agy', manager: stubManager(async () => '').manager, spawnFor: () => ({}), available: ok })
+      expect((await withGoals.capabilities()).fallback.nativeGoal).toBe(true)
+      expect((await without.capabilities()).fallback.nativeGoal).toBe(false)
+      expect((await goalRun({ reason: 'stop', goal: 'achieved' }, false)).sub).toMatchObject({ kind: 'not_sent', code: 'capability_unavailable' })
+    })
+
+    test('completed only when the goal was achieved', async () => {
+      const r = await goalRun({ reason: 'stop', goal: 'achieved' })
+      expect(r.end.outcome).toBe('completed')
+      expect(r.end.protocol.backendFinished).toBe(true)
+    })
+
+    test('a turn that ended without the goal achieved (cleared, interrupted, never set) is a failure', async () => {
+      for (const goal of ['cleared', 'interrupted', 'none'] as const) {
+        const r = await goalRun({ reason: 'stop', goal })
+        expect(r.end.outcome).toBe('failed')
+        expect(r.end.protocol.backendFinished).toBe(false)
+        expect(r.end.protocol.stopReason).toContain(`goal ${goal}`)
+      }
+    })
+
+    test('releasing a goal run that ended unachieved (e.g. reply timeout) disarms the goal: Escape, then /goal clear', async () => {
+      const { manager, escapes, lines } = stubManager(async opts => { opts.onWaitEnded?.('timeout', { goal: 'active' }); return '' }, false, true)
+      const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+      const c = ctx({ executionAttemptId: 'xatt_goal_timeout' })
+      const h = (await b.open(c) as any).handle
+      await b.submit(c, h, { inputKind: 'native_goal', prompt: '/goal x' })
+      expect(((await collect(b, c)).find(e => e.type === 'turn.ended') as any).outcome).toBe('failed')
+      const rel = await b.release(c, h, 100)
+      expect(rel.released).toBe(true)
+      expect(escapes).toEqual(['/w'])
+      expect(lines).toEqual(['/goal clear'])
+      expect(rel.detail).toContain('goal cleared')
+    })
+
+    test('an achieved or already-cleared goal is not touched on release', async () => {
+      for (const goal of ['achieved', 'cleared'] as const) {
+        const { manager, escapes, lines } = stubManager(async opts => { opts.onWaitEnded?.('stop', { goal }); return '' }, false, true)
+        const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+        const c = ctx({ executionAttemptId: `xatt_goal_rel_${goal}` })
+        const h = (await b.open(c) as any).handle
+        await b.submit(c, h, { inputKind: 'native_goal', prompt: '/goal x' })
+        await collect(b, c)
+        await b.release(c, h, 100)
+        expect(escapes).toEqual([])
+        expect(lines).toEqual([])
+      }
+    })
+
+    test('a session another caller is already using is not typed into on release', async () => {
+      let busy = false
+      const { manager, escapes, lines } = stubManager(async opts => { opts.onWaitEnded?.('stop', { goal: 'interrupted' }); return '' }, () => busy, true)
+      const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+      const c = ctx({ executionAttemptId: 'xatt_goal_busy' })
+      const h = (await b.open(c) as any).handle
+      await b.submit(c, h, { inputKind: 'native_goal', prompt: '/goal x' })
+      await collect(b, c)
+      busy = true
+      const rel = await b.release(c, h, 100)
+      expect(rel.released).toBe(true)
+      expect(escapes).toEqual([])
+      expect(lines).toEqual([])
+      expect(rel.detail).toContain('busy')
+    })
+
+    test('interrupting a goal run presses Escape and clears the goal so the shared session is not left armed', async () => {
+      let finish!: () => void
+      const { manager, escapes, lines } = stubManager(opts => new Promise(r => { finish = () => { opts.onWaitEnded?.('stop', { goal: 'cleared' }); r('') } }), false, true)
+      const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+      const c = ctx({ executionAttemptId: 'xatt_goal_cancel' })
+      await b.submit(c, (await b.open(c) as any).handle, { inputKind: 'native_goal', prompt: '/goal x' })
+      await b.interrupt(c)
+      expect(escapes).toEqual(['/w'])
+      expect(lines).toEqual(['/goal clear'])
+      finish()
+      expect(((await collect(b, c)).find(e => e.type === 'turn.ended') as any).outcome).toBe('cancelled')
+    })
   })
 
   test('maps streamed text, progress and the reply to ledger events', async () => {
@@ -195,4 +299,24 @@ describe('SharedTmuxBackend through the task service (real tmux, fake claude)', 
     expect(await m.sendAndAwaitReply(h.workdir, 'chat still works')).toBe('ECHO: chat still works')
     h.service.stop()
   })
+
+  test('a native_goal task completes only after the goal is achieved across self-continued turns', async () => {
+    const { m } = fakeClaudeManager()
+    const h = makeHarness({
+      dir: tempRoot('rtask-goal-'),
+      backends: [new SharedTmuxBackend({ kind: 'claude', manager: m, spawnFor: c => ({ model: c.model }), available: ok })],
+      config: { backends: { fake: { enabled: false, models: ['x'] }, claude: { models: ['opus'] } } },
+    })
+    realManagers.push({ m, workdir: h.workdir })
+    const claude = { kind: 'claude', mode: 'tmux', model: 'opus', variant: null }
+    const fb = { enabled: false, candidates: [claude], triggerOn: [], maxSwitches: 0, startupRetriesPerCandidate: 0, retryDelaySeconds: 0, maxRecoverySeconds: 60, onExhausted: 'fail', sameOwnerReset: { enabled: false, maxWaitSeconds: 0, maxResumeActions: 0 } }
+    const args = prepareArgs(h, { prompt: '/goal turns=2 finish', fallback: fb })
+    const { task } = await h.data('router_task_prepare', { ...args, assignment: { ...args.assignment, inputKind: 'native_goal' } })
+    await h.data('router_task_start', { taskId: task.taskId, idempotencyKey: 'st', expectedControlVersion: task.controlVersion, authorization: authorization(args) })
+    await waitPhase(h, task.taskId, 'QUIESCENT', 30_000)
+    const result = await h.data('router_task_result', { taskId: task.taskId })
+    expect(result.turns[0].outcome).toBe('completed')
+    expect(result.turns[0].finalText).toBe('Goal set: turns=2 finish\n\nWORK 1\n\nWORK 2')
+    h.service.stop()
+  }, 60_000)
 })

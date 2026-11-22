@@ -60,4 +60,32 @@ describe('TmuxCliManager + Claude profile (fake claude in real tmux)', () => {
     // The next message goes through normally.
     expect(await m.sendAndAwaitReply(workdir, 'hello')).toBe('ECHO: hello')
   }, 30_000)
+
+  test('a native /goal is followed through its self-continued turns until achieved, not cut at the first Stop', async () => {
+    const { m, workdir } = setup()
+    const ends: { reason: string; goal?: string }[] = []
+    const reply = await m.sendAndAwaitReply(workdir, '/goal turns=3 finish', { onWaitEnded: (reason, info) => { ends.push({ reason, goal: info?.goal }) } })
+    expect(reply).toBe('Goal set: turns=3 finish\n\nWORK 1\n\nWORK 2\n\nWORK 3')
+    expect(ends).toEqual([{ reason: 'stop', goal: 'achieved' }])
+    expect(m.isBusy(workdir)).toBe(false)
+  }, 40_000)
+
+  test('an active goal that will not finish keeps the wait open until it is cleared', async () => {
+    const { m, workdir } = setup()
+    const ends: { reason: string; goal?: string }[] = []
+    const done = m.sendAndAwaitReply(workdir, '/goal hold never', { onWaitEnded: (reason, info) => { ends.push({ reason, goal: info?.goal }) } })
+    await new Promise(r => setTimeout(r, 6_000))
+    expect(ends).toEqual([])
+    expect(m.isBusy(workdir)).toBe(true)
+    expect(await m.sendLine(workdir, '/goal clear')).toBe(true)
+    expect(await done).toBe('Goal set: hold never\n\nWORK 1\n\nGoal cleared: c')
+    expect(ends).toEqual([{ reason: 'stop', goal: 'cleared' }])
+  }, 40_000)
+
+  test('an ordinary message reports no goal', async () => {
+    const { m, workdir } = setup()
+    const ends: { reason: string; goal?: string }[] = []
+    expect(await m.sendAndAwaitReply(workdir, 'hi', { onWaitEnded: (reason, info) => { ends.push({ reason, goal: info?.goal }) } })).toBe('ECHO: hi')
+    expect(ends).toEqual([{ reason: 'stop', goal: 'none' }])
+  }, 30_000)
 })

@@ -90,7 +90,7 @@ The server name is **`router-task`**, and the domain contract version is `router
 - Claude Code in **tmux** mode for tasks. Print mode gives exact process ownership and structured turn evidence, which an interactive terminal UI cannot match. Chat keeps using Claude in tmux and socket modes as it does today.
 - Codex through `app-server` (experimental). This is the future route to brokered permissions for Codex (§11.5).
 - ACP.
-- Multi-turn tasks on the same backend session (`router_task_add_turn` returns `UNSUPPORTED_CAPABILITY`), native `/goal`, checkpoint handoff, post-delivery clean-failure fallback, and same-owner quota-reset resume. The schemas and controller must still model all of these and refuse them correctly (§12).
+- Multi-turn tasks on the same backend session (`router_task_add_turn` returns `UNSUPPORTED_CAPABILITY`), native `/goal` on any backend other than Claude tmux (§11.7), checkpoint handoff, post-delivery clean-failure fallback, and same-owner quota-reset resume. The schemas and controller must still model all of these and refuse them correctly (§12).
 - Any change to Feishu chat routing, the `router.sock` worker protocol, chat fallback, or tmux idle reaping.
 
 ---
@@ -747,11 +747,11 @@ Owner direction (2026-11-22): every backend reuses the router's existing executi
 
 `task-service/backends/tmux-shared.ts` (`SharedTmuxBackend`) drives the **router's own `TmuxCliManager` instances**: `tmuxClaude`, `tmuxAgy`, and a Codex manager built from `tmux/profiles/codex.ts`. It calls them through the same `sendAndAwaitReply(workdir, text, options)` that the Feishu path (`tmux-route.ts`) uses. Only the presentation differs: the callbacks feed the task ledger instead of Feishu cards.
 
-- **Sessions.** Sessions are keyed by workdir, exactly as for chat. A task on a workdir that already has a session reuses it. A task on a different workdir (for example a temporary one) gets its own session, which the manager creates on first use. Close and release never kill a session; they only end the task's own turn.
+- **Sessions.** Sessions are keyed by workdir, exactly as for chat. A task on a workdir that already has a session reuses it. A task on a different workdir (for example a temporary one) gets its own session, which the manager creates on first use. Per-attempt release never kills a session; it only ends the task's own turn. Session lifetime follows §11.7.
 - **Spawn options.** These come from the router's own resolution: the Claude model, and `resolveAgySpawnOptions` for agy. They apply only when a session is first spawned, the same as for chat.
 - **Busy sessions.** A busy session is refused before delivery with `not_sent backend_unavailable`, so a task never folds into, or queues behind, someone else's turn. That makes the refusal eligible for the ordered fallback.
 - **Delivery.** By the manager's contract, a throw from `sendAndAwaitReply` means the input never reached the CLI, so it becomes `not_sent startup_failed`. Any callback (text, progress, dialog), or the resolved reply, proves delivery.
-- **Events.** Streamed text chunks become `text` appends. Progress lines become `tool` started events, all completed at turn end. The resolved reply becomes `turn.ended completed` with the reply as final text. A CLI-reported stop error becomes `failed`.
+- **Events.** Streamed text chunks become `text` appends. Progress lines become `tool` started events, all completed at turn end. The resolved reply becomes `turn.ended completed` with the reply as final text, but only when the agent and all its background subtasks have stopped (wait end `stop`, `local_command` or `quiet`). A CLI-reported stop error, or the manager giving up on background work it never saw end (`background_idle`), becomes `failed`.
 - **Router state.** The router's own unavailability state is respected: the agy quota cooldown in `DegradedTracker` is checked before dispatch, and a stop error is fed back to it. This is the same as chat.
 - **Dialogs.** The manager's `onDialog` callback is used.
   - **broker:** a numbered menu with exactly one one-shot allow and one deny becomes `permission.requested`. The client's reply selects that option. Any other menu becomes `interaction.required`, which `router_task_cancel` resolves with Escape.
@@ -762,6 +762,30 @@ Owner direction (2026-11-22): every backend reuses the router's existing executi
 ### 11.5 OpenCode: the router's adapter and session binding
 
 `OpenCodeTaskBackend` wraps the router's `OpenCodeAdapter` (§11.2). It also takes a `sessionFor(directory)` that calls the router's own `getOrCreateOpenCodeSession`, with the same SQLite binding store and in-flight creation lock that chat uses, keyed `task:workdir:<dir>`. Tasks on the same workdir therefore share one OpenCode session, and a busy session is refused before delivery. Release aborts the task's own turn only if it is still running, and never deletes the session.
+
+### 11.7 Task completion and temporary-workdir lifetime
+
+Owner decisions (2026-11-22):
+
+- **Completion.** A `/goal` task is complete once the goal is achieved. Any other task is complete once the whole agent and all its subtasks have stopped. A `/goal` must be submitted as `native_goal`. A text prompt that is itself a `/goal` command is refused at prepare with `INVALID_REQUEST`, because a text task would end at the goal's first Stop.
+- **Native goal (Claude tmux).** The rule follows the Hermes Writer broker's (`inv-code-writer-broker2`) and was verified live against Claude Code 2.1.330. The broker reads pane markers. The router reads the structured `goal_status` transcript attachment instead (`tmux/profiles/claude-goal.ts`):
+  - `met:false, sentinel:true` is goal set.
+  - `met:false` is the verdict after a turn: unmet, and the CLI continues by itself.
+  - `met:true` is achieved.
+  - `met:true, sentinel:true` is `/goal clear`, which is **not** achieved.
+  - `[Request interrupted by user]` is Esc. Esc leaves the goal armed.
+
+  Only records after the send count, and a verdict only applies to a goal that is active in that wait (`tmux/goal.ts`). In `TmuxCliManager` the effects are:
+  - While the goal is active, a Stop does not end the wait. The wait is capped by `backgroundIdleCapMs`, like unconfirmed background work.
+  - The verdict, which lands after that turn's Stop, counts as the turn end.
+  - Background tasks must still be settled.
+  - `Goal set:` is not taken for a finished local command.
+  - The end reason carries the goal state (`onWaitEnded(reason, { goal })`).
+
+  The task is `completed` only for a real stop with goal `achieved`. A cleared, interrupted or never-set goal is `failed`. Cancel presses Esc and then types `/goal clear` while the task's wait still owns the session. Releasing a goal run that ended any other way without the goal achieved or cleared (timeout, dropped dialog, denied tool, Esc) also presses Esc and then `/goal clear`, unless another caller is already using the session. Either way a shared session is not left with an armed goal. Only a goal **set** in the wait is followed, so a goal left armed earlier never turns an ordinary message into a goal wait. Chat gets the same following of a `/goal` to its verdict.
+- **Mapped workdirs** are the access.json group workdirs, `defaultWorkdir`, and the agents.yaml project workdirs, compared by canonical path and read fresh each time. Their sessions are long-lived and shared with chat. Tasks never tear them down.
+- **Temporary workdirs** are every other workdir, such as a `/tmp` dir allowed by the dynamic roots. Their agents exist only for the tasks using them. Concurrent and later tasks on the same workdir reuse the session while it is alive. When the **last** open task on the workdir reaches CLOSED (not after each attempt, so a fallback candidate can still reuse it), `startTaskService({ onWorkdirReleased })` notifies the router. `task-service/workdir-teardown.ts` then kills each CLI's tmux session for that workdir and forgets its conversation id, skipping any session that is busy again. For OpenCode it only releases the router's `task:workdir:<dir>` binding. The OpenCode session itself is kept (owner: "just release session").
+- Tasks left UNKNOWN are not CLOSED, so their sessions stay until the operator resolves them. Sessions orphaned by a crash are reaped by the router's existing idle sweep.
 
 ### 11.6 Per-backend summary
 
@@ -790,7 +814,7 @@ Policy validation is pure and enforces every rule in spec §12.1:
 - Code/stage combinations must be in the allowed matrix (§12.2).
 - `run_timeout` is rejected.
 - Every candidate must be implemented. If any `{code, stage}` pair is enabled, every candidate it could apply to must advertise that trigger and stage. Otherwise prepare fails with `FALLBACK_POLICY_INVALID` or `UNSUPPORTED_CAPABILITY`.
-- `native_goal` requires `nativeGoal` on every candidate, so it is always rejected in phase 1.
+- `native_goal` requires `nativeGoal` on every candidate. Only the Claude tmux backend advertises it (its profile reads goal verdicts, §11.7), so any other candidate in the chain rejects the task.
 - `fallbackPlanSha256 = sha256(JCS(policy.fallback))`.
 
 The chat-level `fallback:` block in agents.yaml has **no effect** on tasks. A task with fallback disabled never switches, even when chat fallback is enabled globally (spec §12.8).
@@ -1035,9 +1059,10 @@ Owner decisions (2026-11-22):
 1. **Stuck UNKNOWN**: an operator-only `task-service/admin.ts` CLI outside MCP (§14, §17).
 2. **Dynamic roots**: `~/Projects` by default, plus any configured root, including temp directories such as `/tmp`. Every component below a root must pass the ownership check (§6). `requireGitWorktree` defaults to `false`.
 3. **Concurrency**: no cap by default. Optional global and per-backend caps exist. Task load is counted separately from chat's OpenCode limit (§5.3).
-4. **OpenCode sessions** are kept after close.
+4. **OpenCode sessions** are kept after close. On a temporary workdir only the router's binding is released (§11.7).
 5. **Facade during router restarts**: read-only tools retry inside the facade for up to 10 s while the socket is missing. Mutations return `SERVICE_UNAVAILABLE` (`sideEffects: "unknown"` if a request may have been sent), and the client retries with the same idempotency key.
 6. **Backends for tasks**: OpenCode, Claude, Codex and agy, all allowed for dynamic directories by default.
+7. **Completion and temporary workdirs**: completion means goal achieved (`/goal`) or agent plus all subtasks stopped. Temporary-workdir agents are torn down when the last task on that workdir closes (§11.7).
 
 To verify during implementation (no owner input needed):
 

@@ -10,6 +10,7 @@ import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { createHash, randomUUID } from 'crypto'
 import { backgroundWaitAfterStop, pendingBackgroundTaskIds } from '../../background-tasks'
+import { parseClaudeGoalSignal } from './claude-goal'
 import { parseDialogOptions, parseRunningShellCount, parseTabBar, type DialogOption } from '../dialog'
 import { resolveBin, type ProgressEvent, type SpawnOptions, type SpawnPlan, type StopContext, type StopOutcome, type TmuxCliProfile } from '../profile'
 
@@ -247,6 +248,7 @@ export const claudeProfile: TmuxCliProfile = {
   },
 
   isLocalCommandResult: isLocalCommandResultLine,
+  parseGoalSignal: parseClaudeGoalSignal,
   parseText: parseAssistantTextLines,
   parseProgress: parseProgressLines,
   parseDialog: (plainPane: string) => parseDialogOptions(plainPane) ?? parseTabBar(plainPane),

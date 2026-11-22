@@ -48,6 +48,7 @@ import { AGY_QUOTA_COOLDOWN_MS, isAgyQuotaError } from './tmux/agy-errors'
 import { createTmuxRouting, TMUX_BACKEND_NAMES, type AttachmentRef } from './tmux-route'
 import { startTaskService, type RunningTaskService } from './task-service'
 import { createTaskBackends } from './task-service/backends/factory'
+import { teardownTaskScopedWorkdir } from './task-service/workdir-teardown'
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -1132,6 +1133,18 @@ if (infraConfig?.taskService) {
       stateDir: STATE_DIR,
       log: dbg,
       onTaskClosed: () => { if (idleShutdownDeferred && workers.size === 0) scheduleIdleShutdown() },
+      // Temporary (unmapped) workdirs: their agents live only for the tasks using them.
+      onWorkdirReleased: (workdir) => {
+        void teardownTaskScopedWorkdir(workdir, {
+          configuredWorkdirs: () => {
+            const a = readAccess()
+            return [a.defaultWorkdir, ...Object.values(a.groups).map(g => g.workdir), ...Object.values(infraConfig?.projects ?? {}).map(p => p.workdir)]
+          },
+          tmuxManagers: [tmuxClaude, tmuxAgy, tmuxCodex],
+          releaseOpenCodeBinding: (dir) => { openCodeBindings.delete(`task:workdir:${dir}`) },
+          log: dbg,
+        }).catch(e => dbg(`task-service: temporary workdir teardown for ${workdir} failed: ${e}`))
+      },
       buildBackends: (cfg, paths) => createTaskBackends(cfg, paths, {
         openCodeAdapter,
         log: dbg,

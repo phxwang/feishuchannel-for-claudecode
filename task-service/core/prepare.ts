@@ -27,9 +27,15 @@ export async function loadCandidateCaps(registry: BackendRegistry, args: Prepare
   return Promise.all(args.policy.fallback.candidates.map(c => registry.capabilitiesFor(c)))
 }
 
+/** A /goal task completes when the goal is achieved, not when one turn stops; a text task cannot observe that. */
+const TEXT_GOAL_COMMAND = /^\s*\/goal(\s|$)/
+
 function validateGoalInput(args: PrepareArgs): void {
-  if (args.assignment.inputKind !== 'native_goal') return
   const p = args.assignment.prompt
+  if (args.assignment.inputKind !== 'native_goal') {
+    if (TEXT_GOAL_COMMAND.test(p)) throw new DomainError('INVALID_REQUEST', 'A /goal command must be submitted with inputKind "native_goal", not as text.')
+    return
+  }
   if (!p.startsWith('/goal ') || /[\r\n]/.test(p) || Buffer.byteLength(p.slice(6), 'utf8') > LIMITS.goalCapsuleMaxBytes || !p.slice(6).trim()) {
     throw new DomainError('INVALID_REQUEST', 'native_goal input must be "/goal <single-line capsule>" with at most 900 bytes.')
   }

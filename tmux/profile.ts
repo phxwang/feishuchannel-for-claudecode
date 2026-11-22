@@ -8,6 +8,7 @@
  */
 import { existsSync } from 'fs'
 import type { BackgroundWait } from '../background-tasks'
+import type { GoalSignal } from './goal'
 import type { Dialog, DialogOption } from './dialog'
 
 export type TmuxCliKind = 'claude' | 'agy' | 'codex'
@@ -113,6 +114,12 @@ export interface TmuxCliProfile {
    * profile that sets this also opts out of the quiet-period fallback.
    */
   isTurnEnd?(line: string): boolean
+  /**
+   * Classify a transcript line as a native `/goal` record (see tmux/goal.ts),
+   * or null. A profile that sets this supports native goals: while a goal is
+   * active a Stop does not end the reply; the goal's verdict does.
+   */
+  parseGoalSignal?(line: string): GoalSignal | null
   parseText(lines: string[]): string[]
   parseProgress(lines: string[]): ProgressEvent[]
   parseDialog(plainPane: string): Dialog | null

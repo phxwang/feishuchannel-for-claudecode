@@ -46,6 +46,17 @@ describe('prepare', () => {
     expect(bounds.error?.code).toBe('INVALID_REQUEST')
   })
 
+  test('a /goal command sent as plain text is refused (its completion is "goal achieved", which text tasks cannot observe)', async () => {
+    h = makeHarness()
+    for (const [i, prompt] of ['/goal ship it', '  /goal\tship it', '/goal'].entries()) {
+      const r = await h.call('router_task_prepare', prepareArgs(h, { prompt, idempotencyKey: `goal-${i}`, clientTaskId: `goal-${i}`, scopeKey: `goal-${i}` }))
+      expect(r.error?.code).toBe('INVALID_REQUEST')
+      expect(r.error?.message).toContain('native_goal')
+    }
+    // Mentioning /goal mid-prompt is ordinary text.
+    expect((await h.call('router_task_prepare', prepareArgs(h, { prompt: 'Explain what /goal does.', idempotencyKey: 'goal-text' }))).ok).toBe(true)
+  })
+
   test('rejects models outside the allowlist and unsupported permission mode', async () => {
     h = makeHarness()
     const r = await h.call('router_task_prepare', prepareArgs(h, { candidates: ['nope'] }))

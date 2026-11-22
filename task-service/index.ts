@@ -17,6 +17,7 @@ import { TaskService } from './core/service'
 import { IpcServer } from './ipc/server'
 import { TaskStore } from './store/task-store'
 import { systemClock } from './time'
+import { releasedWorkdir } from './workdir-release'
 
 export interface StartOptions {
   input: TaskServiceConfigInput
@@ -28,6 +29,12 @@ export interface StartOptions {
   buildBackends: (config: TaskServiceConfig, paths: TaskServicePaths) => TaskBackend[]
   /** Called after any task reaches CLOSED (the router re-evaluates idle shutdown). */
   onTaskClosed?: () => void
+  /**
+   * Called once the last open task on a workdir reaches CLOSED, with its
+   * canonical path. The router tears down that workdir's agent sessions if
+   * it is temporary (see workdir-release.ts). Must not throw.
+   */
+  onWorkdirReleased?: (canonicalWorkdir: string) => void
 }
 
 export interface TaskServicePaths {
@@ -84,9 +91,18 @@ export async function startTaskService(o: StartOptions): Promise<RunningTaskServ
     })
     const svc = service
     const armed = svc.committer.onCommitted
+    // CLOSED is final, but a closed task can still be committed again; fire the workdir release once per task.
+    const releaseSeen = new Set<string>()
     svc.committer.onCommitted = task => {
       armed?.(task)
-      if (task.phase === 'CLOSED') { try { o.onTaskClosed?.() } catch (e) { o.log(`task-service: onTaskClosed failed: ${String(e)}`) } }
+      if (task.phase !== 'CLOSED') return
+      try { o.onTaskClosed?.() } catch (e) { o.log(`task-service: onTaskClosed failed: ${String(e)}`) }
+      if (!o.onWorkdirReleased || releaseSeen.has(task.taskId)) return
+      releaseSeen.add(task.taskId)
+      try {
+        const workdir = releasedWorkdir(task, store.listNonClosed())
+        if (workdir) o.onWorkdirReleased(workdir)
+      } catch (e) { o.log(`task-service: workdir release for ${task.taskId} failed: ${String(e)}`) }
     }
     await svc.start()
     ipc = new IpcServer({ socketPath: paths.socketPath, service: svc, log: o.log })

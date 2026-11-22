@@ -12,6 +12,7 @@
  * pasted, nothing throws past sendAndAwaitReply — failures while waiting
  * are swallowed and whatever text was collected is returned.
  */
+import { goalLeftActive, nextGoalState, type GoalState } from './goal'
 import { existsSync, readFileSync, statSync } from 'fs'
 import { randomUUID } from 'crypto'
 import { runTmux } from './tmux-exec'
@@ -62,9 +63,15 @@ export interface SendAndAwaitReplyOptions extends SpawnOptions {
   /**
    * Why the reply wait ended, for callers that must tell a real turn end
    * ('stop') from giving up (session killed, timeout, idle, dialog ended…).
-   * Called just before the call resolves. Optional; chat does not use it.
+   * Called just before the call resolves, with the goal state of the wait.
+   * Optional; chat does not use it.
    */
-  onWaitEnded?: (reason: WaitEndReason) => void
+  onWaitEnded?: (reason: WaitEndReason, info?: WaitEndInfo) => void
+}
+
+export interface WaitEndInfo {
+  /** Native `/goal` state at the end of this wait (tmux/goal.ts); 'none' for an ordinary message. */
+  goal: GoalState
 }
 
 export type WaitEndReason = 'stop' | 'session_killed' | 'timeout' | 'background_idle' | 'quiet' | 'local_command' | 'idle_no_turn' | 'dialog_ended'
@@ -225,6 +232,18 @@ export class TmuxCliManager {
     const name = this.profile.sessionName(workdir)
     if (!(await this.hasSession(name))) return
     await runTmux(['send-keys', '-t', name, 'Escape'])
+  }
+
+  /**
+   * Type one line into the workdir's session without starting a reply wait
+   * (e.g. `/goal clear` after Esc, to disarm a goal an in-flight wait is
+   * following). False if there's no live session.
+   */
+  async sendLine(workdir: string, text: string): Promise<boolean> {
+    const name = this.profile.sessionName(workdir)
+    if (!(await this.hasSession(name))) return false
+    await this.sendKeys(name, text)
+    return true
   }
 
   /** Manual `/select <n>`: answer a numbered menu no card was sent for. False if there's no live session. */
@@ -474,6 +493,9 @@ export class TmuxCliManager {
     let textOwner: TurnOwner | undefined = owners[0]
     let seenTurnStart = false
     let sawLocalCommandResult = false
+    /** Native goal driven by this message (tmux/goal.ts). Only records read after the send count. */
+    // `as`: assigned only inside readGrowth, so TS would otherwise narrow it to 'none' here.
+    let goal = 'none' as GoalState
     const advanceTextOwner = () => {
       const idx = textOwner ? owners.indexOf(textOwner) : -1
       const next = owners[idx + 1]
@@ -521,6 +543,14 @@ export class TmuxCliManager {
       for (const line of newLines) {
         if (profile.isLocalCommandResult?.(line)) sawLocalCommandResult = true
         if (profile.isTurnEnd?.(line)) sawTurnEnd = true
+        const goalSignal = profile.parseGoalSignal?.(line)
+        if (goalSignal) {
+          const before = goal
+          goal = nextGoalState(goal, goalSignal)
+          // The verdict lands after that turn's Stop already fired: leaving the
+          // goal (achieved, cleared, Esc) ends the turn just like a stop.
+          if (goalLeftActive(before, goal)) sawTurnEnd = true
+        }
         if (profile.isUserTurnStart?.(line)) {
           deliver(segment)
           segment = []
@@ -554,7 +584,7 @@ export class TmuxCliManager {
     }
     let idleSinceMs = 0
     const ended = (reason: WaitEndReason) => {
-      for (const o of owners) { try { o.opts.onWaitEnded?.(reason) } catch (e) { this.dbg(`${this.tag()}: onWaitEnded threw: ${e}`) } }
+      for (const o of owners) { try { o.opts.onWaitEnded?.(reason, { goal }) } catch (e) { this.dbg(`${this.tag()}: onWaitEnded threw: ${e}`) } }
     }
 
     while (Date.now() < deadline) {
@@ -616,6 +646,13 @@ export class TmuxCliManager {
           for (const o of owners.splice(0, stoppedIdx)) o.resolve(o.collected.join('\n\n'))
           if (!textOwner || !owners.includes(textOwner)) textOwner = current()
         }
+        if (goal === 'active') {
+          // A goal's Stop is one step of its loop: the CLI continues by itself
+          // until the verdict. Capped like background work in case it never comes.
+          this.dbg(`${this.tag()}: ${workdir} stopped with its /goal still active — waiting for the goal verdict`)
+          waitCappedSinceStop = true
+          continue
+        }
         if (outcome.wait !== 'done') {
           this.dbg(`${this.tag()}: ${workdir} stopped with background work still running — waiting for its next turn`)
           waitCappedSinceStop = outcome.wait === 'wait-capped'
@@ -634,8 +671,9 @@ export class TmuxCliManager {
 
       // A local slash command recorded its result and nothing followed: no
       // Stop hook will come for it (Claude's /model, /cost …).
+      // "Goal set:" is itself a local-command record, but it starts a turn.
       if (
-        sawLocalCommandResult && owners.length === 1 && owners[0].text.trim().startsWith('/') &&
+        sawLocalCommandResult && goal !== 'active' && owners.length === 1 && owners[0].text.trim().startsWith('/') &&
         isQuietDone(lastChangeMs, Date.now(), LOCAL_COMMAND_QUIET_MS)
       ) {
         this.dbg(`${this.tag()}: ${workdir} — "${owners[0].text.trim()}" recorded its local result with no turn, treating it as done`)

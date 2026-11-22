@@ -52,6 +52,43 @@ describe('startTaskService', () => {
     again.close()
   })
 
+  test('onWorkdirReleased fires once, when the last task on a workdir closes', async () => {
+    const s = setup()
+    const fake = new FakeBackend().script('fake-a', { events: [{ type: 'delivery', status: 'accepted' }], hang: true })
+    const released: string[] = []
+    const r = (await startTaskService({
+      input: input(s.workRoot, true), projects: {}, allowedRoots: [s.workRoot], stateDir: s.stateDir, log: () => {},
+      buildBackends: () => [fake], onWorkdirReleased: w => { released.push(w) },
+    }))!
+    running.push(r)
+    const h = { workdir: s.workdir } as any
+    const start = async (n: string) => {
+      const args = prepareArgs(h, { clientTaskId: `j${n}`, scopeKey: `s${n}`, idempotencyKey: `p${n}` })
+      const t = ((await r.service.call('router_task_prepare', args)).data as any).task
+      await r.service.call('router_task_start', { taskId: t.taskId, idempotencyKey: `st${n}`, expectedControlVersion: t.controlVersion, authorization: authorization(args) })
+      return t.taskId as string
+    }
+    const cancel = async (taskId: string) => {
+      const get = async () => ((await r.service.call('router_task_get', { taskId })).data as any).task
+      const g = await get()
+      const res = await r.service.call('router_task_cancel', {
+        taskId, idempotencyKey: `c-${taskId}`, expectedControlVersion: g.controlVersion,
+        expectedOwner: g.owner.executionId ? { executionId: g.owner.executionId, generation: g.owner.generation } : null, reason: 'test', graceSeconds: 1,
+      })
+      expect(res.ok).toBe(true)
+      const deadline = Date.now() + 3000
+      while ((await get()).phase !== 'CLOSED' && Date.now() < deadline) await new Promise(res => setTimeout(res, 20))
+      expect((await get()).phase).toBe('CLOSED')
+    }
+    const a = await start('1')
+    const b = await start('2')
+    await cancel(a)
+    expect(released).toEqual([])
+    await cancel(b)
+    await new Promise(res => setTimeout(res, 50))
+    expect(released).toEqual([require('fs').realpathSync(s.workdir)])
+  })
+
   test('disabled with no database does not start', async () => {
     const s = setup()
     const r = await startTaskService({ input: input(s.workRoot, false), projects: {}, allowedRoots: [s.workRoot], stateDir: s.stateDir, log: () => {}, buildBackends: () => [] })

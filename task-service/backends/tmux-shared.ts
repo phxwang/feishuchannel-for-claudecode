@@ -10,6 +10,7 @@
  * message never reached the CLI (pre-delivery, safe to fall back).
  */
 import { DIALOG_ESCAPE_CHOICE, type TmuxCliManager, type WaitEndReason } from '../../tmux/manager'
+import type { GoalState } from '../../tmux/goal'
 import { stripAnsi, type Dialog } from '../../tmux/dialog'
 import { runTmux } from '../../tmux/tmux-exec'
 import type { SpawnOptions } from '../../tmux/profile'
@@ -47,14 +48,27 @@ interface Run {
   interrupted: boolean
   stopError: string | null
   endReason: WaitEndReason | null
+  /** native_goal input: completion requires the goal to be achieved, not just a turn to stop. */
+  goalInput: boolean
+  goal: GoalState
+  /** `/goal clear` already typed for this run. */
+  goalCleared: boolean
   toolSeq: number
   openTools: string[]
   pending: Map<string, PendingDialog>
   finished: Promise<void>
 }
 
-/** Wait-end reasons that mean the CLI really finished the turn (matches what chat treats as a reply). */
-const COMPLETED_REASONS: ReadonlySet<WaitEndReason> = new Set<WaitEndReason>(['stop', 'local_command', 'background_idle', 'quiet'])
+/**
+ * Wait-end reasons that mean the CLI really finished: the agent AND all its
+ * subtasks have stopped. 'background_idle' is excluded — the manager gave up
+ * waiting on background work it never saw end, so completion is unproven
+ * (chat still shows that reply; a task must not report it as completed).
+ */
+const COMPLETED_REASONS: ReadonlySet<WaitEndReason> = new Set<WaitEndReason>(['stop', 'local_command', 'quiet'])
+
+/** Let the CLI settle the Esc before typing `/goal clear` into its prompt. */
+const GOAL_CLEAR_DELAY_MS = 300
 
 const TRIGGERS: BackendCapabilities['fallback']['supportedFallbackTriggers'] = [
   { code: 'backend_unavailable', stage: 'before_delivery' },
@@ -77,8 +91,13 @@ export class SharedTmuxBackend implements TaskBackend {
       // Sessions are per workdir and shared with chat; a turn in flight lives only in router memory.
       features: { isolatedSession: false, samePrimaryTurns: false, recoverAcceptedTurn: false, permissionReply: true, cancel: true, eventReplay: true },
       permissionModes: ['broker', 'backend_policy'],
-      fallback: { orderedFallback: true, supportedFallbackTriggers: TRIGGERS, cleanFailureFallback: false, checkpointHandoff: false, sameOwnerResetRecovery: false, nativeGoal: false },
+      fallback: { orderedFallback: true, supportedFallbackTriggers: TRIGGERS, cleanFailureFallback: false, checkpointHandoff: false, sameOwnerResetRecovery: false, nativeGoal: this.supportsGoals() },
     }
+  }
+
+  /** Native goals need a profile that can read the CLI's goal verdicts (tmux/goal.ts). */
+  private supportsGoals(): boolean {
+    return typeof this.o.manager.profile.parseGoalSignal === 'function'
   }
 
   async preflight(ctx: AttemptContext): Promise<{ kind: 'ok' } | NotSent> {
@@ -104,12 +123,13 @@ export class SharedTmuxBackend implements TaskBackend {
   }
 
   async submit(ctx: AttemptContext, _h: BackendHandle, input: { inputKind: 'text' | 'native_goal'; prompt: string }): Promise<SubmitResult> {
-    if (input.inputKind !== 'text') return notSent('capability_unavailable', 'native goal input is not supported')
+    const goalInput = input.inputKind === 'native_goal'
+    if (goalInput && !this.supportsGoals()) return notSent('capability_unavailable', `${this.kind} has no native goal support`)
     const workdir = ctx.workdir.canonicalPath
     if (this.o.manager.isBusy(workdir)) return notSent('backend_unavailable', `the ${this.kind} session for this workdir is busy`)
     const run: Run = {
       workdir, queue: [], wake: null, done: false, delivered: false, interrupted: false, stopError: null, endReason: null,
-      toolSeq: 0, openTools: [], pending: new Map(), finished: Promise.resolve(),
+      goalInput, goal: 'none', goalCleared: false, toolSeq: 0, openTools: [], pending: new Map(), finished: Promise.resolve(),
     }
     this.runs.set(ctx.executionAttemptId, run)
     const push = (e: BackendEvent) => { run.queue.push(e); run.wake?.() }
@@ -128,18 +148,22 @@ export class SharedTmuxBackend implements TaskBackend {
       onDialog: dialog => { delivered(); return this.onDialog(ctx, run, dialog, push) },
       onAbsorbed: () => { delivered(); push({ type: 'diagnostic', detail: 'input was folded into a turn already in flight on this session' }) },
       onStopError: error => { run.stopError = error; this.o.onStopError?.(workdir, error) },
-      onWaitEnded: reason => { run.endReason = reason },
+      onWaitEnded: (reason, info) => { run.endReason = reason; run.goal = info?.goal ?? 'none' },
     }).then(reply => {
       delivered()
       for (const id of run.openTools.splice(0)) push({ type: 'tool', toolCallId: id, name: 'tool', status: 'completed' })
       // Only a real end of turn is a completion; giving up (session killed by /restart, timeout, idle, dropped dialog) is not.
-      const finishedTurn = run.endReason !== null && COMPLETED_REASONS.has(run.endReason)
+      // A /goal task is complete only once its goal is achieved (cleared, interrupted or never set is not).
+      const turnStopped = run.endReason !== null && COMPLETED_REASONS.has(run.endReason)
+      const goalMissed = run.goalInput && run.goal !== 'achieved'
+      const finishedTurn = turnStopped && !goalMissed
       const outcome = run.interrupted ? 'cancelled' : run.stopError || !finishedTurn ? 'failed' : 'completed'
+      const unfinishedReason = !turnStopped ? `reply wait ended: ${run.endReason ?? 'unknown'}` : `goal ${run.goal}, not achieved`
       push({
         type: 'turn.ended', outcome, finalText: reply || null,
         protocol: {
           backendFinished: finishedTurn, activeToolCount: 0,
-          stopReason: run.stopError ?? (run.interrupted ? 'interrupted' : finishedTurn ? null : `reply wait ended: ${run.endReason ?? 'unknown'}`),
+          stopReason: run.stopError ?? (run.interrupted ? 'interrupted' : finishedTurn ? null : unfinishedReason),
         },
         process: { exitCode: null, signal: null, controlledShutdown: run.interrupted },
         ...(outcome === 'failed' ? { failureCode: 'execution_failed' as const } : {}),
@@ -204,6 +228,37 @@ export class SharedTmuxBackend implements TaskBackend {
     run.interrupted = true
     for (const p of [...run.pending.values()]) p.resolve(DIALOG_ESCAPE_CHOICE)
     await this.o.manager.sendEscape(run.workdir)
+    // Esc stops the turn but leaves the goal armed: its Stop hook would keep
+    // driving the shared session. Clearing it also ends the reply wait. Only
+    // while this run's wait still owns the session — once it has ended, the
+    // session may already be running someone else's message (release() then
+    // clears it only if the session is free).
+    if (run.goalInput) {
+      await new Promise(r => setTimeout(r, GOAL_CLEAR_DELAY_MS))
+      if (!run.done && !run.goalCleared) {
+        run.goalCleared = true
+        await this.o.manager.sendLine(run.workdir, '/goal clear')
+      }
+    }
+  }
+
+  /**
+   * After a goal run ended without its goal achieved or cleared (timeout,
+   * dropped dialog, denied tool, Esc …), the goal is still armed in the CLI
+   * and would keep driving turns on the shared session. Disarm it: Escape,
+   * then `/goal clear` — unless another caller is already using the session.
+   */
+  private async disarmGoal(run: Run): Promise<string> {
+    if (!run.goalInput || run.goalCleared || run.goal === 'achieved' || run.goal === 'cleared') return ''
+    if (this.o.manager.isBusy(run.workdir)) return '; goal may still be armed: the session is busy with another caller'
+    run.goalCleared = true
+    try {
+      await this.o.manager.sendEscape(run.workdir)
+      await new Promise(r => setTimeout(r, GOAL_CLEAR_DELAY_MS))
+      return (await this.o.manager.sendLine(run.workdir, '/goal clear')) ? '; unfinished goal cleared' : '; session gone, goal cleared with it'
+    } catch (e) {
+      return `; clearing the unfinished goal failed: ${e instanceof Error ? e.message : String(e)}`
+    }
   }
 
   /** The session is shared per workdir and is never killed; release = this task's turn has ended. */
@@ -215,8 +270,9 @@ export class SharedTmuxBackend implements TaskBackend {
       const settled = await Promise.race([run.finished.then(() => true), new Promise<boolean>(r => setTimeout(() => r(false), graceMs))])
       if (!settled) return { released: false, backgroundWorkSettled: false, detail: `turn still running after ${graceMs} ms` }
     }
+    const goalNote = await this.disarmGoal(run)
     this.runs.delete(ctx.executionAttemptId)
-    return { released: true, backgroundWorkSettled: true, detail: `turn ended; shared ${this.kind} session for the workdir kept` }
+    return { released: true, backgroundWorkSettled: true, detail: `turn ended; shared ${this.kind} session for the workdir kept${goalNote}` }
   }
 
   /**
