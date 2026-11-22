@@ -35,7 +35,8 @@ export function deadlines(engine: Engine, task: TaskRecord, now: number): { at: 
   if (task.phase === 'WAITING_RETRY' && b.retryWakeAtMs !== null) out.push({ at: b.retryWakeAtMs, kind: 'retry' })
   if (task.phase === 'WAITING_AUTHORIZATION' && task.pendingAuthorization) out.push({ at: task.pendingAuthorization.expiresAtMs, kind: 'authorization' })
   if (RECOVERY_PHASES.has(task.phase)) out.push({ at: now + Math.max(0, recoveryRemainingMs(task, now)), kind: 'recovery' })
-  if (task.phase === 'UNKNOWN') out.push({ at: now + engine.deps.reconcileRetryMs, kind: 'reconcile' })
+  // UNKNOWN keeps reconciling; FINALIZING retries release if a previous attempt threw.
+  if (task.phase === 'UNKNOWN' || task.phase === 'FINALIZING') out.push({ at: now + engine.deps.reconcileRetryMs, kind: 'reconcile' })
   return out
 }
 
@@ -49,7 +50,15 @@ export function armTimer(engine: Engine, task: TaskRecord): void {
   if (!all.length) return
   const next = all.reduce((a, b) => (b.at < a.at ? b : a))
   const delay = Math.min(MAX_TIMEOUT_MS, Math.max(0, next.at - now))
-  const timer = setTimeout(() => { engine.timers.delete(task.taskId); fire(engine, task.taskId) }, delay)
+  const timer = setTimeout(() => {
+    engine.timers.delete(task.taskId)
+    try { fire(engine, task.taskId) } catch (e) {
+      // Never let a deadline crash the router; retry shortly instead.
+      engine.deps.log(`task-service: deadline handling for ${task.taskId} failed: ${e instanceof Error ? e.message : String(e)}`)
+      const retry = setTimeout(() => engine.kick(task.taskId), engine.deps.reconcileRetryMs)
+      engine.timers.set(task.taskId, retry)
+    }
+  }, delay)
   engine.timers.set(task.taskId, timer)
 }
 

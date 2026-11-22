@@ -282,10 +282,13 @@ function routeToWorkdir(workdir: string, payload: Record<string, unknown>): bool
 let idleTimer: ReturnType<typeof setTimeout> | null = null
 const IDLE_GRACE_MS = 10_000  // wait 10s before shutting down
 
+/** True when the last worker left while tasks were still live; re-checked when a task closes. */
+let idleShutdownDeferred = false
 function scheduleIdleShutdown() {
   if (idleTimer) clearTimeout(idleTimer)
   // Machine tasks (task MCP) are live work too: an unplanned exit would turn them UNKNOWN.
-  if (workers.size > 0 || taskService?.hasLiveWork()) return
+  idleShutdownDeferred = workers.size === 0 && !!taskService?.hasLiveWork()
+  if (workers.size > 0 || idleShutdownDeferred) return
   idleTimer = setTimeout(() => {
     if (workers.size === 0 && !taskService?.hasLiveWork()) {
       dbg('all workers disconnected, shutting down')
@@ -1128,11 +1131,13 @@ if (infraConfig?.taskService) {
       allowedRoots: AGENTS_ALLOWED_ROOTS,
       stateDir: STATE_DIR,
       log: dbg,
+      onTaskClosed: () => { if (idleShutdownDeferred && workers.size === 0) scheduleIdleShutdown() },
       buildBackends: (cfg, paths) => createTaskBackends(cfg, paths, {
         openCodeAdapter,
         log: dbg,
         // Same binding store + creation lock chat uses; keyed by workdir so tasks on one workdir share its session.
         openCodeSessionFor: (dir) => getOrCreateOpenCodeSession(`task:workdir:${dir}`, { project: dir, workdir: dir } as NonNullable<ReturnType<typeof resolveRoute>>),
+        openCodeSessionMissing: (dir, sessionId) => { evictMissingOpenCodeBinding(openCodeBindings, `task:workdir:${dir}`, sessionId, 'session_missing') },
         tmux: {
           claude: {
             manager: tmuxClaude,
@@ -1198,6 +1203,9 @@ function shutdown() {
   setTimeout(() => process.exit(0), 2000)
 }
 process.on('SIGTERM', shutdown)
+// Safety net: a stray promise rejection (e.g. from a background task-service step) is
+// logged instead of terminating the router and every chat route with it.
+process.on('unhandledRejection', (reason) => { dbg(`unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`) })
 process.on('SIGINT', shutdown)
 process.on('exit', () => releaseRouterLock(LOCK_DIR))
 

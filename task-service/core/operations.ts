@@ -12,6 +12,11 @@ import type { TaskStore } from '../store/task-store'
 import type { Clock } from '../time'
 import { errorEnvelope, okEnvelope, replayEnvelope, type Envelope } from './envelope'
 
+const NOT_RECORDED: ReadonlySet<string> = new Set([
+  'INTERNAL_ERROR', 'STORAGE_UNAVAILABLE', 'VERSION_CONFLICT', 'OWNER_MISMATCH', 'TASK_NOT_QUIESCENT',
+  'TASK_BUSY', 'PERMISSION_STALE', 'AUTHORIZATION_STALE', 'SCOPE_BUSY', 'OWNER_UNVERIFIED',
+])
+
 export interface MutationOutcome {
   data: Record<string, unknown>
   /** Post-commit work (e.g. kick the engine). Never runs if the transaction rolled back. */
@@ -61,8 +66,9 @@ export class OperationRunner {
           env = okEnvelope(requestId, outcome.data)
         } catch (e) {
           const err = toDomainError(e)
-          // Retryable rejections must stay retryable with the same key, so they are not recorded.
-          if (err.retryable || err.code === 'INTERNAL_ERROR' || err.code === 'STORAGE_UNAVAILABLE') throw err
+          // Retryable and state-dependent rejections are not recorded: retrying the same key
+          // after the task has moved on must re-evaluate, not replay a stale rejection.
+          if (err.retryable || NOT_RECORDED.has(err.code)) throw err
           env = errorEnvelope(requestId, err)
         }
         this.store.putOperation({

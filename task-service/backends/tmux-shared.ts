@@ -9,8 +9,9 @@
  * Contract inherited from the manager: sendAndAwaitReply throwing means the
  * message never reached the CLI (pre-delivery, safe to fall back).
  */
-import { DIALOG_ESCAPE_CHOICE, type TmuxCliManager } from '../../tmux/manager'
-import type { Dialog } from '../../tmux/dialog'
+import { DIALOG_ESCAPE_CHOICE, type TmuxCliManager, type WaitEndReason } from '../../tmux/manager'
+import { stripAnsi, type Dialog } from '../../tmux/dialog'
+import { runTmux } from '../../tmux/tmux-exec'
 import type { SpawnOptions } from '../../tmux/profile'
 import type { Candidate } from '../schema/primitives'
 import {
@@ -45,11 +46,15 @@ interface Run {
   delivered: boolean
   interrupted: boolean
   stopError: string | null
+  endReason: WaitEndReason | null
   toolSeq: number
   openTools: string[]
   pending: Map<string, PendingDialog>
   finished: Promise<void>
 }
+
+/** Wait-end reasons that mean the CLI really finished the turn (matches what chat treats as a reply). */
+const COMPLETED_REASONS: ReadonlySet<WaitEndReason> = new Set<WaitEndReason>(['stop', 'local_command', 'background_idle', 'quiet'])
 
 const TRIGGERS: BackendCapabilities['fallback']['supportedFallbackTriggers'] = [
   { code: 'backend_unavailable', stage: 'before_delivery' },
@@ -103,7 +108,7 @@ export class SharedTmuxBackend implements TaskBackend {
     const workdir = ctx.workdir.canonicalPath
     if (this.o.manager.isBusy(workdir)) return notSent('backend_unavailable', `the ${this.kind} session for this workdir is busy`)
     const run: Run = {
-      workdir, queue: [], wake: null, done: false, delivered: false, interrupted: false, stopError: null,
+      workdir, queue: [], wake: null, done: false, delivered: false, interrupted: false, stopError: null, endReason: null,
       toolSeq: 0, openTools: [], pending: new Map(), finished: Promise.resolve(),
     }
     this.runs.set(ctx.executionAttemptId, run)
@@ -123,13 +128,19 @@ export class SharedTmuxBackend implements TaskBackend {
       onDialog: dialog => { delivered(); return this.onDialog(ctx, run, dialog, push) },
       onAbsorbed: () => { delivered(); push({ type: 'diagnostic', detail: 'input was folded into a turn already in flight on this session' }) },
       onStopError: error => { run.stopError = error; this.o.onStopError?.(workdir, error) },
+      onWaitEnded: reason => { run.endReason = reason },
     }).then(reply => {
       delivered()
       for (const id of run.openTools.splice(0)) push({ type: 'tool', toolCallId: id, name: 'tool', status: 'completed' })
-      const outcome = run.interrupted ? 'cancelled' : run.stopError ? 'failed' : 'completed'
+      // Only a real end of turn is a completion; giving up (session killed by /restart, timeout, idle, dropped dialog) is not.
+      const finishedTurn = run.endReason !== null && COMPLETED_REASONS.has(run.endReason)
+      const outcome = run.interrupted ? 'cancelled' : run.stopError || !finishedTurn ? 'failed' : 'completed'
       push({
         type: 'turn.ended', outcome, finalText: reply || null,
-        protocol: { backendFinished: true, activeToolCount: 0, stopReason: run.stopError ?? (run.interrupted ? 'interrupted' : null) },
+        protocol: {
+          backendFinished: finishedTurn, activeToolCount: 0,
+          stopReason: run.stopError ?? (run.interrupted ? 'interrupted' : finishedTurn ? null : `reply wait ended: ${run.endReason ?? 'unknown'}`),
+        },
         process: { exitCode: null, signal: null, controlledShutdown: run.interrupted },
         ...(outcome === 'failed' ? { failureCode: 'execution_failed' as const } : {}),
         effects: run.toolSeq === 0 && !run.stopError ? 'none' : 'unknown',
@@ -163,7 +174,8 @@ export class SharedTmuxBackend implements TaskBackend {
       const next = run.queue.shift()
       if (next) {
         yield next
-        if (next.type === 'turn.ended' || (next.type === 'delivery' && next.status === 'not_sent')) return
+        if (next.type === 'delivery' && next.status === 'not_sent') { this.runs.delete(ctx.executionAttemptId); return }
+        if (next.type === 'turn.ended') return
         continue
       }
       if (run.done) return
@@ -195,9 +207,9 @@ export class SharedTmuxBackend implements TaskBackend {
   }
 
   /** The session is shared per workdir and is never killed; release = this task's turn has ended. */
-  async release(ctx: AttemptContext, _h: BackendHandle, graceMs: number): Promise<ReleaseResult> {
+  async release(ctx: AttemptContext, h: BackendHandle, graceMs: number): Promise<ReleaseResult> {
     const run = this.runs.get(ctx.executionAttemptId)
-    if (!run) return { released: null, backgroundWorkSettled: null, detail: 'no in-memory record of this turn (router restarted?)' }
+    if (!run) return this.releaseOrphan(ctx, h, graceMs)
     if (!run.done) {
       await this.interrupt(ctx)
       const settled = await Promise.race([run.finished.then(() => true), new Promise<boolean>(r => setTimeout(() => r(false), graceMs))])
@@ -205,6 +217,33 @@ export class SharedTmuxBackend implements TaskBackend {
     }
     this.runs.delete(ctx.executionAttemptId)
     return { released: true, backgroundWorkSettled: true, detail: `turn ended; shared ${this.kind} session for the workdir kept` }
+  }
+
+  /**
+   * After a router restart the turn is no longer tracked in memory. The session
+   * name is the exact identity: gone → nothing is left running; present → press
+   * Escape (as /esc does) and require the CLI's ready prompt before reporting release.
+   */
+  private async releaseOrphan(ctx: AttemptContext, h: BackendHandle, graceMs: number): Promise<ReleaseResult> {
+    const name = h.backendSessionId ?? this.o.manager.profile.sessionName(ctx.workdir.canonicalPath)
+    const alive = async () => (await runTmux(['has-session', '-t', name])).ok
+    const ready = async () => {
+      const pane = await runTmux(['capture-pane', '-p', '-t', name])
+      return pane.ok && this.o.manager.profile.isReady(stripAnsi(pane.stdout))
+    }
+    try {
+      if (!(await alive())) return { released: true, backgroundWorkSettled: true, detail: `session ${name} no longer exists` }
+      if (await ready()) return { released: true, backgroundWorkSettled: null, detail: `session ${name} is idle at its prompt` }
+      await this.o.manager.sendEscape(ctx.workdir.canonicalPath)
+      const end = Date.now() + graceMs
+      while (Date.now() < end) {
+        if (!(await alive()) || await ready()) return { released: true, backgroundWorkSettled: null, detail: `interrupted the orphaned turn in ${name}` }
+        await new Promise(r => setTimeout(r, 250))
+      }
+      return { released: false, backgroundWorkSettled: false, detail: `session ${name} did not return to its prompt after Escape` }
+    } catch (e) {
+      return { released: null, backgroundWorkSettled: null, detail: `could not inspect session ${name}: ${e instanceof Error ? e.message : String(e)}` }
+    }
   }
 
   async locate(ctx: AttemptContext): Promise<LocateResult> {

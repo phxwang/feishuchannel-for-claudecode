@@ -87,10 +87,10 @@ export class Engine implements TimerHost {
     switch (task.phase) {
       case 'STARTING':
         if (attempt && attempt.state === 'planned') await this.dispatch(task, attempt)
-        else if (attempt && !this.runtimes.has(task.taskId) && attempt.delivery !== 'not_sent') this.startObserve(task, attempt)
+        else if (attempt && observable(attempt) && !this.runtimes.has(task.taskId) && attempt.delivery !== 'not_sent') this.startObserve(task, attempt)
         return
       case 'ACTIVE': case 'WAITING_PERMISSION': case 'WAITING_INPUT':
-        if (attempt && !this.runtimes.has(task.taskId)) this.startObserve(task, attempt)
+        if (attempt && observable(attempt) && !this.runtimes.has(task.taskId)) this.startObserve(task, attempt)
         return
       case 'FALLBACK_PENDING':
         await evaluateFallback(this, task)
@@ -312,7 +312,8 @@ export class Engine implements TimerHost {
         failure: { code: failure.code ?? 'other', stage: failure.stage, detail: failure.detail, evidenceDigest: null },
       }
       const events = [attemptEvent('execution_attempt.ended', ended, t.currentTurnId, { outcome, failure: ended.failure, delivery: ended.delivery })]
-      if (t.phase === 'FINALIZING' || t.sealed) return { task: t, attempts: [ended], events }
+      // A sealed task still needs a terminal path: decide() returns terminate(sealed) → QUIESCENT/FINALIZING.
+      if (t.phase === 'FINALIZING') return { task: t, attempts: [ended], events }
       const pre = preDecide(this, t, ended, failure)
       const delivered = ended.delivery !== 'not_sent'
       let phase: TaskRecord['phase']
@@ -364,11 +365,15 @@ export class Engine implements TimerHost {
       } finally {
         if (this.runtimes.get(task.taskId) === rt) this.runtimes.delete(task.taskId)
       }
-      if (!finished && !rt.abort.signal.aborted && !this.stopped) {
-        this.markUnknown(task.taskId, rt.attemptId, 'observation ended without a turn end')
+      try {
+        if (!finished && !rt.abort.signal.aborted && !this.stopped) {
+          this.markUnknown(task.taskId, rt.attemptId, 'observation ended without a turn end')
+        }
+      } catch (e) {
+        this.deps.log(`task-service: marking ${task.taskId} UNKNOWN failed: ${e instanceof Error ? e.message : String(e)}`)
       }
       this.kick(task.taskId)
-    })()
+    })().catch(e => this.deps.log(`task-service: observer for ${task.taskId} crashed: ${e instanceof Error ? e.message : String(e)}`))
   }
 
   markUnknown(taskId: string, attemptId: string, reason: string): void {
@@ -385,6 +390,11 @@ export class Engine implements TimerHost {
     const rt = this.runtimes.get(taskId)
     if (rt) { rt.abort.abort(); this.runtimes.delete(taskId) }
   }
+}
+
+/** An attempt that already ended is never observed again (prevents re-observe loops). */
+function observable(a: AttemptRecord): boolean {
+  return a.state !== 'ended' && a.state !== 'skipped'
 }
 
 function ownerFacts(h: BackendHandle) {

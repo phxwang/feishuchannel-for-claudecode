@@ -59,7 +59,15 @@ export interface SendAndAwaitReplyOptions extends SpawnOptions {
   onTurnStarted?: () => void
   /** A turn stopped with an error the CLI reported (e.g. agy quota exhausted). Fire-and-forget. */
   onStopError?: (error: string) => void
+  /**
+   * Why the reply wait ended, for callers that must tell a real turn end
+   * ('stop') from giving up (session killed, timeout, idle, dialog ended…).
+   * Called just before the call resolves. Optional; chat does not use it.
+   */
+  onWaitEnded?: (reason: WaitEndReason) => void
 }
+
+export type WaitEndReason = 'stop' | 'session_killed' | 'timeout' | 'background_idle' | 'quiet' | 'local_command' | 'idle_no_turn' | 'dialog_ended'
 
 export interface TmuxManagerOptions {
   dbg?: (msg: string) => void
@@ -545,12 +553,16 @@ export class TmuxCliManager {
       return owners[0].text.trim().startsWith('/') ? slashIdleMs : NO_TURN_IDLE_MS
     }
     let idleSinceMs = 0
+    const ended = (reason: WaitEndReason) => {
+      for (const o of owners) { try { o.opts.onWaitEnded?.(reason) } catch (e) { this.dbg(`${this.tag()}: onWaitEnded threw: ${e}`) } }
+    }
 
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 400))
       if (!owners.length) return  // every caller already settled (e.g. a queued paste failed after a hand-off)
       if (sessionKilled()) {
         this.dbg(`${this.tag()}: ${workdir}'s session was killed/restarted — ending its in-flight reply wait`)
+        ended('session_killed')
         return
       }
       // Refreshed every tick so a long active wait isn't reaped as idle.
@@ -570,7 +582,7 @@ export class TmuxCliManager {
         const outcome = profile.afterStop({ workdir, sessionName: name, transcriptPath, plainPane: stripAnsi(await this.capturePane(name)) })
         // A /reset or /restart may have landed during that await — don't
         // write this dead session's state back over the new one.
-        if (sessionKilled()) return
+        if (sessionKilled()) { ended('session_killed'); return }
         if (outcome.conversationId && outcome.conversationId !== this.sessionIds.get(workdir)) {
           this.dbg(`${this.tag()}: ${workdir} now on conversation ${outcome.conversationId}`)
           this.rememberSessionId(workdir, outcome.conversationId)
@@ -609,14 +621,16 @@ export class TmuxCliManager {
           waitCappedSinceStop = outcome.wait === 'wait-capped'
           continue
         }
+        ended('stop')
         return
       }
       if (waitCappedSinceStop && isQuietDone(lastChangeMs, Date.now(), this.backgroundIdleCapMs)) {
         this.dbg(`${this.tag()}: ${workdir} — no activity for ${this.backgroundIdleCapMs}ms while waiting on background tasks, treating the reply as finished`)
+        ended('background_idle')
         return
       }
       // Quiet-period fallback only when there's no stop signal at all.
-      if (!signalPath && !profile.isTurnEnd && anyCollected && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) return
+      if (!signalPath && !profile.isTurnEnd && anyCollected && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) { ended('quiet'); return }
 
       // A local slash command recorded its result and nothing followed: no
       // Stop hook will come for it (Claude's /model, /cost …).
@@ -625,6 +639,7 @@ export class TmuxCliManager {
         isQuietDone(lastChangeMs, Date.now(), LOCAL_COMMAND_QUIET_MS)
       ) {
         this.dbg(`${this.tag()}: ${workdir} — "${owners[0].text.trim()}" recorded its local result with no turn, treating it as done`)
+        ended('local_command')
         return
       }
 
@@ -641,6 +656,7 @@ export class TmuxCliManager {
               this.dbg(`${this.tag()}: ${workdir} — idle ${idleLimit}ms with no turn and no stop signal, ending the wait${hint}`)
               try { owner?.opts.onStopError?.(`${profile.label} 已空闲但未收到回合结束信号${hint}`) } catch (e) { this.dbg(`${this.tag()}: onStopError threw: ${e}`) }
             }
+            ended(idleLimit === slashIdleMs ? 'local_command' : 'idle_no_turn')
             return
           }
         } else {
@@ -657,7 +673,7 @@ export class TmuxCliManager {
         const dialog = onDialog ? profile.parseDialog(stripAnsi(rawPane)) : null
         if (dialog && onDialog) {
           const keepWaiting = await this.handleDialog(workdir, name, dialog, onDialog, owner.opts.onTabSwitched)
-          if (!keepWaiting) return
+          if (!keepWaiting) { ended('dialog_ended'); return }
           // The click can take any amount of time — give the chosen action a
           // fresh window to run.
           deadline = Date.now() + this.replyTimeoutMs
@@ -672,6 +688,7 @@ export class TmuxCliManager {
         }
       }
     }
+    ended('timeout')
   }
 
   /**

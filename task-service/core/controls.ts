@@ -136,6 +136,7 @@ export function replyPermission(engine: Engine, a: ControlBase & { turnId: strin
     void backend.replyPermission(ctx, engine.handleOf(attempt, turn), p.backendRequestId, option.kind)
       .catch(() => 'unknown' as const)
       .then(result => recordPermissionResult(engine, t.taskId, attempt, p.permissionRequestId, option.kind, a.authorizationRevision, result))
+      .catch(e => engine.deps.log(`task-service: recording permission reply for ${t.taskId} failed: ${e instanceof Error ? e.message : String(e)}`))
   }
   return { data: { accepted: true, task: snapshotOf(engine, t.taskId) }, after }
 }
@@ -170,6 +171,11 @@ export function sealTask(engine: Engine, a: ControlBase & { reason: string }): M
       control: true,
       events: [taskEvent('task.sealed', { reason: a.reason })],
     }))
+  }
+  // Nothing can ever advance a sealed task waiting for a retry/grant: finalize it now (prior outcome preserved).
+  const latest = loadTask(engine, t.taskId)
+  if (['FALLBACK_PENDING', 'WAITING_RETRY', 'WAITING_AUTHORIZATION'].includes(latest.phase)) {
+    engine.deps.committer.commit(t.taskId, cur => sealAndFinalize(cur, { kind: 'terminate', reason: 'SEALED_BY_CLIENT', graceSeconds: null }))
   }
   return { data: { task: snapshotOf(engine, t.taskId) }, after: () => engine.kick(t.taskId) }
 }

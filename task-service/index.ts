@@ -26,6 +26,8 @@ export interface StartOptions {
   log: (msg: string) => void
   /** Build backends once the config is finalized (and the socket path is known). */
   buildBackends: (config: TaskServiceConfig, paths: TaskServicePaths) => TaskBackend[]
+  /** Called after any task reaches CLOSED (the router re-evaluates idle shutdown). */
+  onTaskClosed?: () => void
 }
 
 export interface TaskServicePaths {
@@ -71,29 +73,47 @@ export async function startTaskService(o: StartOptions): Promise<RunningTaskServ
   const drain = !enabled
   if (drain) o.log(`task-service: disabled but ${liveAtStart.length} task(s) are not CLOSED; running in drain mode: ${liveAtStart.map(t => t.taskId).join(', ')}`)
 
-  const registry = new BackendRegistry(o.buildBackends(config, paths), config)
-  const service = new TaskService({
-    store, clock: systemClock, registry, runRoot: paths.runRoot, log: o.log,
-    access: { config, stateDir: o.stateDir, uid: process.getuid!() },
-    maxConcurrentTasks: config.maxConcurrentTasks, drain,
-  })
-  await service.start()
-
-  const ipc = new IpcServer({ socketPath: paths.socketPath, service, log: o.log })
-  await ipc.listen()
+  let service: TaskService | null = null
+  let ipc: IpcServer | null = null
+  try {
+    const registry = new BackendRegistry(o.buildBackends(config, paths), config)
+    service = new TaskService({
+      store, clock: systemClock, registry, runRoot: paths.runRoot, log: o.log,
+      access: { config, stateDir: o.stateDir, uid: process.getuid!() },
+      maxConcurrentTasks: config.maxConcurrentTasks, drain,
+    })
+    const svc = service
+    const armed = svc.committer.onCommitted
+    svc.committer.onCommitted = task => {
+      armed?.(task)
+      if (task.phase === 'CLOSED') { try { o.onTaskClosed?.() } catch (e) { o.log(`task-service: onTaskClosed failed: ${String(e)}`) } }
+    }
+    await svc.start()
+    ipc = new IpcServer({ socketPath: paths.socketPath, service: svc, log: o.log })
+    await ipc.listen()
+  } catch (e) {
+    // Never leave a half-started service driving tasks the router cannot see or stop.
+    ipc?.close()
+    service?.stop()
+    store.close()
+    throw e
+  }
   o.log(`task-service: listening on ${paths.socketPath}${drain ? ' (drain mode)' : ''}`)
+  const started = service
+  const server = ipc
 
   const prune = setInterval(() => {
     try {
-      const r = service.prune(Date.now())
+      const r = started.prune(Date.now())
       if (r.events || r.bodies) o.log(`task-service: pruned events of ${r.events} rows, ${r.bodies} result bodies`)
     } catch (e) { o.log(`task-service: retention failed: ${String(e)}`) }
   }, RETENTION_INTERVAL_MS)
   prune.unref?.()
 
   return {
-    service, ipc, paths, drain,
-    hasLiveWork: () => service.hasLiveWork() || ipc.connectionCount > 0,
-    stop: () => { clearInterval(prune); ipc.close(); service.stop(); store.close() },
+    service: started, ipc: server, paths, drain,
+    // Live = a task that is not CLOSED. An idle connected MCP client does not pin the router.
+    hasLiveWork: () => started.hasLiveWork(),
+    stop: () => { clearInterval(prune); server.close(); started.stop(); store.close() },
   }
 }

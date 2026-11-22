@@ -32,6 +32,8 @@ export interface OpenCodeTaskBackendOptions {
    * instead of creating a new one per attempt.
    */
   sessionFor?: (directory: string, signal?: AbortSignal) => Promise<string>
+  /** The shared session no longer exists on the server: drop the router's binding so the next task recreates it. */
+  onSessionMissing?: (directory: string, sessionId: string) => void
 }
 
 const DEFAULT_HEALTH_TTL_MS = 10_000
@@ -57,6 +59,9 @@ export class OpenCodeTaskBackend implements TaskBackend {
   private readonly maxPollFailures: number
   private readonly now: () => number
   private readonly sessionFor: OpenCodeTaskBackendOptions['sessionFor']
+  private readonly onSessionMissing: OpenCodeTaskBackendOptions['onSessionMissing']
+  /** directory → attempt currently using the shared per-workdir session (in-process lock). */
+  private readonly inUse = new Map<string, string>()
 
   constructor(private readonly adapter: OpenCodeAdapter, opts: OpenCodeTaskBackendOptions = {}) {
     this.healthTtlMs = opts.healthTtlMs ?? DEFAULT_HEALTH_TTL_MS
@@ -64,6 +69,7 @@ export class OpenCodeTaskBackend implements TaskBackend {
     this.maxPollFailures = opts.maxConsecutivePollFailures ?? DEFAULT_MAX_POLL_FAILURES
     this.now = opts.now ?? Date.now
     this.sessionFor = opts.sessionFor
+    this.onSessionMissing = opts.onSessionMissing
   }
 
   async capabilities(): Promise<BackendCapabilities> {
@@ -86,11 +92,17 @@ export class OpenCodeTaskBackend implements TaskBackend {
 
   async open(ctx: AttemptContext, signal: AbortSignal): Promise<OpenResult> {
     const directory = ctx.workdir.canonicalPath
+    if (this.sessionFor) {
+      const holder = this.inUse.get(directory)
+      if (holder && holder !== ctx.executionAttemptId) return notSent('backend_unavailable', 'another task is using this workdir\'s OpenCode session', true)
+      this.inUse.set(directory, ctx.executionAttemptId)
+    }
+    const unlockOnFailure = (r: OpenResult): OpenResult => { if (r.kind === 'not_sent') this.unlock(directory, ctx.executionAttemptId); return r }
     try {
       const sessionId = this.sessionFor ? await this.sessionFor(directory, signal) : await this.adapter.createSessionIn(directory, signal)
       // A shared per-workdir session must not take a second input while a turn runs (it would be merged into that turn).
       if (this.sessionFor && isSessionBusy(await this.adapter.sessionStatus(directory), sessionId)) {
-        return notSent('backend_unavailable', `OpenCode session ${sessionId} for this workdir is busy`, true)
+        return unlockOnFailure(notSent('backend_unavailable', `OpenCode session ${sessionId} for this workdir is busy`, true))
       }
       const handle: BackendHandle = {
         backendSessionId: sessionId, backendTurnId: nextPromptId(),
@@ -99,7 +111,7 @@ export class OpenCodeTaskBackend implements TaskBackend {
       return { kind: 'opened', handle }
     } catch (e) {
       // No session id came back, so nothing exists that this attempt owns.
-      return notSent('startup_failed', `OpenCode session creation failed: ${errorText(e)}`, true)
+      return unlockOnFailure(notSent('startup_failed', `OpenCode session creation failed: ${errorText(e)}`, true))
     }
   }
 
@@ -120,7 +132,12 @@ export class OpenCodeTaskBackend implements TaskBackend {
         if (r.reason === 'rate_limited') return notSent('rate_limited', r.detail, false)
         if (r.reason === 'capacity_exhausted') return notSent('provider_unavailable', r.detail, false)
         // A vanished session leaves nothing to release; any other rejection leaves the empty session.
-        return notSent('startup_failed', r.detail, r.reason === 'session_missing')
+        if (r.reason === 'session_missing') {
+          this.onSessionMissing?.(directoryOf(ctx, handle), handle.backendSessionId)
+          this.unlock(directoryOf(ctx, handle), ctx.executionAttemptId)
+          return notSent('startup_failed', r.detail, true)
+        }
+        return notSent('startup_failed', r.detail, false)
     }
   }
 
@@ -156,7 +173,17 @@ export class OpenCodeTaskBackend implements TaskBackend {
     if (handle.backendSessionId) await this.adapter.abortSession(handle.backendSessionId, directoryOf(ctx, handle))
   }
 
+  private unlock(directory: string, attemptId: string): void {
+    if (this.inUse.get(directory) === attemptId) this.inUse.delete(directory)
+  }
+
   async release(ctx: AttemptContext, handle: BackendHandle, graceMs: number): Promise<ReleaseResult> {
+    const result = await this.releaseInner(ctx, handle, graceMs)
+    if (result.released === true) this.unlock(directoryOf(ctx, handle), ctx.executionAttemptId)
+    return result
+  }
+
+  private async releaseInner(ctx: AttemptContext, handle: BackendHandle, graceMs: number): Promise<ReleaseResult> {
     const sessionId = handle.backendSessionId
     if (!sessionId) return { released: true, backgroundWorkSettled: true, detail: 'no OpenCode session was created' }
     const directory = directoryOf(ctx, handle)

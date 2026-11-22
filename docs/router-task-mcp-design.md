@@ -1085,3 +1085,16 @@ These record where the implementation made a concrete choice that the sections a
 - **Startup grant reuse.** A `before_delivery` switch reuses the start grant only if it is still valid and unexpired, with a 2 s margin, when dispatch happens. Otherwise the engine raises `authorization.required`. A grant is marked consumed only when input is actually handed to a backend; a not-sent failure puts it back.
 - **Recovery for not-sent attempts.** After a restart, an attempt whose input was provably never handed off is closed as `not_started`, and a fresh attempt on the same candidate is planned behind `authorization.required` (trigger `recovery_restart`), so old grants never authorize input after a restart.
 - **Socket path length.** Unix socket paths are limited to 104 bytes on macOS. The service refuses paths longer than 103 bytes with a clear error. The default `~/.claude/channels/feishu/task-service/task.sock` is far below that.
+- **Review hardening.**
+  - Malformed IPC frames are dropped, and request handlers can never reject unhandled.
+  - The router logs any stray `unhandledRejection` instead of exiting.
+  - Deadline, observer and permission-reply failures are caught and retried.
+  - A partially failed startup tears itself down.
+  - Idle shutdown is re-checked when a task closes, but only if it was deferred for live tasks. An idle connected MCP client does not pin the router.
+  - State-dependent rejections are not recorded under an idempotency key: `VERSION_CONFLICT`, `OWNER_MISMATCH`, `TASK_NOT_QUIESCENT`, `TASK_BUSY`, `PERMISSION_STALE`, `AUTHORIZATION_STALE`, `SCOPE_BUSY` and `OWNER_UNVERIFIED`. The key stays usable after the task moves on.
+  - Tmux turn outcomes use the manager's new optional `onWaitEnded` reason. Only a real stop counts as `completed`; a chat `/restart`, a timeout or idle give-up ends the turn as `failed`.
+  - After a router restart, cancelling a tmux task checks the exact session: if the session is gone, the task is released. Otherwise Escape is sent and the CLI's ready prompt is required.
+  - OpenCode tasks on one workdir take an in-process lock, and a missing shared session evicts its binding.
+- **Known limits.**
+  - A chat message sent to a workdir while an MCP task's turn runs is handled by the CLI's own mid-turn rule ("absorb" for Claude/Codex, "queue" for agy), exactly as two chat messages would be. `router_task_cancel` presses Escape on that shared session.
+  - Admin methods share `task.sock`. Any same-UID process can already read `task-service.db` directly, so a separate socket would not add a boundary under the v1 same-UID trust model.

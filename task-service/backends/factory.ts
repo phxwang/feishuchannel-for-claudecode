@@ -31,6 +31,7 @@ export interface FactoryDeps {
   openCodeAdapter: OpenCodeAdapter | null
   /** The router's per-workdir OpenCode session lookup/creation. */
   openCodeSessionFor?: (directory: string) => Promise<string>
+  openCodeSessionMissing?: (directory: string, sessionId: string) => void
   tmux: Partial<Record<TmuxTaskKind, TmuxCliDeps>>
   log: (msg: string) => void
 }
@@ -48,7 +49,7 @@ export function createTaskBackends(config: TaskServiceConfig, _paths: TaskServic
   const out: TaskBackend[] = []
   const b = config.backends
   if (b.opencode) {
-    if (deps.openCodeAdapter) out.push(new OpenCodeTaskBackend(deps.openCodeAdapter, { sessionFor: deps.openCodeSessionFor }))
+    if (deps.openCodeAdapter) out.push(new OpenCodeTaskBackend(deps.openCodeAdapter, { sessionFor: deps.openCodeSessionFor, onSessionMissing: deps.openCodeSessionMissing }))
     else deps.log('task-service: backends.opencode is configured but agents.opencode is missing; OpenCode tasks are unavailable')
   }
   for (const kind of ['claude', 'agy', 'codex'] as const) {

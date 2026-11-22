@@ -40,8 +40,16 @@ describe('startTaskService', () => {
     const client = new IpcClient(r!.paths.socketPath)
     const res = await client.request('tool', { name: 'router_health', arguments: {} }, 5000) as any
     expect(res.envelope.ok).toBe(true)
-    expect(r!.hasLiveWork()).toBe(true) // a connected client counts as live work
+    expect(r!.hasLiveWork()).toBe(false) // an idle connected client does not pin the router
     client.close()
+    // Malformed frames (null, arrays, missing id) are dropped; the service keeps serving.
+    const { connect } = await import('net')
+    await new Promise<void>(resolve => {
+      const s2 = connect(r!.paths.socketPath, () => { s2.write('null\n[1]\n{"method":"tool"}\n"x"\n'); setTimeout(() => { s2.destroy(); resolve() }, 200) })
+    })
+    const again = new IpcClient(r!.paths.socketPath)
+    expect(((await again.request('tool', { name: 'router_health', arguments: {} }, 5000)) as any).envelope.ok).toBe(true)
+    again.close()
   })
 
   test('disabled with no database does not start', async () => {

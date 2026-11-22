@@ -13,6 +13,13 @@ export interface IpcServerOptions {
   log: (msg: string) => void
 }
 
+function isRequest(v: unknown): v is IpcRequest {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false
+  const r = v as Record<string, unknown>
+  const paramsOk = r.params === undefined || (typeof r.params === 'object' && r.params !== null && !Array.isArray(r.params))
+  return Number.isSafeInteger(r.id) && typeof r.method === 'string' && paramsOk
+}
+
 export class IpcServer {
   private server: Server | null = null
   private sockets = new Set<Socket>()
@@ -53,7 +60,9 @@ export class IpcServer {
     const inflight = new AbortController()
     socket.setEncoding('utf8')
     socket.on('data', (chunk: string) => {
-      for (const line of lines.push(chunk)) void this.handle(socket, line, inflight.signal)
+      for (const line of lines.push(chunk)) {
+        this.handle(socket, line, inflight.signal).catch(e => this.o.log(`task-service ipc: request handling failed: ${e instanceof Error ? e.message : String(e)}`))
+      }
       if (lines.overflowed) { socket.destroy(); }
     })
     const done = () => { inflight.abort(); this.sockets.delete(socket) }
@@ -62,8 +71,10 @@ export class IpcServer {
   }
 
   private async handle(socket: Socket, line: string, signal: AbortSignal): Promise<void> {
-    let req: IpcRequest
-    try { req = JSON.parse(line) } catch { return }
+    let parsed: unknown
+    try { parsed = JSON.parse(line) } catch { return }
+    if (!isRequest(parsed)) { this.o.log('task-service ipc: dropped a malformed frame'); return }
+    const req = parsed
     const reply = (body: Record<string, unknown>) => { if (!socket.destroyed) socket.write(frame({ id: req.id, ...body })) }
     try {
       reply({ result: await this.dispatch(req, signal) })

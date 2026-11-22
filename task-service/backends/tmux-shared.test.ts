@@ -43,11 +43,23 @@ async function collect(b: SharedTmuxBackend, c: AttemptContext, stopAfter = 50):
 const menu: Dialog = { kind: 'numbered', question: 'Allow Bash(ls)?', options: [{ number: '1', label: 'Yes' }, { number: '2', label: 'Yes, and always allow' }, { number: '3', label: 'No' }] } as Dialog
 
 describe('SharedTmuxBackend (stub manager)', () => {
+  test('a reply wait that ended without a real stop (e.g. chat /restart) is not a completion', async () => {
+    const { manager } = stubManager(async opts => { opts.onTextChunk?.('partial'); opts.onWaitEnded?.('session_killed'); return 'partial' })
+    const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+    const c = ctx({ executionAttemptId: 'xatt_killed' })
+    await b.submit(c, (await b.open(c) as any).handle, { inputKind: 'text', prompt: 'hi' })
+    const end = (await collect(b, c)).find(e => e.type === 'turn.ended') as any
+    expect(end.outcome).toBe('failed')
+    expect(end.protocol.backendFinished).toBe(false)
+    expect(end.protocol.stopReason).toContain('session_killed')
+  })
+
   test('maps streamed text, progress and the reply to ledger events', async () => {
     const { manager } = stubManager(async opts => {
       opts.onProgress?.([{ tool: 'Bash', summary: 'ls' }])
       opts.onTextChunk?.('hello ')
       opts.onTextChunk?.('world')
+      opts.onWaitEnded?.('stop')
       return 'hello world'
     })
     const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: c => ({ model: c.model }), available: ok })
@@ -129,7 +141,8 @@ describe('SharedTmuxBackend (stub manager)', () => {
     const c = ctx({ executionAttemptId: 'xatt_unknown' })
     expect(await b.locate(c)).toBe('unreachable')
     expect((await collect(b, c))[0]).toMatchObject({ type: 'lost' })
-    expect((await b.release(c, (await b.open(c) as any).handle, 10)).released).toBeNull()
+    // The exact session name is checked: this one does not exist, so nothing is left running.
+    expect((await b.release(c, (await b.open(c) as any).handle, 10)).released).toBe(true)
   })
 })
 

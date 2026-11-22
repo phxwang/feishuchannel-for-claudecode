@@ -209,3 +209,31 @@ describe('cancel and seal', () => {
     expect(add.error?.code).toBe('UNSUPPORTED_CAPABILITY')
   })
 })
+
+describe('review regressions', () => {
+  test('a sealed ACTIVE task whose turn fails reaches a terminal path instead of re-observing', async () => {
+    h = makeHarness()
+    h.fake.script('fake-a', { events: [{ type: 'delivery', status: 'accepted' }, { delayMs: 200 }, ended('boom', 'failed')] })
+    const { task } = await startTask(h)
+    const a = await waitPhase(h, task.taskId, 'ACTIVE')
+    await h.data('router_task_seal', { taskId: task.taskId, idempotencyKey: 'seal', expectedControlVersion: a.controlVersion, expectedOwner: { executionId: a.owner.executionId, generation: a.owner.generation }, reason: 'hold' })
+    await waitPhase(h, task.taskId, 'QUIESCENT')
+    await new Promise(r => setTimeout(r, 300))
+    expect(eventTypes(h, task.taskId).filter(t => t === 'turn.ended')).toHaveLength(1)
+  })
+
+  test('a state-dependent rejection is not replayed after the task moves on', async () => {
+    h = makeHarness()
+    h.fake.script('fake-a', { events: [{ type: 'delivery', status: 'accepted' }, { delayMs: 200 }, ended('ok')] })
+    const { task } = await startTask(h)
+    const a = await waitPhase(h, task.taskId, 'ACTIVE')
+    const owner = { executionId: a.owner.executionId, generation: a.owner.generation }
+    const early = await h.call('router_task_close', { taskId: task.taskId, idempotencyKey: 'close', expectedControlVersion: a.controlVersion, expectedOwner: owner, reason: 'r' })
+    expect(early.error?.code).toBe('TASK_NOT_QUIESCENT')
+    const q = await waitPhase(h, task.taskId, 'QUIESCENT')
+    const later = await h.call('router_task_close', { taskId: task.taskId, idempotencyKey: 'close', expectedControlVersion: q.controlVersion, expectedOwner: owner, reason: 'r' })
+    // The rejected attempt did not consume the key, so the same key now succeeds.
+    expect(later.ok).toBe(true)
+    await waitPhase(h, task.taskId, 'CLOSED')
+  })
+})
