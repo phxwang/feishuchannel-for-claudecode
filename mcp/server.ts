@@ -1,6 +1,7 @@
 /**
- * Thin stdio MCP facade (design doc §7): translates tools/call and
- * resources/read into task.sock requests. Holds no task state, never spawns
+ * Thin MCP facade (design doc §7): translates tools/call and
+ * resources/read into task-service requests (over task.sock, or in-process
+ * for the HTTP server). Holds no task state, never spawns
  * a service, never talks to a backend.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -18,8 +19,16 @@ const NORMAL_TIMEOUT_MS = 10_000
 const LONG_POLL_TIMEOUT_MS = 25_000
 const QUERY_RETRY_WINDOW_MS = 10_000
 
+/** How the facade reaches the task service: task.sock (stdio launcher) or in-process (HTTP in the router). */
+export interface FacadeRequester {
+  request(method: 'tool' | 'resource.read', params: Record<string, unknown>, timeoutMs: number): Promise<unknown>
+  close(): void
+}
+
 export interface FacadeOptions {
-  socketPath: string
+  /** task.sock path (stdio launcher). Ignored when `requester` is given. */
+  socketPath?: string
+  requester?: FacadeRequester
   version: string
   log?: (msg: string) => void
 }
@@ -42,7 +51,8 @@ function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T
 }
 
 export function createFacade(o: FacadeOptions): Server {
-  const ipc = new IpcClient(o.socketPath)
+  if (!o.requester && !o.socketPath) throw new Error('createFacade needs a socketPath or a requester')
+  const ipc: FacadeRequester = o.requester ?? new IpcClient(o.socketPath!)
   const tools = publishedTools()
   const server = new Server(
     { name: SERVER_NAME, version: o.version },

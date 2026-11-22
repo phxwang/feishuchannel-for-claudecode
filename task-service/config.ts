@@ -9,8 +9,10 @@ import { isAbsolute, join, resolve } from 'path'
 import { z } from 'zod'
 
 const REAL_KINDS = ['opencode', 'claude', 'codex', 'agy'] as const
+export const DEFAULT_HTTP_PORT = 8767
 const cap = z.number().int().positive().optional()
-const models = z.array(z.string().min(1).max(256)).min(1)
+/** Optional allowlist. Omitted = no restriction: the candidate's model is passed through to the agent CLI as-is. */
+const models = z.array(z.string().min(1).max(256)).min(1).optional()
 
 export const taskServiceConfigSchema = z.object({
   enabled: z.boolean().default(false),
@@ -24,6 +26,14 @@ export const taskServiceConfigSchema = z.object({
     allowedAgents: z.array(z.enum([...REAL_KINDS, 'fake'])).default([...REAL_KINDS]),
     requireGitWorktree: z.boolean().default(false),
     denyPaths: z.array(z.string().min(1)).default([]),
+  }).strict().default({}),
+  /** router-task MCP over Streamable HTTP, served by the router itself (mcp/http.ts). */
+  http: z.object({
+    enabled: z.boolean().default(true),
+    host: z.enum(['127.0.0.1', 'localhost', '::1']).default('127.0.0.1'),
+    port: z.number().int().min(1).max(65535).default(DEFAULT_HTTP_PORT),
+    /** Optional file holding a bearer token clients must send (Authorization: Bearer …). */
+    bearerTokenFile: z.string().min(1).optional(),
   }).strict().default({}),
   backends: z.object({
     opencode: z.object({ models, maxConcurrentTasks: cap }).strict().optional(),
@@ -47,7 +57,7 @@ export const taskServiceConfigSchema = z.object({
     }).strict().optional(),
     fake: z.object({
       enabled: z.boolean().default(false),
-      models: models.default(['fake']),
+      models,
       maxConcurrentTasks: cap,
     }).strict().optional(),
   }).strict().default({}),

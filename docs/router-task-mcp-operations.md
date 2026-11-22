@@ -8,7 +8,8 @@ How to enable, use, observe, disable and roll back the router task service and i
 |---|---|---|
 | Task service | inside `router.ts` (launchd `com.openclaw.feishuchannel-router`) | Started only when `agents.yaml` has `taskService.enabled: true`, or in drain mode (§4) |
 | Private state | `~/.claude/channels/feishu/task-service/` (0700) | `task-service.db` (SQLite WAL), `task.sock` (0600), `runs/<executionAttemptId>/` (0700) |
-| MCP server | `bin/router-task-mcp` → `mcp/task-mcp.ts` | stdio only. Stateless and safe to restart. Never starts the router. |
+| MCP server (HTTP, default) | `mcp/http.ts`, inside the router | Streamable HTTP at `http://127.0.0.1:8767/mcp`, started and stopped with the task service. Loopback only, Host/Origin allowlist, optional bearer token. Stateless. |
+| MCP server (stdio, optional) | `bin/router-task-mcp` → `mcp/task-mcp.ts` | Same tools over task.sock for clients that only speak stdio. Never starts the router. |
 | Operator CLI | `bun task-service/admin.ts` | `inspect` / `release`. Not reachable through MCP. |
 | JSON Schemas | `schemas/router-task/` | Regenerate with `bun run schemas`. A test fails if they are stale. |
 
@@ -29,7 +30,14 @@ How to enable, use, observe, disable and roll back the router task service and i
        claude:   { models: ["opus", "sonnet"] }
        codex:    { models: ["gpt-5.5-codex"], sandbox: workspace-write }
        agy:      { models: ["<agy model id>"] }
+     http:                             # router-task MCP over Streamable HTTP (default: on)
+       enabled: true
+       host: 127.0.0.1                 # loopback only: 127.0.0.1 | localhost | ::1
+       port: 8767
+       # bearerTokenFile: /path/to/token   # optional; clients then send Authorization: Bearer <token>
    ```
+
+   `models` is optional for every backend. When it is left out, the candidate's model string is passed straight through to the agent CLI, which decides what it accepts. An empty block such as `claude: {}` enables the backend with no restriction. When `models` is listed, it acts as an allowlist.
 
    Rules enforced at load time (the task service refuses to start if they are violated; the chat router keeps running):
    - A root may not be `/`, `$HOME`, or contain `$HOME`, the Feishu state directory or `~/.claude`.
@@ -43,22 +51,21 @@ How to enable, use, observe, disable and roll back the router task service and i
    grep task-service ~/.claude/channels/feishu/router-debug.log | tail
    ```
 
-   Expect `task-service: listening on …/task-service/task.sock`.
+   Expect `task-service: listening on …/task-service/task.sock` and `task-service: MCP (streamable HTTP) listening on http://127.0.0.1:8767/mcp`. If the port is taken, the HTTP endpoint logs `MCP HTTP endpoint NOT started`, and the task service and the stdio launcher keep working.
 
-3. Register the MCP server in the client:
+3. Register the MCP server in the client. Use the HTTP endpoint, which the router serves:
 
    ```json
-   {
-     "mcpServers": {
-       "router-task": {
-         "command": "/Users/openclaw/Projects/feishuchannel/bin/router-task-mcp",
-         "args": ["--service-socket", "/Users/openclaw/.claude/channels/feishu/task-service/task.sock"]
-       }
-     }
-   }
+   { "mcpServers": { "router-task": { "type": "http", "url": "http://127.0.0.1:8767/mcp" } } }
    ```
 
-   `--service-socket` is optional. It defaults to `$FEISHU_STATE_DIR/task-service/task.sock`.
+   Add `"headers": { "Authorization": "Bearer <token>" }` when `http.bearerTokenFile` is set. A client that only speaks stdio can still use the launcher:
+
+   ```json
+   { "mcpServers": { "router-task": { "command": "/Users/openclaw/Projects/feishuchannel/bin/router-task-mcp" } } }
+   ```
+
+   The launcher's `--service-socket` flag is optional. It defaults to `$FEISHU_STATE_DIR/task-service/task.sock`.
 
 ## 3. Using it (client flow)
 

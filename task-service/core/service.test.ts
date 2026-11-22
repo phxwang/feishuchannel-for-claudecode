@@ -57,6 +57,12 @@ describe('prepare', () => {
     expect((await h.call('router_task_prepare', prepareArgs(h, { prompt: 'Explain what /goal does.', idempotencyKey: 'goal-text' }))).ok).toBe(true)
   })
 
+  test('with no models listed for a backend, any model is passed through to the agent', async () => {
+    h = makeHarness({ config: { backends: { fake: { enabled: true } } } })
+    const r = await h.call('router_task_prepare', prepareArgs(h, { candidates: ['whatever-the-cli-accepts'] }))
+    expect(r.ok).toBe(true)
+  })
+
   test('rejects models outside the allowlist and unsupported permission mode', async () => {
     h = makeHarness()
     const r = await h.call('router_task_prepare', prepareArgs(h, { candidates: ['nope'] }))

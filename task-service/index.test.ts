@@ -25,8 +25,11 @@ function input(workRoot: string, enabled: boolean) {
     enabled,
     dynamicWorkdirs: { roots: [workRoot], allowedAgents: ['fake'] },
     backends: { fake: { enabled: true, models: ['fake-a'] } },
+    http: { enabled: false },
   })
 }
+
+const freePort = () => 20000 + Math.floor(Math.random() * 20000)
 
 describe('startTaskService', () => {
   test('creates a private dir and a 0600 socket, and serves tools over IPC', async () => {
@@ -87,6 +90,35 @@ describe('startTaskService', () => {
     await cancel(b)
     await new Promise(res => setTimeout(res, 50))
     expect(released).toEqual([require('fs').realpathSync(s.workdir)])
+  })
+
+  test('serves the MCP over Streamable HTTP with the service, and stops it with the service', async () => {
+    const s = setup()
+    const port = freePort()
+    const r = (await startTaskService({ input: { ...input(s.workRoot, true), http: { enabled: true, host: '127.0.0.1', port } }, projects: {}, allowedRoots: [s.workRoot], stateDir: s.stateDir, log: () => {}, buildBackends: () => [new FakeBackend()] }))!
+    expect(r.http?.url).toBe(`http://127.0.0.1:${port}/mcp`)
+    const init = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 't', version: '1' } } }
+    const res = await fetch(r.http!.url, { method: 'POST', body: JSON.stringify(init), headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' } })
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as any).result.serverInfo.name).toBe('router-task')
+    r.stop()
+    await expect(fetch(r.http!.url, { method: 'POST', body: '{}' })).rejects.toThrow()
+  })
+
+  test('a taken HTTP port does not stop the task service (fails soft, logged)', async () => {
+    const s = setup()
+    const port = freePort()
+    const blocker = Bun.serve({ hostname: '127.0.0.1', port, fetch: () => new Response('x') })
+    const logs: string[] = []
+    try {
+      const r = (await startTaskService({ input: { ...input(s.workRoot, true), http: { enabled: true, host: '127.0.0.1', port } }, projects: {}, allowedRoots: [s.workRoot], stateDir: s.stateDir, log: m => { logs.push(m) }, buildBackends: () => [new FakeBackend()] }))!
+      running.push(r)
+      expect(r.http).toBeNull()
+      expect(logs.some(l => l.includes('MCP HTTP endpoint NOT started'))).toBe(true)
+      expect(statSync(r.paths.socketPath).mode & 0o777).toBe(0o600)
+    } finally {
+      blocker.stop(true)
+    }
   })
 
   test('disabled with no database does not start', async () => {

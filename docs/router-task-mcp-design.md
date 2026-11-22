@@ -202,7 +202,12 @@ taskService:
     allowedAgents: [opencode, claude, codex, agy]
     requireGitWorktree: false    # true: workdir must contain a .git dir/file
     denyPaths: []                # extra canonical subtrees that are refused
+  http:                          # router-task MCP over Streamable HTTP (§7.4a)
+    enabled: true
+    host: 127.0.0.1
+    port: 8767
   backends:                      # task-side settings; chat settings under `agents:` are untouched
+                                 # `models` is optional everywhere: omitted = pass the model through to the CLI
     opencode:                    # endpoint/password still come from agents.opencode
       models: ["deepseek/deepseek-flash"]   # explicit allowlist; no implicit default model
     claude:
@@ -314,6 +319,19 @@ Example configuration for any MCP client:
 ```
 
 `--service-socket` is optional and defaults to `$FEISHU_STATE_DIR/task-service/task.sock`. The facade refuses a socket path whose parent directory fails the 0700/owner check.
+
+### 7.4a Streamable HTTP (default transport)
+
+Owner direction (2026-11-22): the MCP is served over Streamable HTTP and starts together with the router. `mcp/http.ts` runs inside the router process next to task.sock and calls the `TaskService` in-process through the same facade (`createFacade` with an in-process requester). The tools, envelopes and timeouts are identical to the stdio facade.
+- **Transport:** stateless (a fresh facade and transport per POST) with JSON responses. All state lives in the task service.
+- **Security:**
+  - binds loopback only (`127.0.0.1` / `localhost` / `::1`; any other address is refused);
+  - DNS-rebinding protection: the `Host` must be the bound `host:port`, and a browser `Origin` must match it;
+  - optional bearer token (`taskService.http.bearerTokenFile`, compared in constant time);
+  - admin operations are never exposed.
+- **Config:** `taskService.http {enabled (default true), host, port (default 8767), bearerTokenFile}`.
+- **Failure:** fails soft. A taken port or an unreadable token is logged, and the task service and the stdio launcher keep working.
+- **Trust model:** this widens the stdio model from "same UID, via a 0700 dir and 0600 socket" to "any local process that can reach loopback". Set a bearer token on a multi-user machine.
 
 ### 7.5 Tool annotations
 

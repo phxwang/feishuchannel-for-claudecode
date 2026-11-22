@@ -43,8 +43,8 @@ export class BackendRegistry {
     return [...real, ...NOT_IMPLEMENTED.filter(n => !this.get(n)).map(n => stub(n.kind, n.mode))]
   }
 
-  backendConfig(kind: BackendKind): { models: string[]; maxConcurrentTasks?: number } | undefined {
-    const b = this.config.backends as Record<string, { models: string[]; maxConcurrentTasks?: number; enabled?: boolean } | undefined>
+  backendConfig(kind: BackendKind): { models?: string[]; maxConcurrentTasks?: number } | undefined {
+    const b = this.config.backends as Record<string, { models?: string[]; maxConcurrentTasks?: number; enabled?: boolean } | undefined>
     const entry = b[kind]
     if (!entry) return undefined
     if (kind === 'fake' && !entry.enabled) return undefined
@@ -58,7 +58,8 @@ export class BackendRegistry {
     if (!this.get(c) && !NOT_IMPLEMENTED.some(n => n.kind === c.kind && n.mode === c.mode)) {
       throw new DomainError('UNSUPPORTED_CAPABILITY', `Backend ${c.kind}/${c.mode} is not available.`, { candidateIndex: index, kind: c.kind, mode: c.mode })
     }
-    if (!cfg.models.includes(c.model)) throw new DomainError('INVALID_REQUEST', 'Model is not in the server allowlist for this backend.', { candidateIndex: index, model: c.model })
+    // No allowlist configured: pass the model through; the agent CLI is the authority on what it accepts.
+    if (cfg.models && !cfg.models.includes(c.model)) throw new DomainError('INVALID_REQUEST', 'Model is not in the server allowlist for this backend.', { candidateIndex: index, model: c.model })
     if (c.variant !== null && c.kind !== 'fake') {
       throw new DomainError('UNSUPPORTED_CAPABILITY', 'Model variants are not supported by this backend in phase 1.', { candidateIndex: index })
     }

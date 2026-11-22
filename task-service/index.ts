@@ -7,7 +7,7 @@
  * Fails closed: on any error the task service does not start, the chat
  * router keeps running.
  */
-import { existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { checkPrivateDir } from './access'
 import type { TaskBackend } from './backends/backend'
@@ -15,6 +15,7 @@ import { BackendRegistry } from './backends/registry'
 import { finalizeTaskServiceConfig, type TaskServiceConfig, type TaskServiceConfigInput } from './config'
 import { TaskService } from './core/service'
 import { IpcServer } from './ipc/server'
+import { startHttpMcp, type HttpMcpServer } from '../mcp/http'
 import { TaskStore } from './store/task-store'
 import { systemClock } from './time'
 import { releasedWorkdir } from './workdir-release'
@@ -50,6 +51,8 @@ export interface RunningTaskService {
   paths: TaskServicePaths
   drain: boolean
   hasLiveWork(): boolean
+  /** The Streamable HTTP MCP endpoint, when enabled and started. */
+  http: HttpMcpServer | null
   stop(): void
 }
 
@@ -117,6 +120,7 @@ export async function startTaskService(o: StartOptions): Promise<RunningTaskServ
   o.log(`task-service: listening on ${paths.socketPath}${drain ? ' (drain mode)' : ''}`)
   const started = service
   const server = ipc
+  const http = await startHttp(config, started, o.log)
 
   const prune = setInterval(() => {
     try {
@@ -130,6 +134,31 @@ export async function startTaskService(o: StartOptions): Promise<RunningTaskServ
     service: started, ipc: server, paths, drain,
     // Live = a task that is not CLOSED. An idle connected MCP client does not pin the router.
     hasLiveWork: () => started.hasLiveWork(),
-    stop: () => { clearInterval(prune); server.close(); started.stop(); store.close() },
+    http,
+    stop: () => { clearInterval(prune); http?.stop(); server.close(); started.stop(); store.close() },
+  }
+}
+
+function packageVersion(): string {
+  try { return JSON.parse(readFileSync(join(import.meta.dir, '..', 'package.json'), 'utf8')).version ?? '0.0.0' } catch { return '0.0.0' }
+}
+
+/**
+ * Start the HTTP MCP endpoint. Fails soft: the task service and task.sock (and
+ * the stdio launcher) keep working if the port is taken or the token is unreadable.
+ */
+async function startHttp(config: TaskServiceConfig, service: TaskService, log: (msg: string) => void): Promise<HttpMcpServer | null> {
+  const h = config.http
+  if (!h.enabled) return null
+  try {
+    let bearerToken: string | undefined
+    if (h.bearerTokenFile) {
+      bearerToken = readFileSync(h.bearerTokenFile, 'utf8').trim()
+      if (!bearerToken) throw new Error(`bearer token file ${h.bearerTokenFile} is empty`)
+    }
+    return await startHttpMcp({ service, host: h.host, port: h.port, version: packageVersion(), bearerToken, log })
+  } catch (e) {
+    log(`task-service: MCP HTTP endpoint NOT started (${h.host}:${h.port}): ${e instanceof Error ? e.message : String(e)}`)
+    return null
   }
 }

@@ -5,6 +5,7 @@
 import { chmodSync, existsSync, lstatSync, unlinkSync } from 'fs'
 import { createServer, type Server, type Socket } from 'net'
 import type { TaskService } from '../core/service'
+import { dispatchFacadeRequest } from './dispatch'
 import { frame, LineBuffer, type IpcRequest } from './protocol'
 
 export interface IpcServerOptions {
@@ -89,12 +90,8 @@ export class IpcServer {
     const svc = this.o.service
     switch (req.method) {
       case 'ping': return { ok: true }
-      case 'tool': return { envelope: await svc.call(String(p.name), p.arguments ?? {}) }
-      case 'resource.read': {
-        const r = svc.readResource(String(p.uri))
-        if (r.kind === 'ok') return { resource: r.data }
-        return { resourceError: r }
-      }
+      case 'tool':
+      case 'resource.read': return dispatchFacadeRequest(svc, req.method, p)
       case 'admin.inspect': return svc.adminInspect(String(p.taskId))
       case 'admin.release': return svc.adminRelease(String(p.taskId), String(p.note ?? ''))
       default: throw new Error(`unknown method ${String(req.method)}`)
