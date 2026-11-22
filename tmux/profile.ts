@@ -10,7 +10,7 @@ import { existsSync } from 'fs'
 import type { BackgroundWait } from '../background-tasks'
 import type { Dialog, DialogOption } from './dialog'
 
-export type TmuxCliKind = 'claude' | 'agy'
+export type TmuxCliKind = 'claude' | 'agy' | 'codex'
 
 export interface ProgressEvent { tool: string; summary: string }
 
@@ -19,6 +19,8 @@ export interface SpawnOptions {
   model?: string
   effort?: string
   permissionMode?: string
+  /** Sandbox policy for CLIs that have one (Codex `-s`: 'read-only' | 'workspace-write'). */
+  sandbox?: string
 }
 
 export interface SpawnPlan {
@@ -103,6 +105,14 @@ export interface TmuxCliProfile {
    * stop has been fully processed. Omit for 'absorb' profiles.
    */
   isUserTurnStart?(line: string): boolean
+  /**
+   * True if this transcript line ends the current turn (Codex's
+   * `task_complete` / `turn_aborted` records). Treated exactly like the stop
+   * signal firing, for CLIs whose own turn-end hook misses some endings
+   * (Codex's `notify` never fires for failed or interrupted turns). A
+   * profile that sets this also opts out of the quiet-period fallback.
+   */
+  isTurnEnd?(line: string): boolean
   parseText(lines: string[]): string[]
   parseProgress(lines: string[]): ProgressEvent[]
   parseDialog(plainPane: string): Dialog | null

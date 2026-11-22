@@ -54,6 +54,7 @@ export interface TmuxTaskInput {
 const NAMES = {
   claude: { short: 'Claude', long: 'Claude Code (tmux)' },
   agy: { short: 'Antigravity', long: 'Antigravity (tmux)' },
+  codex: { short: 'Codex', long: 'Codex (tmux)' },
 } as const
 
 /**

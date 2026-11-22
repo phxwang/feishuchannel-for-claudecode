@@ -42,6 +42,7 @@ import { decodeBase64DataUri } from './data-uri'
 import { TmuxClaudeManager } from './claude-tmux-worker'
 import { TmuxCliManager } from './tmux/manager'
 import { createAgyProfile } from './tmux/profiles/agy'
+import { createCodexProfile } from './tmux/profiles/codex'
 import { resolveBin } from './tmux/profile'
 import { AGY_QUOTA_COOLDOWN_MS, isAgyQuotaError } from './tmux/agy-errors'
 import { createTmuxRouting, TMUX_BACKEND_NAMES, type AttachmentRef } from './tmux-route'
@@ -151,6 +152,21 @@ const tmuxAgy = new TmuxCliManager(createAgyProfile({ bin: infraConfig?.agents.a
     get: (workdir: string) => getTmuxSessionId(db, AGY_SESSION_KEY_PREFIX + workdir),
     set: (workdir: string, sessionId: string) => setTmuxSessionId(db, AGY_SESSION_KEY_PREFIX + workdir, sessionId, new Date().toISOString()),
     delete: (workdir: string) => deleteTmuxSessionId(db, AGY_SESSION_KEY_PREFIX + workdir),
+  },
+})
+
+/**
+ * Codex via tmux (tmux/profiles/codex.ts): same manager and per-workdir
+ * session model as agy, with the same tmux_sessions persistence (key prefix
+ * `codex:`) so a restart resumes the exact Codex thread. Used by the task MCP.
+ */
+const CODEX_SESSION_KEY_PREFIX = 'codex:'
+const tmuxCodex = new TmuxCliManager(createCodexProfile({ bin: infraConfig?.taskService?.backends?.codex?.bin ?? undefined }), {
+  dbg,
+  persistence: {
+    get: (workdir: string) => getTmuxSessionId(db, CODEX_SESSION_KEY_PREFIX + workdir),
+    set: (workdir: string, sessionId: string) => setTmuxSessionId(db, CODEX_SESSION_KEY_PREFIX + workdir, sessionId, new Date().toISOString()),
+    delete: (workdir: string) => deleteTmuxSessionId(db, CODEX_SESSION_KEY_PREFIX + workdir),
   },
 })
 
@@ -1132,6 +1148,12 @@ if (infraConfig?.taskService) {
               if (isAgyQuotaError(error)) degraded.markDegraded(agyDegradedKey(workdir), Date.now() + AGY_QUOTA_COOLDOWN_MS)
             },
           },
+          codex: {
+            manager: tmuxCodex,
+            bin: infraConfig?.taskService?.backends?.codex?.bin ?? resolveBin('codex', ['/opt/homebrew/bin/codex', '/usr/local/bin/codex', join(homedir(), '.local', 'bin', 'codex')]),
+            // Sandbox is server config only; approvals stay on-request so prompts reach the broker (backend_policy auto-denies them).
+            spawnFor: (c) => ({ model: c.model, sandbox: cfg.backends.codex?.sandbox ?? 'workspace-write', permissionMode: 'on-request' }),
+          },
         },
       }),
     })
@@ -1199,6 +1221,8 @@ const TMUX_IDLE_SWEEP_MS = 10 * 60 * 1000
 setInterval(() => { void tmuxClaude.killIdleSessions(TMUX_IDLE_MS) }, TMUX_IDLE_SWEEP_MS)
 // agy keeps its conversation id across an idle kill, so the next message resumes it (`--conversation`).
 setInterval(() => { void tmuxAgy.killIdleSessions(TMUX_IDLE_MS) }, TMUX_IDLE_SWEEP_MS)
+// Codex resumes its thread (`codex resume <id>`) after an idle kill, like agy.
+setInterval(() => { void tmuxCodex.killIdleSessions(TMUX_IDLE_MS) }, TMUX_IDLE_SWEEP_MS)
 setInterval(pruneOldTmuxAttachments, TMUX_IDLE_SWEEP_MS)
 
 // Keep alive

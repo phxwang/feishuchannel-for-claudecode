@@ -512,6 +512,7 @@ export class TmuxCliManager {
       let segment: string[] = []
       for (const line of newLines) {
         if (profile.isLocalCommandResult?.(line)) sawLocalCommandResult = true
+        if (profile.isTurnEnd?.(line)) sawTurnEnd = true
         if (profile.isUserTurnStart?.(line)) {
           deliver(segment)
           segment = []
@@ -527,7 +528,9 @@ export class TmuxCliManager {
       return true
     }
 
-    const stopFired = () => !!signalPath && existsSync(signalPath) && statSync(signalPath).mtimeMs > baselineStopMs
+    /** A transcript record ended the turn (TmuxCliProfile.isTurnEnd) — counts like the stop signal firing. */
+    let sawTurnEnd = false
+    const stopFired = () => sawTurnEnd || (!!signalPath && existsSync(signalPath) && statSync(signalPath).mtimeMs > baselineStopMs)
     // A local-only slash command (see TmuxCliProfile.slashCommandIdleMs) ends
     // when the pane has been idle for a while and no turn ever started.
     const slashIdleMs = profile.slashCommandIdleMs
@@ -562,7 +565,8 @@ export class TmuxCliManager {
           if (readGrowth()) { lastGrowthMs = Date.now(); continue }
           if (isQuietDone(lastGrowthMs, Date.now(), this.postStopQuietMs)) break
         }
-        baselineStopMs = statSync(signalPath!).mtimeMs
+        sawTurnEnd = false
+        if (signalPath && existsSync(signalPath)) baselineStopMs = statSync(signalPath).mtimeMs
         const outcome = profile.afterStop({ workdir, sessionName: name, transcriptPath, plainPane: stripAnsi(await this.capturePane(name)) })
         // A /reset or /restart may have landed during that await — don't
         // write this dead session's state back over the new one.
@@ -612,7 +616,7 @@ export class TmuxCliManager {
         return
       }
       // Quiet-period fallback only when there's no stop signal at all.
-      if (!signalPath && anyCollected && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) return
+      if (!signalPath && !profile.isTurnEnd && anyCollected && isQuietDone(lastChangeMs, Date.now(), this.quietMs)) return
 
       // A local slash command recorded its result and nothing followed: no
       // Stop hook will come for it (Claude's /model, /cost …).
