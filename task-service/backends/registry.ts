@@ -5,7 +5,7 @@
 import type { TaskServiceConfig } from '../config'
 import { DomainError } from '../errors'
 import type { PermissionMode } from '../schema/policy'
-import type { BackendKind, BackendMode, Candidate } from '../schema/primitives'
+import { DEFAULT_MODEL, type BackendKind, type BackendMode, type Candidate } from '../schema/primitives'
 import type { BackendCapabilities, TaskBackend } from './backend'
 
 /** Known combinations that exist in the contract vocabulary but have no task adapter yet. */
@@ -59,7 +59,8 @@ export class BackendRegistry {
       throw new DomainError('UNSUPPORTED_CAPABILITY', `Backend ${c.kind}/${c.mode} is not available.`, { candidateIndex: index, kind: c.kind, mode: c.mode })
     }
     // No allowlist configured: pass the model through; the agent CLI is the authority on what it accepts.
-    if (cfg.models && !cfg.models.includes(c.model)) throw new DomainError('INVALID_REQUEST', 'Model is not in the server allowlist for this backend.', { candidateIndex: index, model: c.model })
+    // DEFAULT_MODEL ("default") always means the backend's own configured default.
+    if (cfg.models && c.model !== DEFAULT_MODEL && !cfg.models.includes(c.model)) throw new DomainError('INVALID_REQUEST', 'Model is not in the server allowlist for this backend.', { candidateIndex: index, model: c.model })
     if (c.variant !== null && c.kind !== 'fake') {
       throw new DomainError('UNSUPPORTED_CAPABILITY', 'Model variants are not supported by this backend in phase 1.', { candidateIndex: index })
     }

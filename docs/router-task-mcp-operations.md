@@ -37,7 +37,7 @@ How to enable, use, observe, disable and roll back the router task service and i
        # bearerTokenFile: /path/to/token   # optional; clients then send Authorization: Bearer <token>
    ```
 
-   `models` is optional for every backend. When it is left out, the candidate's model string is passed straight through to the agent CLI, which decides what it accepts. An empty block such as `claude: {}` enables the backend with no restriction. When `models` is listed, it acts as an allowlist.
+   `models` is optional for every backend. When it is left out, the candidate's model string is passed straight through to the agent CLI, which decides what it accepts. An empty block such as `claude: {}` enables the backend with no restriction. When `models` is listed, it acts as an allowlist. `model: "default"` always passes: it means the backend's own configured default (no model flag).
 
    Rules enforced at load time (the task service refuses to start if they are violated; the chat router keeps running):
    - A root may not be `/`, `$HOME`, or contain `$HOME`, the Feishu state directory or `~/.claude`.
@@ -145,11 +145,11 @@ All backends run through the router's existing execution objects. A task on a wo
 | kind/mode | permission modes | fallback triggers (before delivery) | notes |
 |---|---|---|---|
 | `opencode/http_sse` | broker, backend_policy | backend_unavailable, startup_failed, rate_limited, provider_unavailable | The router's `OpenCodeAdapter`. One session per workdir (`task:workdir:<dir>` binding). A busy session is refused. |
-| `claude/tmux` | broker (menus), backend_policy (auto-deny) | backend_unavailable, startup_failed | The router's `tmuxClaude`, shared with chat. A busy session is refused. |
+| `claude/tmux` | broker (menus), backend_policy (auto-deny) | backend_unavailable, startup_failed, authentication_invalid (+ authentication_invalid at clean_failure) | The router's `tmuxClaude`, shared with chat. A busy session is refused. Preflight runs `claude auth status --json`; a first-request `verification_required` / `authentication_failed` API error is the clean-failure auth case. |
 | `agy/tmux` | broker (menus), backend_policy (auto-deny) | backend_unavailable, startup_failed | The router's `tmuxAgy`, shared with chat. The quota cooldown is respected. |
 | `codex/tmux` | broker (menus), backend_policy (auto-deny) | backend_unavailable, startup_failed | The Codex profile on the shared tmux manager |
 | `fake/exec` | broker, backend_policy | all | Tests only (`backends.fake.enabled`) |
 
 A tmux turn in flight lives only in router memory. If the router restarts mid-turn, the task becomes UNKNOWN; use `router_task_cancel` or `admin.ts release`. Input is never resent.
 
-Not advertised in phase 1: clean-failure fallback, checkpoint handoff, same-owner reset resume, native `/goal`, multi-turn (`router_task_add_turn` returns `UNSUPPORTED_CAPABILITY`).
+Not advertised in phase 1: clean-failure fallback (except Claude's auth failure), checkpoint handoff, same-owner reset resume, native `/goal` on backends other than `claude/tmux`, multi-turn (`router_task_add_turn` returns `UNSUPPORTED_CAPABILITY`).

@@ -112,6 +112,7 @@ A transport or protocol problem (bad JSON-RPC, unknown tool, wrong header) is an
 | `opencode` | `http_sse` | The router's OpenCode server |
 
 - `model` is passed **as-is** to the agent CLI. The router does not keep an allowlist (unless an operator configures `backends.<kind>.models`), so the CLI decides what it accepts.
+- `model: "default"` (any backend) means the backend's own configured default: no model flag is passed to the CLI / OpenCode, and an operator allowlist does not apply to it.
 - For tmux backends the model only applies when a session is **spawned**. A workdir with a running session keeps that session's model.
 - `variant` must be `null`.
 - `router_capabilities` shows which kind/mode pairs are `available` right now.
@@ -131,6 +132,8 @@ A transport or protocol problem (bad JSON-RPC, unknown tool, wrong header) is an
 A task's turn is `completed` only when:
 - **text input:** the agent **and all its background subtasks** have stopped;
 - **`native_goal` input:** the agent's `/goal` reported the goal **achieved**. A cleared, interrupted or never-set goal counts as `failed`.
+
+A Claude turn that ends on an API error (account verification, rejected credentials, rate limit, server error …) is `failed`, never `completed`, even though the error text is the turn's final text.
 
 `businessAcceptance` is always `not_evaluated`. Whether the work is good is the client's call.
 
@@ -153,6 +156,8 @@ Each entry in `backends[]` has:
 - `features {isolatedSession, samePrimaryTurns, recoverAcceptedTurn, permissionReply, cancel, eventReplay}`;
 - `permissionModes`, `maxConcurrentTasks`, `fallbackContractVersion`, `supportedFallbackTriggers[]`;
 - `orderedFallback`, `cleanFailureFallback`, `checkpointHandoff`, `sameOwnerResetRecovery`, `nativeGoal`.
+
+`claude/tmux` advertises `authentication_invalid` at `before_delivery` and `clean_failure`, with `cleanFailureFallback: true` (§4.3.1).
 
 `limits`:
 
@@ -206,6 +211,40 @@ Creates a `PREPARED` task with a frozen assignment and policy. **Nothing runs, a
 | `fallback.sameOwnerReset` | `{enabled, maxWaitSeconds 0–43200, maxResumeActions 0–1}` | Use `enabled: false` |
 
 Returns `{task: TaskSnapshot, resources: {snapshotUri, resultUri}}`. Keep `task.taskId`, `task.controlVersion` and `task.fallbackPlanSha256`.
+
+#### 4.3.1 Auth-failed fallback
+
+`authentication_invalid` in `triggerOn` is the generic "auth failed" condition. Order and limits are the general policy fields. **The Router alone decides whether to switch and starts the next agent.** It has two stages; list the ones you allow:
+
+| Stage | Claude case | Detected by |
+|---|---|---|
+| `before_delivery` | Logged out / invalid credentials | Preflight `claude auth status --json` → `loggedIn: false`. Nothing is sent to Claude |
+| `clean_failure` | Logged in, but the account must verify (Anthropic Verification Portal), or credentials rejected | The turn's first request fails with a transcript API error `verification_required` or `authentication_failed`, and no tool ran (`effects: none`). Switching needs a fresh grant (`authorization.required` → `router_task_authorize`) |
+
+An unreadable auth status (spawn error, timeout, non-JSON) is not an auth failure — the task runs on Claude. Any other API error (`rate_limit`, `server_error`, `invalid_request` …) fails the task as `execution_failed`, never as auth.
+
+Listing only this trigger means quota or rate limits, network errors, timeouts, approval denials, configuration errors and ambiguous failures end the task. Uncertain delivery puts the task in `UNKNOWN`; another agent is never started. An assignment that must stay in the same Claude session sends `enabled: false`.
+
+`model: "default"` (any backend) means the backend's own configured default model — use it for OpenCode unless the assignment names a model.
+
+Example (Writer3 / Hermes OC Issue rule):
+
+```json
+"fallback": {
+  "enabled": true,
+  "candidates": [
+    {"kind": "claude", "mode": "tmux", "model": "opus", "variant": null},
+    {"kind": "opencode", "mode": "http_sse", "model": "default", "variant": null}
+  ],
+  "triggerOn": [
+    {"code": "authentication_invalid", "stage": "before_delivery"},
+    {"code": "authentication_invalid", "stage": "clean_failure"}
+  ],
+  "maxSwitches": 1, "startupRetriesPerCandidate": 0, "retryDelaySeconds": 0, "maxRecoverySeconds": 300,
+  "onExhausted": "fail",
+  "sameOwnerReset": {"enabled": false, "maxWaitSeconds": 0, "maxResumeActions": 0}
+}
+```
 
 ### 4.4 `router_task_get`
 `{taskId}` → `{task, resources}`.
@@ -298,7 +337,7 @@ Interrupts the task's own agent turn (Esc) and finalizes. For a `native_goal` ta
 ### 4.14 `router_task_authorize` (mutation)
 `{taskId, idempotencyKey, expectedControlVersion, expectedOwner, transitionRequestId, decision: "allow"|"deny", authorization}`.
 
-Use it to answer an `authorization.required` event (a fallback switch needs your fresh grant):
+Use it to answer an `authorization.required` event (a fallback switch needs your fresh grant — every switch at stage `clean_failure` or `checkpoint_handoff`, e.g. Claude's account-verification auth failure, §5.4):
 - `decision: "allow"`: send `authorization` as in §4.6, plus `transitionSha256` taken from the event.
 - `decision: "deny"`: send `authorization: null`.
 
@@ -327,6 +366,17 @@ Reserved for multi-turn tasks. It currently returns `UNSUPPORTED_CAPABILITY`.
 - Send `assignment.inputKind: "native_goal"` with `prompt: "/goal <single-line condition, ≤ 900 bytes>"`.
 - Only candidates with `nativeGoal: true` qualify (today `claude/tmux`). Every candidate in the fallback chain must support it.
 - The task stays `ACTIVE` across all of the goal's self-continued turns. It ends `completed` only when Claude reports the goal achieved, and cancelling clears the goal.
+
+### 5.4 Auth-failed fallback (Writer3 / Hermes)
+1. `router_capabilities`: `claude/tmux` must list `authentication_invalid` at the stages you will use, and the fallback candidate must be `available`.
+2. `router_task_prepare` with the ordered candidates and the generic auth trigger only (§4.3.1), e.g. `[claude, {"kind":"opencode","mode":"http_sse","model":"default","variant":null}]` and `triggerOn: [authentication_invalid@before_delivery, authentication_invalid@clean_failure]`. For an assignment that must stay in the same Claude session send `enabled: false`.
+3. `router_task_start` as usual. Never start the next agent yourself — the Router does.
+4. Watch the events:
+   - **Logged out** (`before_delivery`): `execution_attempt.ended` → `fallback.evaluated {decision: "switch", triggerCode: "authentication_invalid", stage: "before_delivery"}` → `fallback.planned {candidateIndex, backend}` → the next agent runs. No grant needed; nothing was sent to Claude.
+   - **Verification required / credentials rejected** (`clean_failure`): `turn.ended {outcome: "failed"}` → `fallback.evaluated` → `authorization.required {transitionRequestId, transitionSha256, candidateIndex, backend, triggerCode}`. Answer with `router_task_authorize` (`allow` + `transitionSha256`, or `deny`). Then `fallback.planned` and the next agent runs.
+   - **Anything else** (quota, rate limit, network, timeout, approval denial, configuration, unreadable auth status): `fallback.evaluated {decision: "terminate"}`; the task fails with no switch.
+   - **Delivery uncertain:** `task.unknown`; no other agent is started.
+5. `router_task_result.executionAttempts[]` shows each attempt's candidate and outcome (e.g. `failed` on Claude, then `completed` on OpenCode); `task.actualBackend` is the agent that ran last.
 
 ---
 

@@ -32,6 +32,14 @@ export type BackendKind = (typeof BACKEND_KINDS)[number]
 export const BACKEND_MODES = ['http_sse', 'tmux', 'print', 'acp', 'exec'] as const
 export type BackendMode = (typeof BACKEND_MODES)[number]
 
+/** Model value meaning "the backend's own configured default model". */
+export const DEFAULT_MODEL = 'default'
+
+/** The model to pass to the backend CLI/API, or undefined for its configured default. */
+export function explicitModel(c: { model: string }): string | undefined {
+  return c.model === DEFAULT_MODEL ? undefined : c.model
+}
+
 export const candidateSchema = z.object({
   kind: z.enum(BACKEND_KINDS),
   mode: z.enum(BACKEND_MODES),

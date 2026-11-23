@@ -6,6 +6,7 @@
  * numbered menus answered with digit + Enter.
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'fs'
+import { lastTurnApiError } from './claude-api-error'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { createHash, randomUUID } from 'crypto'
@@ -159,6 +160,8 @@ export function buildSettingsOverride(sessionId: string): string {
   return JSON.stringify({
     hooks: {
       Stop: [{ matcher: '', hooks: [{ type: 'command', command: `touch '${signalPath}'` }] }],
+      // A turn that ends on an API error (auth, verification, rate limit …) fires StopFailure, not Stop.
+      StopFailure: [{ matcher: '', hooks: [{ type: 'command', command: `touch '${signalPath}'` }] }],
     },
   })
 }
@@ -244,7 +247,11 @@ export const claudeProfile: TmuxCliProfile = {
   afterStop(ctx: StopContext): StopOutcome {
     const pending = pendingBackgroundTasks(ctx.transcriptPath)
     const runningShells = parseRunningShellCount(ctx.plainPane)
-    return { wait: backgroundWaitAfterStop(pending.size, runningShells) }
+    const apiError = lastTurnApiError(ctx.transcriptPath)
+    return {
+      wait: backgroundWaitAfterStop(pending.size, runningShells),
+      ...(apiError ? { error: apiError.text || `API Error (${apiError.code})`, errorCode: apiError.code } : {}),
+    }
   },
 
   isLocalCommandResult: isLocalCommandResultLine,

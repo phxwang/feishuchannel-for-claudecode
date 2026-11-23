@@ -821,6 +821,17 @@ Owner decisions (2026-11-22):
 
 ## 12. Fallback and recovery controller
 
+### 12.0 Auth-failed trigger and default models
+
+`authentication_invalid` is the generic "auth failed" trigger. The Claude tmux backend raises it in two cases:
+
+- `before_delivery`: preflight runs `claude auth status --json` (`backends/claude-auth.ts`, `SharedTmuxBackendOptions.authCheck`); only `loggedIn: false` counts. An unreadable status is never a trigger.
+- `clean_failure`: logged in, but the turn's first request is refused (account verification via the Anthropic Verification Portal, or rejected credentials). Claude Code fires `StopFailure` (the profile hooks it like `Stop`) and writes a synthetic assistant entry with `isApiErrorMessage: true` and `error: verification_required | authentication_failed`; `tmux/profiles/claude-api-error.ts` reads it into `StopOutcome.errorCode`. With no tool call the turn reports `effects: none`. Other API error categories fail the turn as `execution_failed`.
+
+The backend advertises both pairs and `cleanFailureFallback` only when it has the probe.
+
+`model: "default"` on any candidate means the backend's own configured default (`explicitModel()`); model allowlists do not apply to it.
+
 ### 12.1 Policy validation (`task-service/fallback/policy.ts`)
 
 Policy validation is pure and enforces every rule in spec §12.1:

@@ -14,6 +14,7 @@ import type { TaskServiceConfig } from '../config'
 import type { TaskServicePaths } from '../index'
 import type { Candidate } from '../schema/primitives'
 import type { TaskBackend } from './backend'
+import type { AuthCheck } from './claude-auth'
 import { FakeBackend } from './fake'
 import { OpenCodeTaskBackend } from './opencode'
 import { SharedTmuxBackend, type TmuxTaskKind } from './tmux-shared'
@@ -24,6 +25,8 @@ export interface TmuxCliDeps {
   bin: string
   spawnFor: (candidate: Candidate, workdir: string) => SpawnOptions
   unavailableReason?: (workdir: string) => string | null
+  /** Credential probe for preflight (Claude). */
+  authCheck?: AuthCheck
   onStopError?: (workdir: string, error: string) => void
 }
 
@@ -58,7 +61,7 @@ export function createTaskBackends(config: TaskServiceConfig, _paths: TaskServic
     if (!t) { deps.log(`task-service: backends.${kind} is configured but the router has no ${kind} tmux manager; ${kind} tasks are unavailable`); continue }
     out.push(new SharedTmuxBackend({
       kind, manager: t.manager, spawnFor: t.spawnFor, available: binAvailable(t.bin),
-      unavailableReason: t.unavailableReason, onStopError: t.onStopError,
+      unavailableReason: t.unavailableReason, authCheck: t.authCheck, onStopError: t.onStopError,
     }))
   }
   if (b.fake?.enabled) out.push(new FakeBackend())

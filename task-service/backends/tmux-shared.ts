@@ -19,6 +19,7 @@ import {
   notSent, type AttemptContext, type BackendCapabilities, type BackendEvent, type BackendHandle,
   type LocateResult, type NotSent, type OpenResult, type ReleaseResult, type SubmitResult, type TaskBackend,
 } from './backend'
+import type { AuthCheck } from './claude-auth'
 import { describeDialog, dialogRequestId, findDenyOption, permissionPair } from './dialog-permission'
 
 export type TmuxTaskKind = 'claude' | 'agy' | 'codex'
@@ -33,6 +34,11 @@ export interface SharedTmuxBackendOptions {
   available: () => Promise<{ ok: boolean; reason?: string }>
   /** Router-side "temporarily unavailable" state (e.g. agy quota cooldown); null = fine. */
   unavailableReason?: (workdir: string) => string | null
+  /**
+   * Credential probe run in preflight (Claude: `claude auth status`). Only a
+   * positive "invalid" result is reported as `authentication_invalid`.
+   */
+  authCheck?: AuthCheck
   /** Router-side handling of a CLI-reported stop error (e.g. mark agy degraded). */
   onStopError?: (workdir: string, error: string) => void
 }
@@ -47,6 +53,8 @@ interface Run {
   delivered: boolean
   interrupted: boolean
   stopError: string | null
+  /** The CLI's category for stopError, when it gives one. */
+  stopCode: string | null
   endReason: WaitEndReason | null
   /** native_goal input: completion requires the goal to be achieved, not just a turn to stop. */
   goalInput: boolean
@@ -74,6 +82,19 @@ const TRIGGERS: BackendCapabilities['fallback']['supportedFallbackTriggers'] = [
   { code: 'backend_unavailable', stage: 'before_delivery' },
   { code: 'startup_failed', stage: 'before_delivery' },
 ]
+/** With a credential probe (Claude): auth failure before delivery (`auth status`) and as a turn's first-request API error. */
+const AUTH_TRIGGERS = [
+  { code: 'authentication_invalid', stage: 'before_delivery' },
+  { code: 'authentication_invalid', stage: 'clean_failure' },
+] as const
+
+/**
+ * CLI error categories that mean "auth failed" although the CLI is logged in
+ * (Claude: account verification required via the Verification Portal, or
+ * rejected credentials). Everything else (rate_limit, server_error …) stays
+ * execution_failed and is never an auth fallback.
+ */
+const AUTH_ERROR_CODES: ReadonlySet<string> = new Set(['verification_required', 'authentication_failed'])
 
 export class SharedTmuxBackend implements TaskBackend {
   readonly kind: TmuxTaskKind
@@ -91,7 +112,9 @@ export class SharedTmuxBackend implements TaskBackend {
       // Sessions are per workdir and shared with chat; a turn in flight lives only in router memory.
       features: { isolatedSession: false, samePrimaryTurns: false, recoverAcceptedTurn: false, permissionReply: true, cancel: true, eventReplay: true },
       permissionModes: ['broker', 'backend_policy'],
-      fallback: { orderedFallback: true, supportedFallbackTriggers: TRIGGERS, cleanFailureFallback: false, checkpointHandoff: false, sameOwnerResetRecovery: false, nativeGoal: this.supportsGoals() },
+      fallback: { orderedFallback: true, supportedFallbackTriggers: this.o.authCheck ? [...TRIGGERS, ...AUTH_TRIGGERS] : TRIGGERS,
+        // Clean-failure classification exists only for the auth case; its effects evidence is "no tool ran".
+        cleanFailureFallback: Boolean(this.o.authCheck), checkpointHandoff: false, sameOwnerResetRecovery: false, nativeGoal: this.supportsGoals() },
     }
   }
 
@@ -103,6 +126,11 @@ export class SharedTmuxBackend implements TaskBackend {
   async preflight(ctx: AttemptContext): Promise<{ kind: 'ok' } | NotSent> {
     const a = await this.o.available().catch(e => ({ ok: false, reason: String(e) }))
     if (!a.ok) return notSent('backend_unavailable', a.reason ?? `${this.kind} is unavailable`)
+    // Positive proof of bad credentials only; an unreadable status lets the attempt proceed (never a fallback trigger).
+    if (this.o.authCheck) {
+      const auth = await this.o.authCheck().catch(e => ({ state: 'unknown' as const, detail: String(e) }))
+      if (auth.state === 'invalid') return notSent('authentication_invalid', auth.detail)
+    }
     const workdir = ctx.workdir.canonicalPath
     const degraded = this.o.unavailableReason?.(workdir)
     if (degraded) return notSent('backend_unavailable', degraded)
@@ -128,7 +156,7 @@ export class SharedTmuxBackend implements TaskBackend {
     const workdir = ctx.workdir.canonicalPath
     if (this.o.manager.isBusy(workdir)) return notSent('backend_unavailable', `the ${this.kind} session for this workdir is busy`)
     const run: Run = {
-      workdir, queue: [], wake: null, done: false, delivered: false, interrupted: false, stopError: null, endReason: null,
+      workdir, queue: [], wake: null, done: false, delivered: false, interrupted: false, stopError: null, stopCode: null, endReason: null,
       goalInput, goal: 'none', goalCleared: false, toolSeq: 0, openTools: [], pending: new Map(), finished: Promise.resolve(),
     }
     this.runs.set(ctx.executionAttemptId, run)
@@ -147,7 +175,7 @@ export class SharedTmuxBackend implements TaskBackend {
       },
       onDialog: dialog => { delivered(); return this.onDialog(ctx, run, dialog, push) },
       onAbsorbed: () => { delivered(); push({ type: 'diagnostic', detail: 'input was folded into a turn already in flight on this session' }) },
-      onStopError: error => { run.stopError = error; this.o.onStopError?.(workdir, error) },
+      onStopError: (error, code) => { run.stopError = error; run.stopCode = code ?? null; this.o.onStopError?.(workdir, error) },
       onWaitEnded: (reason, info) => { run.endReason = reason; run.goal = info?.goal ?? 'none' },
     }).then(reply => {
       delivered()
@@ -158,6 +186,7 @@ export class SharedTmuxBackend implements TaskBackend {
       const goalMissed = run.goalInput && run.goal !== 'achieved'
       const finishedTurn = turnStopped && !goalMissed
       const outcome = run.interrupted ? 'cancelled' : run.stopError || !finishedTurn ? 'failed' : 'completed'
+      const authFailed = run.stopCode !== null && AUTH_ERROR_CODES.has(run.stopCode)
       const unfinishedReason = !turnStopped ? `reply wait ended: ${run.endReason ?? 'unknown'}` : `goal ${run.goal}, not achieved`
       push({
         type: 'turn.ended', outcome, finalText: reply || null,
@@ -166,8 +195,9 @@ export class SharedTmuxBackend implements TaskBackend {
           stopReason: run.stopError ?? (run.interrupted ? 'interrupted' : finishedTurn ? null : unfinishedReason),
         },
         process: { exitCode: null, signal: null, controlledShutdown: run.interrupted },
-        ...(outcome === 'failed' ? { failureCode: 'execution_failed' as const } : {}),
-        effects: run.toolSeq === 0 && !run.stopError ? 'none' : 'unknown',
+        ...(outcome === 'failed' ? { failureCode: authFailed ? 'authentication_invalid' as const : 'execution_failed' as const } : {}),
+        // An auth rejection with no tool call means nothing ran: the request itself was refused.
+        effects: run.toolSeq === 0 && (!run.stopError || authFailed) ? 'none' : 'unknown',
       })
     }, err => {
       // By the manager's contract a throw means the input never reached the CLI.

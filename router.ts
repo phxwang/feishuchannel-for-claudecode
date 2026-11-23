@@ -48,6 +48,8 @@ import { AGY_QUOTA_COOLDOWN_MS, isAgyQuotaError } from './tmux/agy-errors'
 import { createTmuxRouting, TMUX_BACKEND_NAMES, type AttachmentRef } from './tmux-route'
 import { startTaskService, type RunningTaskService } from './task-service'
 import { createTaskBackends } from './task-service/backends/factory'
+import { claudeAuthCheck } from './task-service/backends/claude-auth'
+import { explicitModel } from './task-service/schema/primitives'
 import { teardownTaskScopedWorkdir } from './task-service/workdir-teardown'
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -1125,6 +1127,7 @@ sockServer.listen(SOCK_PATH, () => {
 // Fails closed: a task-service error never stops chat routing.
 let taskService: RunningTaskService | null = null
 if (infraConfig?.taskService) {
+  const claudeTaskBin = resolveBin('claude', [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude'])
   try {
     taskService = await startTaskService({
       input: infraConfig.taskService,
@@ -1154,13 +1157,14 @@ if (infraConfig?.taskService) {
         tmux: {
           claude: {
             manager: tmuxClaude,
-            bin: resolveBin('claude', [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude']),
-            spawnFor: (c) => ({ model: c.model }),
+            bin: claudeTaskBin,
+            spawnFor: (c) => ({ model: explicitModel(c) }),
+            authCheck: claudeAuthCheck(claudeTaskBin),
           },
           agy: {
             manager: tmuxAgy,
             bin: infraConfig?.agents.agy?.bin ?? resolveBin('agy', [join(homedir(), '.local', 'bin', 'agy'), '/opt/homebrew/bin/agy', '/usr/local/bin/agy']),
-            spawnFor: (c, workdir) => resolveAgySpawnOptions(infraConfig, workdir, { model: c.model }),
+            spawnFor: (c, workdir) => resolveAgySpawnOptions(infraConfig, workdir, { model: explicitModel(c) }),
             unavailableReason: (workdir) => degraded.isDegraded(agyDegradedKey(workdir)) ? 'Antigravity is in a quota cooldown' : null,
             onStopError: (workdir, error) => {
               if (isAgyQuotaError(error)) degraded.markDegraded(agyDegradedKey(workdir), Date.now() + AGY_QUOTA_COOLDOWN_MS)
@@ -1170,7 +1174,7 @@ if (infraConfig?.taskService) {
             manager: tmuxCodex,
             bin: infraConfig?.taskService?.backends?.codex?.bin ?? resolveBin('codex', ['/opt/homebrew/bin/codex', '/usr/local/bin/codex', join(homedir(), '.local', 'bin', 'codex')]),
             // Sandbox is server config only; approvals stay on-request so prompts reach the broker (backend_policy auto-denies them).
-            spawnFor: (c) => ({ model: c.model, sandbox: cfg.backends.codex?.sandbox ?? 'workspace-write', permissionMode: 'on-request' }),
+            spawnFor: (c) => ({ model: explicitModel(c), sandbox: cfg.backends.codex?.sandbox ?? 'workspace-write', permissionMode: 'on-request' }),
           },
         },
       }),

@@ -39,6 +39,8 @@ export interface StopOutcome {
   conversationId?: string
   /** Error text the CLI attached to the stop (e.g. a quota error), if any. */
   error?: string
+  /** The CLI's machine-readable error category for `error` (Claude: "verification_required", "rate_limit" …), if it gives one. */
+  errorCode?: string
 }
 
 export interface StopContext {

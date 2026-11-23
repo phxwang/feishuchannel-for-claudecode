@@ -58,8 +58,8 @@ export interface SendAndAwaitReplyOptions extends SpawnOptions {
   onQueued?: () => void
   /** 'queue' CLIs only: called when this queued message's own turn becomes the current one. */
   onTurnStarted?: () => void
-  /** A turn stopped with an error the CLI reported (e.g. agy quota exhausted). Fire-and-forget. */
-  onStopError?: (error: string) => void
+  /** A turn stopped with an error the CLI reported (e.g. agy quota exhausted), plus its category when known. Fire-and-forget. */
+  onStopError?: (error: string, code?: string) => void
   /**
    * Why the reply wait ended, for callers that must tell a real turn end
    * ('stop') from giving up (session killed, timeout, idle, dialog ended…).
@@ -627,7 +627,7 @@ export class TmuxCliManager {
         if (outcome.error) {
           this.dbg(`${this.tag()}: ${workdir} turn stopped with error: ${outcome.error}`)
           const errorOwner = owners[matchStoppedOwner(owners.map(o => o.text), outcome.lastUserInput)] ?? current()
-          try { errorOwner?.opts.onStopError?.(outcome.error) } catch (e) { this.dbg(`${this.tag()}: onStopError threw: ${e}`) }
+          try { errorOwner?.opts.onStopError?.(outcome.error, outcome.errorCode) } catch (e) { this.dbg(`${this.tag()}: onStopError threw: ${e}`) }
         }
         // Queue-mode hand-off: settle every owner up to the one whose turn
         // just ended; if more are queued, the next one owns what follows.

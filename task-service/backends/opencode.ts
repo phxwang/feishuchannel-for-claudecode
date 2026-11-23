@@ -10,6 +10,7 @@
  * sessions and keeps the session for audit (no delete).
  */
 import { parseModel, type OpenCodeModel } from '../../adapters/opencode/model'
+import { explicitModel } from '../schema/primitives'
 import { nextPromptId, type OpenCodeAdapter, type TurnEvent } from '../../adapters/opencode/opencode-adapter'
 import { hasActiveToolPart, isSessionBusy, selectTurnMessages } from '../../adapters/opencode/turn'
 import type {
@@ -121,7 +122,7 @@ export class OpenCodeTaskBackend implements TaskBackend {
     if (input.inputKind === 'native_goal') return notSent('capability_unavailable', 'OpenCode has no native goal input', false)
     if (!handle.backendSessionId || !handle.backendTurnId) return notSent('startup_failed', 'no OpenCode session or message id recorded', !handle.backendSessionId)
     let model: OpenCodeModel | undefined
-    try { model = parseModel(ctx.candidate.model) } catch (e) { return notSent('model_unavailable', errorText(e), false) }
+    try { model = parseModel(explicitModel(ctx.candidate)) } catch (e) { return notSent('model_unavailable', errorText(e), false) }
     const r = await this.adapter.submitPrompt(handle.backendSessionId, directoryOf(ctx, handle), handle.backendTurnId, input.prompt, model, signal)
     switch (r.kind) {
       case 'accepted': return { kind: 'accepted' }
