@@ -254,7 +254,10 @@ export class SharedTmuxBackend implements TaskBackend {
 
   async interrupt(ctx: AttemptContext, _h?: BackendHandle): Promise<void> {
     const run = this.runs.get(ctx.executionAttemptId)
-    if (!run || run.done) return
+    // One Escape per run: finalize and release both interrupt, and reconcile
+    // retries repeat that. A second Esc at Claude's idle prompt opens its
+    // Rewind menu, which then sits over the shared session.
+    if (!run || run.done || run.interrupted) return
     run.interrupted = true
     for (const p of [...run.pending.values()]) p.resolve(DIALOG_ESCAPE_CHOICE)
     await this.o.manager.sendEscape(run.workdir)
@@ -283,15 +286,24 @@ export class SharedTmuxBackend implements TaskBackend {
     if (this.o.manager.isBusy(run.workdir)) return '; goal may still be armed: the session is busy with another caller'
     run.goalCleared = true
     try {
-      await this.o.manager.sendEscape(run.workdir)
-      await new Promise(r => setTimeout(r, GOAL_CLEAR_DELAY_MS))
+      // An interrupted run already got its one Escape and is back at the prompt;
+      // a second Esc there would open Claude's Rewind menu and swallow the clear.
+      if (!run.interrupted) {
+        await this.o.manager.sendEscape(run.workdir)
+        await new Promise(r => setTimeout(r, GOAL_CLEAR_DELAY_MS))
+      }
       return (await this.o.manager.sendLine(run.workdir, '/goal clear')) ? '; unfinished goal cleared' : '; session gone, goal cleared with it'
     } catch (e) {
       return `; clearing the unfinished goal failed: ${e instanceof Error ? e.message : String(e)}`
     }
   }
 
-  /** The session is shared per workdir and is never killed; release = this task's turn has ended. */
+  /**
+   * The session is shared per workdir and is never killed; release = this
+   * task's turn has ended. A Claude interrupt ends the reply wait through the
+   * transcript's interrupt record (TmuxCliProfile.isInterrupt), since no
+   * Stop hook fires for it.
+   */
   async release(ctx: AttemptContext, h: BackendHandle, graceMs: number): Promise<ReleaseResult> {
     const run = this.runs.get(ctx.executionAttemptId)
     if (!run) return this.releaseOrphan(ctx, h, graceMs)

@@ -17,7 +17,12 @@
  *   /goal hold <condition>
  *              a goal that stays active: one unmet turn, then idle
  *   /goal clear  clears an active goal (goal_status met+sentinel, like Claude)
+ *   hang <text>  a turn that streams "WORKING: <text>" and never finishes on
+ *              its own. Escape interrupts it the way Claude Code does: a
+ *              "[Request interrupted by user]" record and NO Stop hook
  *   anything else  an assistant turn replying "ECHO: <text>", then Stop
+ *
+ * stdin is raw (when it's a TTY) so a lone Escape keypress arrives at once.
  */
 import { appendFileSync, mkdirSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
@@ -53,10 +58,26 @@ function startGoal(text: string) {
   void goalTurns(turns ? Number(turns[1]) : 1, !turns)
 }
 
+let hanging = false
+const ESC = '\x1b'
+
+function interruptTurn() {
+  if (!hanging) return
+  hanging = false
+  // Claude Code records the interrupt but does not run Stop hooks for it.
+  record({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } })
+  process.stdout.write('\n  ⎿  Interrupted · What should Claude do instead?\n❯ ')
+}
+
 process.stdout.write('❯ ')
 let buffer = ''
+if (process.stdin.isTTY) process.stdin.setRawMode(true)
 process.stdin.setEncoding('utf8')
 process.stdin.on('data', (chunk: string) => {
+  if (chunk.includes(ESC)) {
+    interruptTurn()
+    chunk = chunk.split(ESC).join('')
+  }
   buffer += chunk
   let nl: number
   while ((nl = buffer.search(/[\r\n]/)) !== -1) {
@@ -69,6 +90,11 @@ process.stdin.on('data', (chunk: string) => {
       record({ type: 'system', subtype: 'local_command', content: '<local-command-stdout>Goal cleared: c</local-command-stdout>' })
     } else if (text.startsWith('/goal ')) {
       startGoal(text)
+    } else if (text.startsWith('hang ')) {
+      record({ type: 'user', message: { role: 'user', content: text } })
+      record({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `WORKING: ${text.slice(5)}` }] } })
+      hanging = true
+      continue
     } else if (text === '/model') {
       record({ type: 'system', subtype: 'local_command', content: '<command-name>/model</command-name>' })
       record({ type: 'system', subtype: 'local_command', content: '<local-command-stdout>Kept model as `Opus`</local-command-stdout>' })

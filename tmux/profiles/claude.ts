@@ -64,6 +64,27 @@ export function isLocalCommandResultLine(line: string): boolean {
   return false
 }
 
+/** The exact texts Claude Code records as a user line when a turn is interrupted (Esc). */
+const INTERRUPT_RE = /^\[Request interrupted by user(?: for tool use)?\]$/
+
+/**
+ * True for the record Claude Code writes when a turn is interrupted. Claude
+ * Code runs no Stop hook for a user interrupt, so this record is the only
+ * proof that the turn has ended. Only a `user` line whose whole text is the
+ * marker counts, so prose that quotes it does not.
+ */
+export function isInterruptLine(line: string): boolean {
+  if (!line.includes('[Request interrupted by user')) return false
+  let parsed: TranscriptLine
+  try { parsed = JSON.parse(line) } catch { return false }
+  if (parsed.type !== 'user') return false
+  const content = parsed.message?.content
+  if (typeof content === 'string') return INTERRUPT_RE.test(content.trim())
+  if (!Array.isArray(content)) return false
+  const texts = content.filter((b: { type?: string }) => b?.type === 'text').map((b: { text?: unknown }) => String(b.text ?? '').trim())
+  return texts.length > 0 && texts.every(t => INTERRUPT_RE.test(t))
+}
+
 /**
  * Extract plain reply text from raw JSONL transcript lines. Invalid or
  * text-less lines are skipped (a partially-flushed last line is expected).
@@ -255,6 +276,7 @@ export const claudeProfile: TmuxCliProfile = {
   },
 
   isLocalCommandResult: isLocalCommandResultLine,
+  isInterrupt: isInterruptLine,
   parseGoalSignal: parseClaudeGoalSignal,
   parseText: parseAssistantTextLines,
   parseProgress: parseProgressLines,

@@ -7,7 +7,7 @@ import { mkdtempSync, realpathSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { TmuxCliManager } from './manager'
-import { claudeProfile, isLocalCommandResultLine } from './profiles/claude'
+import { claudeProfile, isInterruptLine, isLocalCommandResultLine } from './profiles/claude'
 import type { TmuxCliProfile } from './profile'
 
 const FAKE = join(import.meta.dir, 'test-fixtures', 'fake-claude.ts')
@@ -50,7 +50,36 @@ describe('isLocalCommandResultLine', () => {
   })
 })
 
+describe('isInterruptLine', () => {
+  const user = (content: unknown) => JSON.stringify({ type: 'user', message: { role: 'user', content } })
+  test('matches the record Claude Code writes when a turn is interrupted', () => {
+    expect(isInterruptLine(user([{ type: 'text', text: '[Request interrupted by user]' }]))).toBe(true)
+    expect(isInterruptLine(user([{ type: 'text', text: '[Request interrupted by user for tool use]' }]))).toBe(true)
+    expect(isInterruptLine(user('[Request interrupted by user]'))).toBe(true)
+  })
+  test('ignores assistant text or user prose that merely mentions it, and malformed lines', () => {
+    expect(isInterruptLine(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] } }))).toBe(false)
+    expect(isInterruptLine(user('why did I see [Request interrupted by user] earlier?'))).toBe(false)
+    expect(isInterruptLine('{"type":"user","message":{"content":"[Request interrupted by user]')).toBe(false)
+  })
+})
+
 describe('TmuxCliManager + Claude profile (fake claude in real tmux)', () => {
+  test('an interrupted turn (Escape, no Stop hook) ends the reply wait instead of holding the session', async () => {
+    const { m, workdir } = setup()
+    const ends: string[] = []
+    const done = m.sendAndAwaitReply(workdir, 'hang build', { onWaitEnded: reason => { ends.push(reason) } })
+    await new Promise(r => setTimeout(r, 1_500))
+    expect(m.isBusy(workdir)).toBe(true)
+    const escapedAt = Date.now()
+    await m.sendEscape(workdir)
+    expect(await done).toBe('WORKING: build')
+    expect(Date.now() - escapedAt).toBeLessThan(5_000)
+    expect(ends).toEqual(['interrupted'])
+    expect(m.isBusy(workdir)).toBe(false)
+    expect(await m.sendAndAwaitReply(workdir, 'after')).toBe('ECHO: after')
+  }, 30_000)
+
   test('a local slash command (no Stop hook) finishes instead of blocking the session', async () => {
     const { m, workdir } = setup()
     const startedAt = Date.now()

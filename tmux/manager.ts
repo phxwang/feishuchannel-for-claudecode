@@ -74,7 +74,7 @@ export interface WaitEndInfo {
   goal: GoalState
 }
 
-export type WaitEndReason = 'stop' | 'session_killed' | 'timeout' | 'background_idle' | 'quiet' | 'local_command' | 'idle_no_turn' | 'dialog_ended'
+export type WaitEndReason = 'stop' | 'session_killed' | 'timeout' | 'background_idle' | 'quiet' | 'local_command' | 'idle_no_turn' | 'dialog_ended' | 'interrupted'
 
 export interface TmuxManagerOptions {
   dbg?: (msg: string) => void
@@ -543,6 +543,7 @@ export class TmuxCliManager {
       for (const line of newLines) {
         if (profile.isLocalCommandResult?.(line)) sawLocalCommandResult = true
         if (profile.isTurnEnd?.(line)) sawTurnEnd = true
+        if (profile.isInterrupt?.(line)) sawInterrupt = true
         const goalSignal = profile.parseGoalSignal?.(line)
         if (goalSignal) {
           const before = goal
@@ -568,6 +569,8 @@ export class TmuxCliManager {
 
     /** A transcript record ended the turn (TmuxCliProfile.isTurnEnd) — counts like the stop signal firing. */
     let sawTurnEnd = false
+    /** The turn was interrupted (TmuxCliProfile.isInterrupt): no Stop hook will follow. */
+    let sawInterrupt = false
     const stopFired = () => sawTurnEnd || (!!signalPath && existsSync(signalPath) && statSync(signalPath).mtimeMs > baselineStopMs)
     // A local-only slash command (see TmuxCliProfile.slashCommandIdleMs) ends
     // when the pane has been idle for a while and no turn ever started.
@@ -598,6 +601,13 @@ export class TmuxCliManager {
       // Refreshed every tick so a long active wait isn't reaped as idle.
       this.lastUsedAt.set(workdir, Date.now())
       if (readGrowth()) { waitCappedSinceStop = false; continue }
+      if (sawInterrupt) {
+        // Interrupted on purpose (Esc): Claude Code runs no Stop hook for this,
+        // and background work is not waited on — the caller stopped the turn.
+        this.dbg(`${this.tag()}: ${workdir} turn was interrupted — ending the reply wait`)
+        ended('interrupted')
+        return
+      }
       if (stopFired()) {
         // The stop signal can land before the last transcript lines are
         // flushed — keep reading until growth goes quiet for a beat.

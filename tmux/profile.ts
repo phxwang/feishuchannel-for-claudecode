@@ -117,6 +117,14 @@ export interface TmuxCliProfile {
    */
   isTurnEnd?(line: string): boolean
   /**
+   * True if this transcript line records that the user interrupted the turn
+   * (Claude Code's `[Request interrupted by user]`). An interrupt fires no
+   * Stop hook, so without this the reply wait would run to its deadline. It
+   * ends the wait at once ('interrupted'), without waiting on background
+   * work: the turn was stopped on purpose.
+   */
+  isInterrupt?(line: string): boolean
+  /**
    * Classify a transcript line as a native `/goal` record (see tmux/goal.ts),
    * or null. A profile that sets this supports native goals: while a goal is
    * active a Stop does not end the reply; the goal's verdict does.

@@ -114,6 +114,23 @@ describe('SharedTmuxBackend (stub manager)', () => {
       expect(rel.detail).toContain('goal cleared')
     })
 
+    test('an interrupted goal run is disarmed on release without a second Escape', async () => {
+      let finish!: () => void
+      const { manager, escapes, lines } = stubManager(opts => new Promise(r => { finish = () => { opts.onWaitEnded?.('interrupted', { goal: 'active' }); r('') } }), false, true)
+      // The interrupt record ends the wait right after the Escape, before interrupt() would type /goal clear.
+      const sendEscape = manager.sendEscape.bind(manager)
+      ;(manager as any).sendEscape = async (w: string) => { await sendEscape(w); finish() }
+      const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+      const c = ctx({ executionAttemptId: 'xatt_goal_interrupt_release' })
+      const h = (await b.open(c) as any).handle
+      await b.submit(c, h, { inputKind: 'native_goal', prompt: '/goal x' })
+      await b.interrupt(c, h)
+      const rel = await b.release(c, h, 1_000)
+      expect(rel.released).toBe(true)
+      expect(escapes).toEqual(['/w'])
+      expect(lines).toEqual(['/goal clear'])
+    })
+
     test('an achieved or already-cleared goal is not touched on release', async () => {
       for (const goal of ['achieved', 'cleared'] as const) {
         const { manager, escapes, lines } = stubManager(async opts => { opts.onWaitEnded?.('stop', { goal }); return '' }, false, true)
@@ -240,6 +257,22 @@ describe('SharedTmuxBackend (stub manager)', () => {
     expect(end.outcome).toBe('cancelled')
   })
 
+  test('repeated interrupts press Escape once: a second Esc would open the CLI\'s Rewind menu', async () => {
+    let finish!: () => void
+    const { manager, escapes } = stubManager(opts => new Promise(r => { finish = () => { opts.onWaitEnded?.('interrupted'); r('') } }))
+    const b = new SharedTmuxBackend({ kind: 'claude', manager, spawnFor: () => ({}), available: ok })
+    const c = ctx({ executionAttemptId: 'xatt_double_esc' })
+    const h = (await b.open(c) as any).handle
+    await b.submit(c, h, { inputKind: 'text', prompt: 'hi' })
+    await b.interrupt(c, h)
+    await b.interrupt(c, h)
+    expect((await b.release(c, h, 20)).released).toBe(false)
+    expect(escapes).toEqual(['/w'])
+    finish()
+    expect((await b.release(c, h, 1_000)).released).toBe(true)
+    expect(escapes).toEqual(['/w'])
+  })
+
   test('after a router restart the turn is not recoverable: observe reports lost, locate unreachable', async () => {
     const b = new SharedTmuxBackend({ kind: 'claude', manager: stubManager(async () => '').manager, spawnFor: () => ({}), available: ok })
     const c = ctx({ executionAttemptId: 'xatt_unknown' })
@@ -299,6 +332,32 @@ describe('SharedTmuxBackend through the task service (real tmux, fake claude)', 
     expect(await m.sendAndAwaitReply(h.workdir, 'chat still works')).toBe('ECHO: chat still works')
     h.service.stop()
   })
+
+  test('cancelling a turn that is still running closes the task (an interrupt fires no Stop hook)', async () => {
+    const { m } = fakeClaudeManager()
+    const h = makeHarness({
+      dir: tempRoot('rtask-cancel-'),
+      backends: [new SharedTmuxBackend({ kind: 'claude', manager: m, spawnFor: c => ({ model: c.model }), available: ok })],
+      config: { backends: { fake: { enabled: false, models: ['x'] }, claude: { models: ['opus'] } } },
+      releaseGraceMs: 5_000,
+    })
+    realManagers.push({ m, workdir: h.workdir })
+    const claude = { kind: 'claude', mode: 'tmux', model: 'opus', variant: null }
+    const fb = { enabled: false, candidates: [claude], triggerOn: [], maxSwitches: 0, startupRetriesPerCandidate: 0, retryDelaySeconds: 0, maxRecoverySeconds: 60, onExhausted: 'fail', sameOwnerReset: { enabled: false, maxWaitSeconds: 0, maxResumeActions: 0 } }
+    const args = prepareArgs(h, { prompt: 'hang forever', fallback: fb })
+    const { task } = await h.data('router_task_prepare', args)
+    await h.data('router_task_start', { taskId: task.taskId, idempotencyKey: 'st', expectedControlVersion: task.controlVersion, authorization: authorization(args) })
+    const a = await waitPhase(h, task.taskId, 'ACTIVE', 20_000)
+    await new Promise(r => setTimeout(r, 1_500))
+    await h.data('router_task_cancel', {
+      taskId: task.taskId, idempotencyKey: 'c', expectedControlVersion: a.controlVersion,
+      expectedOwner: { executionId: a.owner.executionId, generation: a.owner.generation }, reason: 'stop', graceSeconds: 5,
+    })
+    const c = await waitPhase(h, task.taskId, 'CLOSED', 20_000)
+    expect(c.executionOutcome).toBe('cancelled')
+    expect(m.isBusy(h.workdir)).toBe(false)
+    h.service.stop()
+  }, 60_000)
 
   test('a native_goal task completes only after the goal is achieved across self-continued turns', async () => {
     const { m } = fakeClaudeManager()
