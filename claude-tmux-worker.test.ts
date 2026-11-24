@@ -412,6 +412,67 @@ describe('parseDialogOptions', () => {
     '',
   ].join('\n')
 
+  // Captured verbatim (2026-11-24) from a real qttresearch session: a
+  // subagent's Monitor call. The line right above the options is always the
+  // generic "Do you want to proceed?", so the card used to carry no hint of
+  // which tool, agent or command it was asking about.
+  const realMonitorPermissionDialog = [
+    '✻ Waiting for 1 background agent to finish',
+    '',
+    '────────────────────────────────────────────────────────────',
+    ' Monitor · from the general-purpose agent',
+    ' smoke process exit',
+    '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+    ' │ S=/tmp/x; while pgrep -f "local_smoke run --report" >/dev/null; do sleep 10; done; tail -8 $S/out',
+    '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+    " A variable set in this command can't be checked before it runs",
+    '',
+    ' Do you want to proceed?',
+    ' ❯ 1. Yes',
+    '   2. No',
+    '',
+    ' Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents',
+    '',
+  ].join('\n')
+
+  test('carries the tool, agent and command above a generic permission question as context', () => {
+    const dialog = parseDialogOptions(realMonitorPermissionDialog)!
+    expect(dialog.question).toBe('Do you want to proceed?')
+    expect(dialog.context).toBe([
+      'Monitor · from the general-purpose agent',
+      'smoke process exit',
+      'S=/tmp/x; while pgrep -f "local_smoke run --report" >/dev/null; do sleep 10; done; tail -8 $S/out',
+      "A variable set in this command can't be checked before it runs",
+    ].join('\n'))
+  })
+
+  test('context stops at the blank line above the dialog header, not the tool progress lines', () => {
+    expect(parseDialogOptions(realPermissionDialog)!.context).toBe([
+      'Fetch · from the web-fetch agent',
+      'Claude wants to fetch content from example.com',
+      'url: https://example.com/',
+      'prompt: What is the page title, main text, and all links on this page?',
+    ].join('\n'))
+  })
+
+  test('context stops at transcript markers when no blank line separates them', () => {
+    const text = ['⏺ Bash(ls)', ' Bash command', ' │ ls -la', ' Do you want to proceed?', ' ❯ 1. Yes', '   2. No', ''].join('\n')
+    expect(parseDialogOptions(text)!.context).toBe('Bash command\nls -la')
+  })
+
+  test('context is bounded in line count and line length', () => {
+    const body = Array.from({ length: 40 }, (_, i) => ` │ line ${i} ${'x'.repeat(500)}`)
+    const text = ['────────', ...body, ' Do you want to proceed?', ' ❯ 1. Yes', '   2. No', ''].join('\n')
+    const lines = parseDialogOptions(text)!.context!.split('\n')
+    expect(lines.length).toBeLessThanOrEqual(12)
+    expect(lines.at(-1)!.startsWith('line 39 ')).toBe(true)  // keeps the lines nearest the question
+    expect(Math.max(...lines.map(l => l.length))).toBeLessThanOrEqual(301)
+  })
+
+  test('no context when nothing sits above the question', () => {
+    expect(parseDialogOptions(['Pick one:', '1. Yes', '2. No', ''].join('\n'))!.context).toBeUndefined()
+  })
+
   test('finds a real dialog that appears after a finished reply\'s own numbered list', () => {
     const dialog = parseDialogOptions(realDialogAfterPriorNumberedReply)
     expect(dialog).not.toBeNull()

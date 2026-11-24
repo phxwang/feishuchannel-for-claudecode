@@ -24,6 +24,13 @@ export interface Dialog {
    */
   kind: 'numbered' | 'tabs' | 'cursor'
   question: string
+  /**
+   * `kind: 'numbered'`: the rest of the dialog box above the question — for
+   * a permission prompt the tool, the asking agent, the command and the
+   * reason it needs approval — since the question itself is often just the
+   * generic "Do you want to proceed?". Absent when nothing sits above it.
+   */
+  context?: string
   options: DialogOption[]
   /**
    * `kind: 'tabs'`: the tab believed to currently be focused — `'1'`
@@ -50,6 +57,33 @@ const TRAILING_DECORATION_RE = /^\s*[▸◐]/
 /** An "Esc to <verb>" footer hint, case-insensitively — narrower than matching the bare word "esc" anywhere, which could otherwise wrongly tolerate ordinary reply text that happens to mention "esc" after an option block. */
 const ESC_HINT_RE = /\besc\s+to\s+\w+/i
 const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*m/g
+/** The solid rule Claude draws across the top of a dialog box (dashed `╌` rules sit *inside* the box). */
+const SOLID_RULE_RE = /^\s*─{3,}\s*$/
+/** Lines that belong to the conversation above the dialog, not the dialog itself. */
+const TRANSCRIPT_MARKER_RE = /^\s*[⏺⎿✻❯]/
+/** Bounds on dialog context so a huge command can't flood the card; the lines nearest the question are kept. */
+const MAX_CONTEXT_LINES = 12
+const MAX_CONTEXT_LINE_CHARS = 300
+
+/**
+ * Lines of the dialog box above its question line, top to bottom: walks up,
+ * skipping blank lines right above the question and dashed in-box dividers,
+ * and stops at the box's edge — a blank line, the solid top rule, or a line
+ * from the conversation transcript.
+ */
+function dialogContextAbove(lines: readonly string[], questionIdx: number): string | undefined {
+  const collected: string[] = []
+  let i = questionIdx - 1
+  while (i >= 0 && lines[i].trim() === '') i--
+  for (; i >= 0 && collected.length < MAX_CONTEXT_LINES; i--) {
+    const line = lines[i]
+    if (line.trim() === '' || SOLID_RULE_RE.test(line) || TRANSCRIPT_MARKER_RE.test(line)) break
+    if (DIVIDER_LINE_RE.test(line)) continue
+    const text = line.trim().replace(/^│\s?/, '').trim()
+    collected.push(text.length > MAX_CONTEXT_LINE_CHARS ? `${text.slice(0, MAX_CONTEXT_LINE_CHARS)}…` : text)
+  }
+  return collected.length > 0 ? collected.reverse().join('\n') : undefined
+}
 
 const escapeForCharClass = (s: string) => s.replace(/[\\\]^-]/g, '\\$&')
 
@@ -128,13 +162,20 @@ export function parseDialogOptions(paneText: string, opts: DialogParseOptions = 
     }
     if (!isBottomOfPane) continue
 
-    let question = ''
+    let questionIdx = -1
     for (let i = firstOptionIdx - 1; i >= 0; i--) {
       if (lines[i].trim() === '' || DIVIDER_LINE_RE.test(lines[i])) continue
-      question = lines[i].trim()
+      questionIdx = i
       break
     }
-    return { kind: 'numbered', question: question || opts.fallbackQuestion || 'Claude 需要你的输入', options }
+    const question = questionIdx >= 0 ? lines[questionIdx].trim() : ''
+    const context = questionIdx >= 0 ? dialogContextAbove(lines, questionIdx) : undefined
+    return {
+      kind: 'numbered',
+      question: question || opts.fallbackQuestion || 'Claude 需要你的输入',
+      ...(context !== undefined && { context }),
+      options,
+    }
   }
   return null
 }

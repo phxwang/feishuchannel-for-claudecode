@@ -144,6 +144,9 @@ export function buildTmuxDialogCard(dialog: Dialog, code: string, title: string)
     body: {
       elements: [
         { tag: 'markdown', content: dialog.question },
+        // plain_text, not markdown: context is raw pane text (commands with
+        // backticks, `*`, links) that must show verbatim, not render.
+        ...(dialog.context ? [{ tag: 'div', text: { tag: 'plain_text', content: dialog.context } }] : []),
         { tag: 'hr' },
         ...rows.map(({ number, label, type }) => ({
           tag: 'column_set',

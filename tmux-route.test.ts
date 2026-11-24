@@ -21,6 +21,18 @@ describe('buildTmuxDialogCard', () => {
     const b = buttons(buildTmuxDialogCard({ kind: 'numbered', question: 'q', options: [{ number: '1', label: 'Yes' }, { number: '2', label: 'No' }] }, 'c', 't'))
     expect(b.map((x: any) => x.type)).toEqual(['primary', 'default', 'danger'])
   })
+
+  test('shows dialog context as plain text so commands cannot break markdown', () => {
+    const context = 'Monitor · from the general-purpose agent\n│ echo `whoami` **bold**'
+    const els = JSON.parse(buildTmuxDialogCard({ kind: 'numbered', question: 'Do you want to proceed?', context, options: [{ number: '1', label: 'Yes' }] }, 'c', 't')).body.elements
+    expect(els[0]).toEqual({ tag: 'markdown', content: 'Do you want to proceed?' })
+    expect(els[1]).toEqual({ tag: 'div', text: { tag: 'plain_text', content: context } })
+  })
+
+  test('omits the context element when the dialog has none', () => {
+    const els = JSON.parse(buildTmuxDialogCard({ kind: 'numbered', question: 'q', options: [{ number: '1', label: 'Yes' }] }, 'c', 't')).body.elements
+    expect(els.filter((e: any) => e.tag === 'div')).toEqual([])
+  })
 })
 
 describe('handleTmuxDialogChoice', () => {
