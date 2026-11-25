@@ -31,8 +31,15 @@ const notification = (id: string, status = 'completed') =>
 const notificationAsUserMessage = (id: string, status?: string) => JSON.stringify({
   type: 'user', message: { role: 'user', content: notification(id, status) },
 })
-const notificationAsQueueOperation = (id: string) => JSON.stringify({
+const notificationEnqueued = (id: string) => JSON.stringify({
   type: 'queue-operation', operation: 'enqueue', content: notification(id),
+})
+/** Taken off the queue into the running turn (mid-turn absorb). */
+const notificationAbsorbedMidTurn = (id: string) => JSON.stringify({
+  type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', content: notification(id),
+})
+const notificationAsQueuedCommand = (id: string) => JSON.stringify({
+  type: 'attachment', attachment: { type: 'queued_command', prompt: notification(id) },
 })
 const taskStopped = (id: string) => JSON.stringify({
   type: 'user',
@@ -50,9 +57,29 @@ describe('pendingBackgroundTaskIds', () => {
     expect(pendingBackgroundTaskIds([bashMovedToBackground('bbycurvg0'), notificationAsUserMessage('bbycurvg0')])).toEqual(new Set())
   })
 
-  test('an async agent is pending until its notification arrives, even when only recorded as a queue operation', () => {
-    expect(pendingBackgroundTaskIds([asyncAgentLaunched('af9bce42fab95c2cd')])).toEqual(new Set(['af9bce42fab95c2cd']))
-    expect(pendingBackgroundTaskIds([asyncAgentLaunched('af9bce42fab95c2cd'), notificationAsQueueOperation('af9bce42fab95c2cd')])).toEqual(new Set())
+  test('an async agent is pending until its notification is consumed', () => {
+    const launched = asyncAgentLaunched('af9bce42fab95c2cd')
+    expect(pendingBackgroundTaskIds([launched])).toEqual(new Set(['af9bce42fab95c2cd']))
+    const enqueued = notificationEnqueued('af9bce42fab95c2cd')
+    expect(pendingBackgroundTaskIds([launched, enqueued, notificationAsUserMessage('af9bce42fab95c2cd')])).toEqual(new Set())
+    expect(pendingBackgroundTaskIds([launched, enqueued, notificationAbsorbedMidTurn('af9bce42fab95c2cd')])).toEqual(new Set())
+    expect(pendingBackgroundTaskIds([launched, enqueued, notificationAsQueuedCommand('af9bce42fab95c2cd')])).toEqual(new Set())
+  })
+
+  test('a notification that is only enqueued is still pending: the CLI has yet to start the turn that handles it', () => {
+    expect(pendingBackgroundTaskIds([asyncAgentLaunched('a1'), notificationEnqueued('a1')])).toEqual(new Set(['a1']))
+  })
+
+  test('qttresearch 2026-11-25: last review agent enqueued 1.3s before Stop, report turn was dropped', () => {
+    // Transcript order at the Stop: five agents consumed, P3 only enqueued.
+    const ids = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']
+    const atStop = [
+      ...ids.map(asyncAgentLaunched),
+      ...ids.filter(id => id !== 'p3').flatMap(id => [notificationEnqueued(id), notificationAsUserMessage(id)]),
+      notificationEnqueued('p3'),
+    ]
+    expect(pendingBackgroundTaskIds(atStop)).toEqual(new Set(['p3']))
+    expect(pendingBackgroundTaskIds([...atStop, notificationAsUserMessage('p3')])).toEqual(new Set())
   })
 
   test('failed and killed notifications also end a task', () => {
@@ -69,7 +96,7 @@ describe('pendingBackgroundTaskIds', () => {
     expect(pendingBackgroundTaskIds(atFirstStop)).toEqual(new Set(['bbycurvg0', 'af9bce42fab95c2cd']))
     const afterSmoke = [...atFirstStop, notificationAsUserMessage('bbycurvg0')]
     expect(pendingBackgroundTaskIds(afterSmoke)).toEqual(new Set(['af9bce42fab95c2cd']))
-    const afterReview = [...afterSmoke, notificationAsQueueOperation('af9bce42fab95c2cd')]
+    const afterReview = [...afterSmoke, notificationEnqueued('af9bce42fab95c2cd'), notificationAbsorbedMidTurn('af9bce42fab95c2cd')]
     expect(pendingBackgroundTaskIds(afterReview)).toEqual(new Set())
   })
 

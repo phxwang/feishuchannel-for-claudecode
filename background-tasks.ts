@@ -16,10 +16,10 @@
  *   - bash run in, or moved to, the background: `backgroundTaskId`
  *   - async agent: `isAsync: true` + `agentId`
  * End records:
- *   - `<task-notification><task-id>ID</task-id>…` anywhere in a line —
- *     as a user message for bash tasks, but for agents only as a
- *     `queue-operation` / `queued_command` line, so it's matched as raw text
- *     rather than in one particular message field
+ *   - `<task-notification><task-id>ID</task-id>…` once the CLI has consumed
+ *     it: a user message, a `queued_command` attachment, or a `remove`
+ *     queue operation (matched as raw text, not one message field). An
+ *     `enqueue` line alone does not count; see consumedNotificationTaskIds
  *   - a successful TaskStop (`toolUseResult.task_id` + "Successfully
  *     stopped task"), which sends no notification of its own
  */
@@ -56,8 +56,19 @@ function stoppedTaskId(result: ToolUseResult): string | null {
   return stopped && typeof result.task_id === 'string' && result.task_id ? result.task_id : null
 }
 
-function notifiedTaskIds(line: string): string[] {
+/**
+ * An `enqueue` line only means the task finished: the CLI has yet to act on
+ * it, and when idle it starts a fresh turn for it (enqueue → dequeue → user
+ * message). A Stop can land in that gap, so an enqueue alone must not end the
+ * task. Every enqueue seen in real transcripts is followed by a consuming line
+ * carrying the same notification (user message, `queued_command` attachment,
+ * or a `remove` queue operation); any of those ends it.
+ */
+const ENQUEUE_LINE_RE = /"type"\s*:\s*"queue-operation"[^\n]*"operation"\s*:\s*"enqueue"|"operation"\s*:\s*"enqueue"[^\n]*"type"\s*:\s*"queue-operation"/
+
+function consumedNotificationTaskIds(line: string): string[] {
   if (!line.includes('<task-notification>')) return []
+  if (ENQUEUE_LINE_RE.test(line)) return []
   return [...line.matchAll(NOTIFICATION_TASK_ID_RE)].map(m => m[1].trim())
 }
 
@@ -83,7 +94,7 @@ export function pendingBackgroundTaskIds(lines: readonly string[]): Set<string> 
   const started = new Set<string>()
   const ended = new Set<string>()
   for (const line of lines) {
-    for (const id of notifiedTaskIds(line)) ended.add(id)
+    for (const id of consumedNotificationTaskIds(line)) ended.add(id)
     const result = parseToolUseResult(line)
     if (!result) continue
     const startId = startedTaskId(result)
